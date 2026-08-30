@@ -24,17 +24,22 @@ const rootDir = dirname(fileURLToPath(import.meta.url))
 const outDir = resolve(rootDir, 'lib')
 mkdirSync(outDir, { recursive: true })
 
+const zodNodePath = resolve(rootDir, '../node_modules/.pnpm/zod@4.4.3/node_modules')
+
 // 1. Build Host ESM bundle (lib/index.js)
+// Bundle zod and local modules; mark only dsh / schemastery as external
 await esbuild.build({
   entryPoints: [resolve(rootDir, 'src/index.ts')],
   outfile: resolve(outDir, 'index.js'),
   bundle: true,
   format: 'esm',
-  target: 'node22',
+  target: 'node20',
   platform: 'node',
+  nodePaths: [zodNodePath],
   external: [
-    '@deepseek-ai/*',
-    'zod',
+    '@deepseek-ai/cordis',
+    '@deepseek-ai/schemastery',
+    '@deepseek-ai/dsh-*',
     'react',
     'react-dom',
   ],
