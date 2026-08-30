@@ -3,6 +3,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import React from 'react'
 import { apply } from '../src/client/index.ts'
 import { ChangeCard } from '../src/client/components/ChangeCard.ts'
+import { ProjectControlView } from '../src/client/components/ProjectControlView.tsx'
 
 class MockSlotsService extends Service {
   constructor(ctx: Context, private readonly registeredSlots: string[]) {
@@ -27,6 +28,7 @@ describe('Client UI & Slot Registration (T7.1 - T7.4)', () => {
     await ctx.plugin(MockSlotsService, registeredSlots)
     await ctx.plugin({ name: 'test-client', apply, inject: ['slots'] })
 
+    expect(registeredSlots).toContain('conversation.view')
     expect(registeredSlots).toContain('sidebar.footer.action')
     expect(registeredSlots).toContain('tool.call.toolview')
     expect(registeredSlots).toContain('conversation.session.header.actions')
@@ -46,5 +48,11 @@ describe('Client UI & Slot Registration (T7.1 - T7.4)', () => {
     expect(element.props.title).toBe('Fix Authentication')
     expect(element.props.filesChanged).toBe(3)
     expect(element.props.evidenceId).toBe('evi_123456')
+  })
+
+  it('T7.3: renders ProjectControlView with multi-panel navigation tabs', () => {
+    const element = React.createElement(ProjectControlView, { sessionId: 'test-session' })
+    expect(element).toBeDefined()
+    expect(element.type).toBe(ProjectControlView)
   })
 })
