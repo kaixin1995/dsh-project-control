@@ -17,6 +17,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { BootstrapPipeline } from '../bootstrap/pipeline.ts'
 import { GenericLanguageAnalyzer } from '../analysis/language.ts'
 import { ProjectService } from '../domain/project.ts'
+import { scanHistory } from '../runtime/history.ts'
 import type { ProjectControlService } from './service.ts'
 
 export const name = 'project-control-api'
@@ -157,6 +158,31 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       finishedAt: run.finishedAt ?? null,
     })),
     attemptsCount: attempts.length,
+    importedChanges: (store.importedChanges?.list() ?? []).slice(-100).map((item) => ({
+      id: item.id,
+      title: item.title,
+      commitCount: item.commitShas.length,
+      firstCommitAt: item.firstCommitAt,
+      lastCommitAt: item.lastCommitAt,
+      confidence: item.confidence,
+      status: item.status,
+    })),
+    issues: store.issues.list().slice(-50).map((issue) => ({
+      id: issue.id,
+      changeId: issue.changeId,
+      severity: issue.severity,
+      category: issue.category,
+      title: issue.title,
+      status: issue.status,
+    })),
+    verifications: store.verifications.list().slice(-50).map((verification) => ({
+      id: verification.id,
+      changeId: verification.changeId,
+      name: verification.name,
+      type: verification.type,
+      status: verification.status,
+      createdAt: verification.createdAt,
+    })),
     memories: memories.map((memory) => ({
       id: memory.id,
       type: memory.type,
@@ -248,6 +274,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               service.store.checkpoints,
             )
             const checkpoint = await pipeline.runBootstrap(ensured.project.id, rootPath)
+          const scanHistoryFlag = body['includeHistory'] === true
+          let importedCount = 0
+          if (scanHistoryFlag && service.store.importedChanges !== undefined) {
+            const imported = await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits: service.liveConfig.bootstrap.defaultMaxCommits })
+            importedCount = imported.length
+          }
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
               ok: true,
@@ -255,7 +287,33 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               summary: checkpoint.summary,
               techStack: checkpoint.techStack,
               symbolsCount: checkpoint.topLevelSymbols.length,
+              importedChanges: importedCount,
             }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        if (req.method === 'POST' && routePath === '/memory/confirm') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const memoryId = typeof body['memoryId'] === 'string' ? body['memoryId'] : ''
+            const memory = memoryId === '' ? undefined : service.store.memories.get(memoryId as never)
+            if (memory === undefined) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'memory not found' }))
+              return
+            }
+            await service.memoryService?.confirmMemory(memoryId as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, memoryId }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))

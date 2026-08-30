@@ -73,6 +73,7 @@ export const historyDomainSpec = defineDomain({
   layout: 'single',
   tables: {
     checkpoints: domainTable(recordSchema),
+    imported_changes: domainTable(recordSchema),
     issues: domainTable(recordSchema),
     verifications: domainTable(recordSchema),
     memories: domainTable(recordSchema),

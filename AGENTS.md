@@ -82,6 +82,15 @@
 - 全局 dsh 已升级 0.1.0-rc.7 → **0.1.1-rc.2**（npm latest）；credentials 嵌套布局兼容 ✓。rc.2 端到端：headless 模型真实回复 ✓；web bootstrap 扫描真实仓库入库 ✓ + /state 真实状态 ✓ + client bundle 进启动图 ✓ + Origin 围栏 403 ✓。
 - 源码启动（repo CLI）下 web 的 __DSH_BOOT__ 图为空的异常仍在待查（全局 CLI 无此问题）。
 
+**bundle patch / 存储面事实（2026-08-30）**
+- 同一 id 的**二次 insert** 会 fail loud（duplicate loader entry id）——bundle 间覆盖只能由用户层 update 型行完成；本 bundle 不重述 storage 行。
+- 0.1.1 起 headless 不挂 storage 栈：需要持久化的 headless profile 在其 cordis.patch.yml 用户层补 storage/storage-json/storage-domain 三行（用户 headless profile 已配置）。
+- json 存储后端是单写者假设：跨进程写入对已打开实例不可见（重启后可见）——跨实例验证时先重启 web。
+- defineTool 参数**必填字段必须显式 required: true**（省略即可选）；参数名避免用 type（与 DSL 元键同名易混淆，已改 memoryType）。
+- 一次性 LLM 分析走 ctx.llm.stream + BlockAssembler + deadline（analysis/llm-analyzer.ts）；路由解析：settings 等级覆盖 → 会话当前路由 → deepseek 兜底。
+- ctx.agents.create 子代理：meta.origin='subagent'，setup 注册 project_control_step_complete；usage 从子会话 assistant/message 事件聚合。
+- 客户端 details 槽面板默认轨道宽 0：WorkspaceFrame 挂载时调用 ctx.layout.openDetails()（inject 需声明 'layout'）打开轨道；无会话落地页轨道恒 0，原生英雄页不受影响。
+
 **待查证（下一会话优先）**
 - 源码启动（repo CLI）下 web 的 `__DSH_BOOT__` 图为空（连官方 ui 包都未进图，无告警——疑似 `loader.internal.resolveSync` 在 tsx/Windows 下静默失败、warn 被内部 logger 吞掉）。用户日常 3080 用的是全局安装 rc.7，图正常。需决定：插件验证走哪条运行时路径，或定位 resolveSync 问题（vendor 代码，受零改动铁律约束，只能上报或绕过）。
 

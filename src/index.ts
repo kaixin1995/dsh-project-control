@@ -15,6 +15,9 @@ import { ProjectControlService, apply as serviceApply } from './plugin/service.t
 import { apply as toolsApply, registerTools } from './plugin/tools.ts'
 import { apply as commandsApply, registerCommands } from './plugin/commands.ts'
 import { apply as apiRouteApply, registerApiRoute } from './plugin/api-route.ts'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { PROJECT_CONTROL_SETTINGS_SCHEMA } from './config.ts'
+import { resolveFullConfig, type ProjectControlFullConfig } from './config.ts'
 import type { ProjectControlConfig } from './plugin/service.ts'
 
 /** 插件名称 */
@@ -23,14 +26,16 @@ export const name = 'project-control'
  * 注入的服务依赖（直接读取的服务必须在此声明；storageDomain / webServer 为
  * 可选动态注入——headless 等面不挂载，静默降级，不阻塞激活）。
  */
-export const inject = ['tools', 'commands']
+export const inject = ['tools', 'commands', 'agents', 'jobs', 'sessions', 'llm']
 
 /**
  * 插件装配函数：创建服务、提供 projectControl、启动存储（动态）、
  * 注册工具 / 命令 / API 路由。
  */
 export function apply(ctx: Context, config: ProjectControlConfig = {}): void {
+  const fullConfig = resolveFullConfig(config as unknown as Partial<ProjectControlFullConfig>)
   const service = new ProjectControlService(ctx, config)
+  service.liveConfig = fullConfig
   ctx.provide('projectControl', service)
   ctx.effect(() => () => service.stop(), 'project-control: service stop')
 
@@ -38,6 +43,19 @@ export function apply(ctx: Context, config: ProjectControlConfig = {}): void {
   ctx.inject(['storageDomain'], (scope: Context) => {
     void service.start((scope as any).storageDomain).catch((error: unknown) => {
       ctx.logger?.warn?.()
+    })
+  })
+
+  // settings namespace：用户可通过 settings 面板 / cordis.yml 调整模型等级、预算、重试等
+  ctx.inject(['settings'], (scope: Context) => {
+    installSettingsSection(scope, settingsNamespace('project-control'), PROJECT_CONTROL_SETTINGS_SCHEMA, config, {
+      validate: (value: unknown) => {
+        void resolveFullConfig(value as never)
+      },
+      setSource: (current: unknown) => {
+        service.liveConfig = resolveFullConfig(current as never)
+      },
+      onChange: () => {},
     })
   })
 

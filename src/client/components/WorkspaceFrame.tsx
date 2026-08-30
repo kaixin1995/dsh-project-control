@@ -28,6 +28,9 @@ export interface WorkspaceState {
   evidenceCount?: number
   recentEvidence?: Array<{ id: string; source: string; truthLevel: string; locator: string; snippet: string; createdAt: number }>
   bootstrap?: { id: string; summary: string; techStack: string[]; manifestFiles: string[]; symbolsCount: number; createdAt: number } | null
+  importedChanges?: Array<{ id: string; title: string; commitCount: number; firstCommitAt: number; lastCommitAt: number; confidence: number; status: string }>
+  issues?: Array<{ id: string; changeId: string; severity: string; category: string; title: string; status: string }>
+  verifications?: Array<{ id: string; changeId: string; name: string; type: string; status: string; createdAt: number }>
 }
 
 /**
@@ -42,7 +45,7 @@ div[class*="frame"][style*="grid-template-columns"][data-details-collapsed] > di
 div[class*="frame"][style*="grid-template-columns"][data-details-collapsed] > div[class*="detailsCol"] { order: 0; }
 `
 
-type TabKey = 'overview' | 'changes' | 'execution' | 'memory'
+type TabKey = 'overview' | 'changes' | 'execution' | 'memory' | 'history'
 
 export interface WorkspaceFrameProps {
   /** 官方 details 槽契约的 locale 注入（我们注册的 project-control 词典）。 */
@@ -83,6 +86,22 @@ export const WORKSPACE_DICT = {
     'exec.col.started': '开始',
     'exec.attempts': '尝试次数',
     'evidence.recent': '最近证据',
+    'tab.history': '历史',
+    'history.imported': 'Imported Change（Git 历史重建）',
+    'history.col.title': '标题',
+    'history.col.commits': '提交数',
+    'history.col.period': '时间',
+    'history.col.confidence': '置信度',
+    'history.col.status': '状态',
+    'history.noImported': '暂无历史重建记录。点击「初始化项目」并勾选历史扫描，或使用 bootstrap_project 工具。',
+    'review.issues': 'Review 问题',
+    'review.noIssues': '暂无 Review 问题。',
+    'review.col.severity': '级别',
+    'review.col.title': '标题',
+    'review.col.status': '状态',
+    'verify.records': '验收记录',
+    'verify.noRecords': '暂无验收记录。',
+    'memory.confirm': '确认',
     'error.load': '加载失败',
   },
   en: {
@@ -117,6 +136,22 @@ export const WORKSPACE_DICT = {
     'exec.col.started': 'Started',
     'exec.attempts': 'Attempts',
     'evidence.recent': 'Recent evidence',
+    'tab.history': 'History',
+    'history.imported': 'Imported Change (rebuilt from git history)',
+    'history.col.title': 'Title',
+    'history.col.commits': 'Commits',
+    'history.col.period': 'Period',
+    'history.col.confidence': 'Confidence',
+    'history.col.status': 'Status',
+    'history.noImported': 'No imported changes yet. Run Initialize project with history scan, or the bootstrap_project tool.',
+    'review.issues': 'Review issues',
+    'review.noIssues': 'No review issues.',
+    'review.col.severity': 'Severity',
+    'review.col.title': 'Title',
+    'review.col.status': 'Status',
+    'verify.records': 'Verification records',
+    'verify.noRecords': 'No verification records yet.',
+    'memory.confirm': 'Confirm',
     'error.load': 'Failed to load',
   },
 } as const
@@ -131,8 +166,8 @@ const styles: Record<string, React.CSSProperties> = {
     height: '100%',
     display: 'flex',
     flexDirection: 'column',
-    background: 'var(--dsw-alias-bg-base, #1e1e1e)',
-    color: 'var(--dsw-alias-text-primary, #ccc)',
+    background: 'var(--dsw-alias-bg-base, #fff)',
+    color: 'var(--dsw-alias-label-primary, #1f2328)',
     fontFamily: 'var(--ds-font-sans, inherit)',
     overflow: 'hidden',
   },
@@ -141,36 +176,37 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     gap: '4px',
     padding: '8px 12px',
-    borderBottom: '1px solid var(--dsw-alias-border-l1, #333)',
+    borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(5,5,5,0.1))',
     flex: 'none',
+    background: 'var(--dsw-alias-bg-base, #fff)',
   },
-  title: { fontSize: '13px', fontWeight: 600, marginInlineEnd: '10px' },
+  title: { fontSize: '13px', fontWeight: 600, marginInlineEnd: '10px', color: 'var(--dsw-alias-label-primary, #1f2328)' },
   tab: (active: boolean): React.CSSProperties => ({
     padding: '5px 12px',
     borderRadius: '6px',
     border: 'none',
     cursor: 'pointer',
     fontSize: '12px',
-    background: active ? 'var(--dsw-alias-fill-accent, #0e639c)' : 'transparent',
-    color: active ? '#fff' : 'var(--dsw-alias-text-secondary, #999)',
+    background: active ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'transparent',
+    color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #6b7280)',
   }),
   body: { flex: 1, overflowY: 'auto', padding: '14px 16px' },
   card: {
-    border: '1px solid var(--dsw-alias-border-l1, #333)',
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
     borderRadius: '8px',
     padding: '12px 14px',
     marginBottom: '12px',
-    background: 'var(--dsw-alias-bg-elevated, #252526)',
+    background: 'var(--dsw-alias-bg-layer-1, #fafafa)',
   },
   row: { display: 'flex', gap: '18px', flexWrap: 'wrap', fontSize: '12px', margin: '6px 0' },
-  label: { color: 'var(--dsw-alias-text-secondary, #999)', marginInlineEnd: '6px' },
+  label: { color: 'var(--dsw-alias-label-secondary, #6b7280)', marginInlineEnd: '6px' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: '12px' },
-  th: { textAlign: 'start', padding: '6px 8px', borderBottom: '1px solid var(--dsw-alias-border-l1, #333)', color: 'var(--dsw-alias-text-secondary, #999)', fontWeight: 500 },
-  td: { padding: '6px 8px', borderBottom: '1px solid var(--dsw-alias-border-l2, #2a2a2a)' },
-  empty: { color: 'var(--dsw-alias-text-secondary, #999)', fontSize: '12px', padding: '10px 4px' },
+  th: { textAlign: 'start', padding: '6px 8px', borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(5,5,5,0.1))', color: 'var(--dsw-alias-label-secondary, #6b7280)', fontWeight: 500 },
+  td: { padding: '6px 8px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))' },
+  empty: { color: 'var(--dsw-alias-label-secondary, #6b7280)', fontSize: '12px', padding: '10px 4px' },
   button: {
     padding: '5px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer',
-    fontSize: '12px', background: 'var(--dsw-alias-fill-accent, #0e639c)', color: '#fff',
+    fontSize: '12px', background: 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
   },
   badge: (color: string): React.CSSProperties => ({
     display: 'inline-block', padding: '1px 8px', borderRadius: '4px', fontSize: '11px',
@@ -223,6 +259,27 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }, [])
 
+  const confirmMemory = async (memoryId: string): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/memory/confirm', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ memoryId }),
+      })
+      if (!response.ok) {
+        const data: unknown = await response.json()
+        setLoadError((data as { error?: string }).error ?? `HTTP ${response.status}`)
+        return
+      }
+      setState((previous) => previous === null ? previous : {
+        ...previous,
+        memories: previous.memories?.map((memory) => memory.id === memoryId ? { ...memory, isHumanConfirmed: true, truthLevel: 'fact' } : memory),
+      })
+    } catch (error: unknown) {
+      setLoadError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   const runBootstrap = async (): Promise<void> => {
     setBootstrapping(true)
     try {
@@ -252,12 +309,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const runs = state?.runs ?? []
   const memories = state?.memories ?? []
   const recentEvidence = state?.recentEvidence ?? []
+  const importedChanges = state?.importedChanges ?? []
+  const issues = state?.issues ?? []
+  const verifications = state?.verifications ?? []
 
   const tabs: Array<{ key: TabKey; label: string }> = [
     { key: 'overview', label: t('tab.overview') },
     { key: 'changes', label: t('tab.changes') },
     { key: 'execution', label: t('tab.execution') },
     { key: 'memory', label: t('tab.memory') },
+    { key: 'history', label: t('tab.history') },
   ]
 
   return React.createElement('div', { style: styles.root, 'data-testid': 'project-control-workspace' },
@@ -296,7 +357,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   React.createElement('span', null, React.createElement('span', { style: styles.label }, t('state.manifests')), String(bootstrap.manifestFiles.length)),
                   React.createElement('span', null, React.createElement('span', { style: styles.label }, t('state.evidence')), String(state?.evidenceCount ?? 0)),
                 ),
-                React.createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-text-secondary, #999)', marginTop: '8px' } }, bootstrap.summary),
+                React.createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '8px' } }, bootstrap.summary),
               ),
             )),
 
@@ -333,13 +394,30 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               ))),
             )),
 
+      tab === 'history' && React.createElement(Card, { title: t('history.imported') },
+        importedChanges.length === 0
+          ? React.createElement('div', { style: styles.empty }, t('history.noImported'))
+          : React.createElement('table', { style: styles.table },
+              React.createElement('thead', null, React.createElement('tr', null,
+                ['history.col.title', 'history.col.commits', 'history.col.period', 'history.col.confidence', 'history.col.status'].map((key) =>
+                  React.createElement('th', { key, style: styles.th }, t(key)))),
+              ),
+              React.createElement('tbody', null, importedChanges.map((item) => React.createElement('tr', { key: item.id },
+                React.createElement('td', { style: styles.td }, item.title),
+                React.createElement('td', { style: styles.td }, String(item.commitCount)),
+                React.createElement('td', { style: styles.td }, formatTime(item.firstCommitAt)),
+                React.createElement('td', { style: styles.td }, String(item.confidence)),
+                React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(item.status === 'confirmed' ? '#4ec9b0' : '#dcdcaa') }, item.status)),
+              ))),
+            )),
+
       tab === 'memory' && React.createElement(React.Fragment, null,
         React.createElement(Card, null,
           memories.length === 0
             ? React.createElement('div', { style: styles.empty }, t('state.noMemories'))
             : React.createElement('table', { style: styles.table },
                 React.createElement('thead', null, React.createElement('tr', null,
-                  ['memory.col.title', 'memory.col.type', 'memory.col.truth', 'memory.col.branch'].map((key) =>
+                  ['memory.col.title', 'memory.col.type', 'memory.col.truth', 'memory.col.branch', 'memory.confirm'].map((key) =>
                     React.createElement('th', { key, style: styles.th }, t(key)))),
                 ),
                 React.createElement('tbody', null, memories.map((memory) => React.createElement('tr', { key: memory.id },
@@ -347,6 +425,36 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   React.createElement('td', { style: styles.td }, memory.type),
                   React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(memory.isHumanConfirmed ? '#4ec9b0' : '#dcdcaa') }, memory.isHumanConfirmed ? 'confirmed' : memory.truthLevel)),
                   React.createElement('td', { style: styles.td }, memory.gitBranch ?? '—'),
+                  React.createElement('td', { style: styles.td }, memory.isHumanConfirmed
+                    ? React.createElement('span', { style: styles.badge('#4ec9b0') }, 'confirmed')
+                    : React.createElement('button', {
+                        style: { ...styles.button, padding: '2px 8px', fontSize: '11px' },
+                        onClick: () => { void confirmMemory(memory.id) },
+                      }, t('memory.confirm'))),
+                ))),
+              )),
+        React.createElement(Card, { title: t('review.issues') },
+          issues.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('review.noIssues'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('thead', null, React.createElement('tr', null,
+                  ['review.col.severity', 'review.col.title', 'review.col.status'].map((key) =>
+                    React.createElement('th', { key, style: styles.th }, t(key)))),
+                ),
+                React.createElement('tbody', null, issues.map((issue) => React.createElement('tr', { key: issue.id },
+                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(issue.severity === 'critical' || issue.severity === 'high' ? '#ce9178' : '#569cd6') }, issue.severity)),
+                  React.createElement('td', { style: styles.td }, issue.title),
+                  React.createElement('td', { style: styles.td }, issue.status),
+                ))),
+              )),
+        React.createElement(Card, { title: t('verify.records') },
+          verifications.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('verify.noRecords'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('tbody', null, verifications.map((record) => React.createElement('tr', { key: record.id },
+                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(record.status === 'passed' ? '#4ec9b0' : '#dcdcaa') }, record.status)),
+                  React.createElement('td', { style: styles.td }, record.name),
+                  React.createElement('td', { style: styles.td }, formatTime(record.createdAt)),
                 ))),
               )),
         React.createElement(Card, { title: t('evidence.recent') },

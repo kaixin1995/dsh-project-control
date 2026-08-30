@@ -8,6 +8,6 @@ describe('ProjectControl Smoke', () => {
     await root.plugin({ name: 'project-control', apply }, { enabled: true })
 
     expect(root.projectControl).toBeDefined()
-    expect(root.projectControl.config.enabled).toBe(true)
+    expect(root.projectControl.liveConfig.enabled).toBe(true)
   })
 })

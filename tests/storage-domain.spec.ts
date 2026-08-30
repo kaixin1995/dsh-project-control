@@ -26,7 +26,7 @@ describe('Storage Domain Routing & Round-trip (T0.4)', () => {
 
     // 1. Core Domain
     const core = await facility.open(coreDomainSpec)
-    const itemsTable = core.table('items')
+    const itemsTable = core.table('projects')
     const item1 = { id: 'core-1', name: 'Core Item', updatedAt: Date.now() }
     await itemsTable.put('item-1', item1)
     expect(itemsTable.get('item-1')).toEqual(item1)
@@ -34,14 +34,14 @@ describe('Storage Domain Routing & Round-trip (T0.4)', () => {
 
     // 2. Analysis Domain (per-record layout)
     const analysis = await facility.open(analysisDomainSpec)
-    const analysisTable = analysis.table('items')
+    const analysisTable = analysis.table('evidence')
     const item2 = { id: 'analysis-1', name: 'Analysis Item', updatedAt: Date.now() }
     await analysisTable.put('item-2', item2)
     expect(analysisTable.get('item-2')).toEqual(item2)
 
     // 3. History Domain
     const history = await facility.open(historyDomainSpec)
-    const historyTable = history.table('items')
+    const historyTable = history.table('checkpoints')
     const item3 = { id: 'history-1', name: 'History Item', updatedAt: Date.now() }
     await historyTable.put('item-3', item3)
     expect(historyTable.get('item-3')).toEqual(item3)
@@ -59,7 +59,7 @@ describe('Storage Domain Routing & Round-trip (T0.4)', () => {
     {
       const { facility } = await createTestFacility(pool)
       const core = await facility.open(coreDomainSpec)
-      await core.table('items').put('persisted-1', { id: 'p1', name: 'Persisted', updatedAt: 12345 })
+      await core.table('projects').put('persisted-1', { id: 'p1', name: 'Persisted', updatedAt: 12345 })
       await core.close()
     }
 
@@ -67,7 +67,7 @@ describe('Storage Domain Routing & Round-trip (T0.4)', () => {
     {
       const { facility } = await createTestFacility(pool)
       const core = await facility.open(coreDomainSpec)
-      expect(core.table('items').get('persisted-1')).toEqual({ id: 'p1', name: 'Persisted', updatedAt: 12345 })
+      expect(core.table('projects').get('persisted-1')).toEqual({ id: 'p1', name: 'Persisted', updatedAt: 12345 })
       await core.close()
     }
   })

@@ -22,21 +22,32 @@ import { WORKSPACE_DICT, WorkspaceFrame } from './components/WorkspaceFrame.tsx'
 const NS = 'project-control'
 
 export const name = 'client-project-control'
-export const inject = ['slots', 'locale']
+export const inject = ['slots', 'locale', 'layout']
 
 export function apply(ctx: any): void {
   ctx.effect(() => ctx.locale.register(NS, { zh: WORKSPACE_DICT.zh, en: WORKSPACE_DICT.en }), 'project-control: dictionaries')
+  const layout = ctx.layout
 
   // ── 1. 项目工作台：遮蔽 details 槽（可逆）───────────────────────────────
   let workspaceEnabled = true
   let disposeWorkspace: (() => void) | undefined
 
   const registerWorkspace = (): void => {
-    disposeWorkspace = ctx.slots.register({
-      name: 'details',
-      priority: -10,
-      locale: NS,
-    }, WorkspaceFrame)
+    disposeWorkspace = ctx.slots.register(
+      {
+        name: 'details',
+        priority: -10,
+        locale: NS,
+      },
+      // 挂载即打开 details 轨道（面板偏好默认 0）：工作台需要真实宽度；
+      // 无会话落地页轨道恒 0，天然保持原生英雄页布局。
+      (props: any) => {
+        React.useEffect(() => {
+          layout?.openDetails?.()
+        }, [])
+        return React.createElement(WorkspaceFrame, props)
+      },
+    )
   }
   const unregisterWorkspace = (): void => {
     disposeWorkspace?.()

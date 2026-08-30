@@ -1,4 +1,23 @@
-# Bundle patch for dsh-project-control installed via profile package
+# Bundle patch for dsh-project-control installed via profile package.
+#
+# NOTE: the storage stack (storage / storage-json / storage-domain) is mounted
+# by the web / sdk surfaces since dsh 0.1.1. Headless lacks it — profiles that
+# want project-control persistence on headless add the three rows (same shape
+# as the web-app bundle's) to their OWN cordis.patch.yml user layer:
+#
+#   - id: storage
+#     name: '@deepseek-ai/dsh-storage'
+#   - id: storage-json
+#     name: '@deepseek-ai/dsh-storage-json'
+#     config:
+#       root: !!js dshHomePath('storages')
+#   - id: storage-domain
+#     name: '@deepseek-ai/dsh-storage-domain'
+#     config:
+#       backend: json
+#
+# (Restating them here would duplicate ids on web profiles — insert/insert
+# collisions fail loud; only the user layer may update by id.)
 - insert:
     - id: project-control
       name: dsh-project-control

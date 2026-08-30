@@ -78,18 +78,55 @@ export class DomainRepository<T extends { id: string }, ID extends string = stri
 /**
  * Project Control 系统的完整存储仓储聚合接口
  */
-export interface ProjectControlStore {
-  projects: DomainRepository<ProjectRecord, ProjectId>
-  changes: DomainRepository<ChangeRecord, ChangeId>
-  plans: DomainRepository<PlanRecord, PlanId>
-  runs: DomainRepository<RunRecord, RunId>
-  steps: DomainRepository<StepRecord, StepId>
-  attempts: DomainRepository<AttemptRecord, AttemptId>
-  /** 引导检查点仓储（history 域） */
-  checkpoints: DomainRepository<ProjectBootstrapCheckpoint, string>
-  evidence: DomainRepository<EvidenceRecord, EvidenceId>
-  issues: DomainRepository<ReviewIssueRecord, IssueId>
-  verifications: DomainRepository<VerificationRecord, VerificationId>
-  memories: DomainRepository<MemoryRecord, MemoryId>
-  concepts?: DomainRepository<any, any>
+export interface MemoryStoreOptions {
+  // optional configuration
+}
+
+export function createMemoryKvTable<T extends { id: string }>(): KvTable<string, T> {
+  const map = new Map<string, T>()
+  return {
+    get(key: string): T | undefined {
+      return map.get(key)
+    },
+    entries(): IterableIterator<[string, T]> {
+      return map.entries()
+    },
+    keys(): IterableIterator<string> {
+      return map.keys()
+    },
+    get size(): number {
+      return map.size
+    },
+    async put(key: string, value: T): Promise<void> {
+      map.set(key, value)
+    },
+    async delete(key: string): Promise<boolean> {
+      return map.delete(key)
+    },
+    async update(key: string, fn: (current: T) => T): Promise<T> {
+      const current = map.get(key)
+      if (current === undefined) throw new Error(`missing-key: ${key}`)
+      const next = fn(current)
+      map.set(key, next)
+      return next
+    },
+  }
+}
+
+export function createInMemoryStore(): ProjectControlStore {
+  return {
+    projects: new DomainRepository<ProjectRecord, ProjectId>(createMemoryKvTable<ProjectRecord>()),
+    changes: new DomainRepository<ChangeRecord, ChangeId>(createMemoryKvTable<ChangeRecord>()),
+    plans: new DomainRepository<PlanRecord, PlanId>(createMemoryKvTable<PlanRecord>()),
+    runs: new DomainRepository<RunRecord, RunId>(createMemoryKvTable<RunRecord>()),
+    steps: new DomainRepository<StepRecord, StepId>(createMemoryKvTable<StepRecord>()),
+    attempts: new DomainRepository<AttemptRecord, AttemptId>(createMemoryKvTable<AttemptRecord>()),
+    checkpoints: new DomainRepository<ProjectBootstrapCheckpoint, string>(createMemoryKvTable<ProjectBootstrapCheckpoint>()),
+    importedChanges: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
+    evidence: new DomainRepository<EvidenceRecord, EvidenceId>(createMemoryKvTable<EvidenceRecord>()),
+    issues: new DomainRepository<ReviewIssueRecord, IssueId>(createMemoryKvTable<ReviewIssueRecord>()),
+    verifications: new DomainRepository<VerificationRecord, VerificationId>(createMemoryKvTable<VerificationRecord>()),
+    memories: new DomainRepository<MemoryRecord, MemoryId>(createMemoryKvTable<MemoryRecord>()),
+    concepts: new DomainRepository<any, any>(createMemoryKvTable<any>()),
+  }
 }
