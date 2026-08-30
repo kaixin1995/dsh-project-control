@@ -20,7 +20,7 @@ import { ProjectService } from '../domain/project.ts'
 import type { ProjectControlService } from './service.ts'
 
 export const name = 'project-control-api'
-export const inject = ['webServer', 'projectControl']
+export const inject = ['projectControl']
 
 const ROUTE_PREFIX = '/project-control/api'
 
@@ -191,75 +191,77 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
  */
 export function apply(ctx: Context): void {
   const service = ctx.projectControl as ProjectControlService
-  const webServer = ctx.webServer
-  if (webServer === undefined || webServer === null) {
-    throw new Error('project-control-api: ctx.webServer is not available (web profile only)')
-  }
+  // webServer 只存在于 web 面 composition：headless / sdk / acp 无此服务，
+  // ctx.inject 静默不触发，插件照常激活（不产生 pending）。
+  ctx.inject(['webServer'], (scope: Context) => {
+    const webServer = scope.webServer
+    if (webServer === undefined || webServer === null) return
 
-  const disposeRoute = webServer.register({
-    kind: 'prefix',
-    path: ROUTE_PREFIX,
-    handler: async (req: IncomingMessage, res: ServerResponse) => {
-      const denied = trustFence(req, res)
-      if (denied !== undefined) return
+    const disposeRoute = webServer.register({
+      kind: 'prefix',
+      path: ROUTE_PREFIX,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        const denied = trustFence(req, res)
+        if (denied !== undefined) return
 
-      const url = new URL(req.url ?? '/', 'http://localhost')
-      const routePath = url.pathname.slice(ROUTE_PREFIX.length)
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const routePath = url.pathname.slice(ROUTE_PREFIX.length)
 
-      if (req.method === 'GET' && routePath === '/state') {
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify(buildState(service)))
-        return
-      }
-
-      if (req.method === 'POST' && routePath === '/bootstrap') {
-        if (service.store === undefined) {
-          res.writeHead(503, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'service not started' }))
+        if (req.method === 'GET' && routePath === '/state') {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(buildState(service)))
           return
         }
-        try {
-          const body = await readJsonBody(req)
-          const rootPathRaw = body['rootPath']
-          const rootPath = typeof rootPathRaw === 'string' && rootPathRaw.length > 0
-            ? rootPathRaw
-            : service.currentProject?.identity.rootPath
-          if (rootPath === undefined) {
-            res.writeHead(400, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ error: 'no project root known; pass rootPath' }))
+
+        if (req.method === 'POST' && routePath === '/bootstrap') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
             return
           }
-          const projectService = new ProjectService(
-            service.store.projects,
-            (args, cwd) => service.git.runGit(args, cwd),
-          )
-          const ensured = await projectService.ensureProject(rootPath)
-          service.currentProject = ensured.project
-          const pipeline = new BootstrapPipeline(
-            service.git,
-            new GenericLanguageAnalyzer(),
-            service.store.checkpoints,
-          )
-          const checkpoint = await pipeline.runBootstrap(ensured.project.id, rootPath)
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({
-            ok: true,
-            checkpointId: checkpoint.id,
-            summary: checkpoint.summary,
-            techStack: checkpoint.techStack,
-            symbolsCount: checkpoint.topLevelSymbols.length,
-          }))
-        } catch (error: unknown) {
-          res.writeHead(500, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          try {
+            const body = await readJsonBody(req)
+            const rootPathRaw = body['rootPath']
+            const rootPath = typeof rootPathRaw === 'string' && rootPathRaw.length > 0
+              ? rootPathRaw
+              : service.currentProject?.identity.rootPath
+            if (rootPath === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project root known; pass rootPath' }))
+              return
+            }
+            const projectService = new ProjectService(
+              service.store.projects,
+              (args, cwd) => service.git.runGit(args, cwd),
+            )
+            const ensured = await projectService.ensureProject(rootPath)
+            service.currentProject = ensured.project
+            const pipeline = new BootstrapPipeline(
+              service.git,
+              new GenericLanguageAnalyzer(),
+              service.store.checkpoints,
+            )
+            const checkpoint = await pipeline.runBootstrap(ensured.project.id, rootPath)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              ok: true,
+              checkpointId: checkpoint.id,
+              summary: checkpoint.summary,
+              techStack: checkpoint.techStack,
+              symbolsCount: checkpoint.topLevelSymbols.length,
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
         }
-        return
-      }
 
-      res.writeHead(404, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'not found' }))
-    },
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+      },
+    })
+
+    ctx.effect(() => disposeRoute, 'project-control: api route')
   })
-
-  ctx.effect(() => disposeRoute, 'project-control: api route')
 }

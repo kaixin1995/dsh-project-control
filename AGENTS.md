@@ -56,12 +56,27 @@
 
 ## 已查明的本体事实（避免重复踩坑）
 
-- `__DSH_BOOT__` 浏览器启动清单是**运行时**从挂载的 Loader 条目派生（`webserver/index-inject` 每次渲染触发），挂载即生效、无需重建 Web 应用。
-- Web 聊天的 markdown **不支持 mermaid**；流程图一期用文本链/自定义树组件渲染。
-- 工具的 `presentCall`/`presentResult` 视图词汇当前不被 Web 客户端消费；富卡片必须注册 keyed toolview（按工具名）。
+**工具与启动（2026-08-30 真机验证）**
+- 插件入口**禁止 `export default apply`**：loader 的 `unwrapExports` 先取 `exports.default`，函数插件会丢失 `inject` 元数据 → 启动报 `cannot get property "X" without inject`。
+- `defineTool` 的 schema DSL 严格约定：`parameters` 可选字段**省略 `required`**（写 `required: false` 即 `UNSUPPORTED_SCHEMA`）；`output.schema` 不支持 `required` 数组；object 必须显式 `additionalProperties: true|false`。
+- Windows 下 `cordis.yml`/patch 的绝对路径必须是 `file:///D:/...` URL（tsx ESM loader 拒绝 `D:` 协议，`ERR_UNSUPPORTED_ESM_URL_SCHEME`）。
+- 仓库根 `pnpm dsh`（repo CLI）与全局安装的 `dsh` 是**两个运行时**：cwd 不在本体仓库根时 `pnpm dsh` 会落到全局安装；profile 的 fallback 链接锚定创建它的 CLI。两者数据/包版本错位会互炸（例：仓库版 `.credentials.yaml` 嵌套布局 vs rc.7 旧版期望平铺字符串版）。
+- 本体源码运行的前置：`pnpm run build:lib:host`（typert-loader 需要 lib/typert.host.js）；web 面前端前置：`pnpm run build:lib:client` + `pnpm run build:web`（否则 SPA fallback 404）。
+- 本机 3080 的 web 是全局 dsh `lib/bin.js web`；验证用 `--no-open --port 3101` 防端口冲突。
+
+**UI 机制（已源码验证，2026-08-30）**
+- `__DSH_BOOT__` 运行时从挂载条目派生，挂载即生效、无需重建 Web 应用。
+- 客户端插件进图 = `package.json` 声明 `dsh.client`（platform web + inject 行）+ `exports['./client']` 指向预构建 `lib/client.js`（惰性 CJS 工厂格式，见"客户端打包格式契约"）。
+- `renderSlot` 有槽位所有权校验（`entry.children?.[key]`）→ **遮蔽 single 槽后无法重托管其子槽**；遮蔽 `conversation` 不可行。
+- **已验证可行的主区域重排方案**：遮蔽 `details` 单槽（priority -10，可逆——卸载即恢复官方 DetailsPanel）+ 组件注入样式表做网格列序视觉交换（`centerCol→order:3` 聊天最右，`detailsCol→order:2` 工作台居中；`[data-details-collapsed]` 无会话落地页恢复原生列序）。已实现于 `src/client/components/WorkspaceFrame.tsx`。
+- AppFrame 网格列是 CSS Modules 哈希类名 div，可用 `[class*="centerCol"]` 子串选择器定位；`[style*="grid-template-columns"]` 唯一锚定框架 div。
+- Web 聊天的 markdown **不支持 mermaid**；工具的 `presentCall/presentResult` 不被 Web 客户端消费（富卡片必须注册 keyed toolview）。
 - `dsh` CLI 源码启动走 tsx ESM-only 钩子；仓外插件按 ESM 编写即可。
-- 本体压缩功能（compaction）依赖模型 contextWindow 元数据：自定义路由缺 `contextWindow` 时自动压缩会静默失效（只 warn 一次），详见本体根 `AGENT_PROJECT_GUIDE.md` 的排错记录。
+- 本体压缩功能依赖模型 contextWindow 元数据：自定义路由缺 `contextWindow` 时自动压缩静默失效（只 warn 一次），详见本体根 `AGENT_PROJECT_GUIDE.md` 的排错记录。
 - 本体资料总览见 `../AGENT_PROJECT_GUIDE.md`（本体根目录的本地未跟踪文件）。
+
+**待查证（下一会话优先）**
+- 源码启动（repo CLI）下 web 的 `__DSH_BOOT__` 图为空（连官方 ui 包都未进图，无告警——疑似 `loader.internal.resolveSync` 在 tsx/Windows 下静默失败、warn 被内部 logger 吞掉）。用户日常 3080 用的是全局安装 rc.7，图正常。需决定：插件验证走哪条运行时路径，或定位 resolveSync 问题（vendor 代码，受零改动铁律约束，只能上报或绕过）。
 
 ## 术语
 

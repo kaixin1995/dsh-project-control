@@ -13,8 +13,8 @@ import { apply as apiRoutePlugin } from './plugin/api-route.ts'
 
 /** 插件名称 */
 export const name = 'project-control'
-/** 注入的服务依赖 */
-export const inject = ['storage', 'tools', 'commands', 'webServer']
+/** 注入的服务依赖（webServer 为可选动态注入，headless 等无 web 面不阻塞激活） */
+export const inject = ['storage', 'tools', 'commands']
 
 /**
  * 插件装配函数：挂载服务插件、工具插件、命令插件与 API 路由插件
