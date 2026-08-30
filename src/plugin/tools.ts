@@ -18,6 +18,8 @@ import { EvidenceManager } from '../analysis/evidence.ts'
 import { ChangeService } from '../domain/change.ts'
 import { ChangeId } from '../domain/ids.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { collectSymbolReferences } from '../analysis/lsp-evidence.ts'
+import { GenericLanguageAnalyzer } from '../analysis/language.ts'
 import { VerificationRunner } from '../verification/service.ts'
 import { DeterministicBuildVerifier } from '../verification/verifier.ts'
 import { UnitTestVerifier } from '../verification/verifier.ts'
@@ -291,6 +293,58 @@ export function registerTools(ctx: Context): void {
     },
   })
 
+  // ── 影响分析 ──────────────────────────────────────────────────────────
+
+  const queryImpactTool = defineTool({
+    name: 'query_impact',
+    description: 'Find references of a symbol across the workspace and classify evidence level. Uses the language server when available (semantic, lsp_symbol evidence); degrades to text scan (file_ast evidence) with the degradation labeled.',
+    parameters: {
+      symbolName: { type: 'string', required: true, description: 'Symbol name to look up.' },
+      filePath: { type: 'string', description: 'File where the symbol is defined (used for LSP cursor positioning when a language server is available).' },
+      line: { type: 'number', description: 'Zero-based line of the symbol in filePath (for LSP).' },
+      character: { type: 'number', description: 'Zero-based character of the symbol in filePath (for LSP).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          evidenceSource: { type: 'string' },
+          referenceCount: { type: 'number' },
+          references: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { evidenceSource: string; referenceCount: number; references: string }
+        return [{ type: 'text', text: `Evidence source: ${result.evidenceSource} (${result.referenceCount} references)
+${result.references}` }]
+      },
+    },
+    async execute(args: { symbolName: string; filePath?: string; line?: number; character?: number }, exec: ToolRunContext) {
+      const service = control(ctx)
+      const cwd = workdir(exec)
+      const analyzer = new GenericLanguageAnalyzer()
+      const filePath = args.filePath ?? ''
+      const evidence = await collectSymbolReferences(
+        ctx,
+        analyzer,
+        args.symbolName,
+        cwd,
+        filePath,
+        { line: args.line ?? 0, character: args.character ?? 0 },
+        exec.signal,
+      )
+      const referenceText = evidence.references.length === 0
+        ? 'No references found.'
+        : evidence.references.slice(0, 40).map((reference) => `- ${reference.filePath}:${reference.line}`).join('\n')
+      return {
+        evidenceSource: evidence.source,
+        referenceCount: evidence.references.length,
+        references: referenceText,
+      }
+    },
+  })
+
   // ── Review 与 Verification ───────────────────────────────────────────
 
   const runReviewTool = defineTool({
@@ -557,6 +611,7 @@ export function registerTools(ctx: Context): void {
     createPlanTool,
     startRunTool,
     analyzeChangeTool,
+    queryImpactTool,
     runReviewTool,
     runVerificationTool,
     recordMemoryTool,

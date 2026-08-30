@@ -1,60 +1,66 @@
-# dsh-project-insight
+# dsh-project-control
 
-AI 项目变更认知与核查工具 —— [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的**仓外插件**。
+**AI 项目认知与开发控制插件** —— [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的仓外插件。让开发者在 AI 大量参与开发后，依然拥有对项目的**理解权、判断权、控制权**。
 
-## 定位
-
-> AI 可以帮助我们写更多代码，但开发者必须拥有比以前更强的项目认知能力。
-
-本插件围绕 **代码变更、项目理解、影响分析、方案核查、开发学习和长期项目记忆**，形成一条完整链路：
-
-```
-代码变化 → 功能变化 → 影响范围 → 方案核查 → 项目记忆
+```text
+代码变化 → 功能变化 → 影响范围 → 方案核查 → 执行控制 → 项目记忆 → 学习模式
 ```
 
-核心竞争力不是又一份 AI Code Review，而是「**变更影响图 + 项目记忆 + 最小侵入分析**」。
+核心竞争力：**变更影响图 + 项目记忆 + 最小侵入分析 + 独立 Review/Verifier**（不是又一份 AI Code Review）。
 
-## 与 dsh 本体的关系
+## 功能总览（首版已全部交付并真机验证）
 
-- **零本体改动**：本插件只通过 dsh 文档化扩展点工作（工具、命令、prompt section、一次性 LLM 调用、subprocess/LSP、`ctx.fs`、`ctx.webServer`、客户端插槽系统）。
-- 本仓库位于 `deepseek-harness/` 仓库根目录下仅为开发便利（`pnpm dsh --patch <绝对路径>` 从本体根启动、tsx 源码加载需要向上解析本体 workspace 的 `node_modules`）；本体通过 `.git/info/exclude` 屏蔽本目录，两边 git 互不可见。
-- 本仓库目前是**纯本地仓库**（无 remote，不推送云端）。
+| 能力 | 说明 |
+|---|---|
+| 项目认知 | 一键初始化：仓库结构 / 技术栈 / 符号索引 / 近期提交扫描 |
+| 变更分析 | `analyze_change`：git diff 证据 + LLM 语义摘要（"这次修改做了什么"），全部结论可溯源到 file:line |
+| 影响分析 | `query_impact`：符号引用检索——LSP 语义级优先（lsp_symbol 证据），缺失自动降级文本扫描（file_ast 证据）并标注证据等级 |
+| 计划与执行 | `create_plan`（版本化）/ `start_run`：每步骤独立子代理 Attempt 执行，`project_control_step_complete` 完成协议 + 工作区真值校验 + 重试/成本预算，**AI 不能自己宣布成功** |
+| 独立 Review | `run_review`：Reasoning 级只读评审 → Review Issue 落盘 |
+| 独立验收 | `run_verification`：确定性 build/test → 证据一致性 → LLM 启发 → 人工，**确定性失败不可被 LLM 覆盖** |
+| 项目记忆 | `record_memory`（analysis 级）/ 人工确认升级 confirmed / `recall_project` 有据回答；执行时自动注入相关约束上下文 |
+| 历史重建 | Legacy Bootstrap：commit 扫描 + 时间窗口/文件重叠聚类 → Imported Change（inferred 置信度）；可选 L1 逐提交 LLM 轻析（`historySummaries` 开关或调用时 `summarize`） |
+| Web 工作台 | 官方侧栏不动；**工作台居中**（总览/变更/执行/记忆/历史五页签，真实数据 4s 轮询）+ **聊天最右**；明暗主题自适应；🧭按钮可逆切换工作台⇄官方详情面板 |
+| 模型分级 | fast / standard / reasoning / verifier 四级路由映射 + 成本估算与三级预算护栏 |
 
-## 仓库状态
+真值模型贯穿全部数据：`fact`（代码/git/build/test）→ `confirmed`（仅人工）→ `analysis`（LLM，永不自动升级）。
 
-- [x] 产品总纲（业主确认）：[docs/product-master-plan.md](docs/product-master-plan.md)（V0.4 全文收编）
-- [x] 技术设计（工程权威）：[docs/AI 项目认知与开发控制插件.md](docs/AI%20项目认知与开发控制插件.md)（V1.0，161 节；三处仓外约束修正见开发计划 R1–R3）
-- [x] **开发任务清单：[docs/development-plan.md](docs/development-plan.md)**（T0–T11 全任务分解 + 测试清单；**当前执行依据**）
-- [x] 新会话入口：[docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)
-- [x] 历史参考：[docs/v04-section-mapping.md](docs/v04-section-mapping.md)、[docs/design-scope.md](docs/design-scope.md)（部分被 V1.0 取代）
-- [x] **T0 前置验证与脚手架**（已完成：脚手架/服务冒烟/客户端bundle/storage-domain/worktree验证）
-- [x] **T1 领域模型与存储**（已完成：12种Branded ID/ULID/状态机矩阵/Truth model/CAS/三域Repository/ProjectService）
-- [x] **T2 Git 变更分析**（已完成：GitAdapter/WorkspaceSnapshot/baseRevision追踪/EvidenceManager/ChangeService/analyze_change工具/insight命令）
-- [x] **T3 影响分析**（已完成：GenericLanguageAnalyzer/ProjectGraph/4级ImpactEngine/ContractAnalyzer）
-- [x] **T4 执行运行时**（已完成：PlanDagScheduler/StepAttemptRunner/WorktreeManager/RecoveryScanner）
-- [x] **T5 模型路由与成本核算**（已完成：ModelRouter/CostTracker/CostGuard预算硬约束）
-- [x] **T6 Review & Verification 引擎**（已完成：四层Priority Verifier/ReviewIssueManager/VerificationRunner）
-- [x] **T7 客户端 UI**（已完成：ChangeCard/Slot注册/lib/client.js打包与状态同步）
-- [x] **T8 Legacy Bootstrap（简化）**（已完成：4阶段轻量扫描/Checkpoint持久化/bootstrap命令与工具）
-- [x] **T9 记忆与概念提取**（已完成：MemoryService/人工确认晋升/真值防降级/MemoryContextInjector）
-- [x] **T10 学习与模式泛化**（已完成：ConceptService/PatternLearner/置信度增强）
-- [x] **T11 打包、分发与全链路验收**（已完成：E2E全链路验收测试通过、lib/client.js 打包、Cordis patch 验证通过）= **🎉 全部任务圆满交付！**
-- [ ] T5 模型路由/成本 → T6 Review/Verification → T7 客户端 UI → T8 Legacy Bootstrap（简化）= **首版**
-- [ ] T9 记忆 → T10 学习 → T11 打包安装 →（后置：C# Roslyn 宿主、并行 Plan）
+## 安装
 
-任务、完成标准与测试细节见 [docs/development-plan.md](docs/development-plan.md)。
-
-## 开发与安装（规划）
+要求 dsh ≥ 0.1.1-rc.2（`npm i -g @deepseek-ai/dsh@latest`）。
 
 ```sh
-# 开发循环（在本体仓库根目录执行；需本体已完成 pnpm install）
-pnpm dsh web --patch /绝对路径/deepseek-harness/dsh-project-insight/cordis.yml
-
-# 安装为正式 bundle（M6 之后）
+# 从本目录安装到任一 profile（web / headless / sdk / 自定义均可）
 dsh plugin --profile <name> add /绝对路径/dsh-project-insight
-dsh --profile <name> --dump-config   # 验证层
+dsh --profile <name> --dump-config   # 验证组合层出现 "# == dsh-project-control"
+dsh --profile <name>                 # 启动；web 面打开后侧栏底部点「🧭 工作台」
 ```
 
-## 给 agent 的说明
+- **web / sdk 面**：存储栈由面自带，开箱即用。
+- **headless 面**：0.1.1 起不挂存储栈；需要持久化时在该 profile 的 `cordis.patch.yml` 用户层补三行（见 [cordis.patch.yml](cordis.patch.yml) 内注释模板）。
 
-本仓库内的自动化会话请先读 [AGENTS.md](AGENTS.md) —— 它规定了不可违背的工程铁律（零本体改动、扩展点白名单、已验证的仓外插件硬约束）。
+## 配置
+
+settings 面板 `project-control` 命名空间或 cordis.yml 均可覆盖：
+
+- `modelTiers` — fast / standard / reasoning / verifier 四级模型路由（缺省回落会话当前路由）
+- `budgets` — step / run / change 美元预算护栏
+- `retry` — 最大尝试次数、退避上下限、模型升级开关
+- `bootstrap` — 扫描范围、单次上限、`historySummaries` 逐提交轻析开关
+- `buildCommand` / `testCommand` — 确定性验收命令（按项目技术栈配置）
+- `analysisMaxTokens` / `analysisTimeoutMs` — 一次性分析上限
+
+## 面向 agent 的说明
+
+本仓库内的自动化会话必须先读 [AGENTS.md](AGENTS.md)——工程铁律（零本体改动、扩展点白名单、客户端打包契约、rc.2 运行时事实）与本体事实库都在那里。新会话入口：[docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)。
+
+## 文档
+
+- 产品总纲（业主确认）：[docs/product-master-plan.md](docs/product-master-plan.md)
+- 技术设计 V1.0（工程权威）：[docs/AI 项目认知与开发控制插件.md](docs/AI%20项目认知与开发控制插件.md)
+- 开发任务清单：[docs/development-plan.md](docs/development-plan.md)
+- 会话交接：[docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)
+
+## 许可
+
+随宿主分发策略（MIT，同 deepseek-harness）。

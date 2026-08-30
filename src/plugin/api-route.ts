@@ -18,6 +18,7 @@ import { BootstrapPipeline } from '../bootstrap/pipeline.ts'
 import { GenericLanguageAnalyzer } from '../analysis/language.ts'
 import { ProjectService } from '../domain/project.ts'
 import { scanHistory } from '../runtime/history.ts'
+import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
 import type { ProjectControlService } from './service.ts'
 
 export const name = 'project-control-api'
@@ -275,9 +276,36 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             )
             const checkpoint = await pipeline.runBootstrap(ensured.project.id, rootPath)
           const scanHistoryFlag = body['includeHistory'] === true
+          const wantSummaries = service.liveConfig.bootstrap.historySummaries || body['summarize'] === true
           let importedCount = 0
           if (scanHistoryFlag && service.store.importedChanges !== undefined) {
-            const imported = await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits: service.liveConfig.bootstrap.defaultMaxCommits })
+            // L1 逐提交轻析：config 开关或调用方显式请求时启用；Fast 等级路由，成本有界。
+            const summaries = wantSummaries
+              ? {
+                  maxSummarized: 30,
+                  run: async (fact: { subject: string; files: string[]; insertions: number; deletions: number }) => {
+                    const tier = service.liveConfig.modelTiers.fast
+                    const provider = tier?.provider || 'deepseek-official'
+                    const model = tier?.model || 'deepseek-chat'
+                    const result = await runLlmAnalysis(ctx, {
+                      prompt: [
+                        'Summarize what this commit changed in ONE short sentence (<= 25 words), in the same language as the commit message.',
+                        '',
+                        `Subject: ${fact.subject}`,
+                        `Files (${fact.files.length}): ${fact.files.slice(0, 10).join(', ')}`,
+                        `Lines: +${fact.insertions}/-${fact.deletions}`,
+                      ].join('\n'),
+                      provider,
+                      model,
+                      maxTokens: 128,
+                      timeoutMs: 30_000,
+                      purpose: 'project-control-history',
+                    })
+                    return result.text
+                  },
+                }
+              : undefined
+            const imported = await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits: typeof body['maxCommits'] === 'number' ? Math.min(body['maxCommits'], service.liveConfig.bootstrap.maxCommitsPerRun) : service.liveConfig.bootstrap.defaultMaxCommits, summaries })
             importedCount = imported.length
           }
             res.writeHead(200, { 'content-type': 'application/json' })

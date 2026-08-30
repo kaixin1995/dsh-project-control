@@ -20,6 +20,8 @@ export interface ImportedChangeRecord {
   lastCommitAt: number
   files: string[]
   modules: string[]
+  /** L1 逐提交轻析（Fast 级一句话；historySummaries 关闭时缺省）。与 commitShas 前 N 条对齐。 */
+  commitSummaries?: string[]
   /** 启发式置信度 0..1（时间凝聚度 × 文件重叠度）。 */
   confidence: number
   status: 'inferred' | 'confirmed' | 'rejected'
@@ -30,6 +32,12 @@ export interface HistoryScanOptions {
   maxCommits: number
   /** 聚类时间窗口（毫秒）：相邻提交间隔超过该值则切开新簇。 */
   clusterGapMs: number
+  /** L1 逐提交轻析（Fast 级）；调用方注入 LLM 回调，扫描本身保持无 ctx 依赖。 */
+  summaries?: {
+    /** 单次扫描最多轻析的提交数（成本上限）。 */
+    maxSummarized: number
+    run: (fact: CommitFact) => Promise<string>
+  }
 }
 
 export const HISTORY_SCAN_DEFAULTS: HistoryScanOptions = {
@@ -48,6 +56,8 @@ interface CommitFact {
   insertions: number
   deletions: number
   isMerge: boolean
+  /** L1 轻析结果（未启用时缺省）。 */
+  aiSummary?: string
 }
 
 /** 从 git numstat 提取单提交的文件与增删行数。 */
@@ -126,6 +136,20 @@ export async function scanHistory(
   const opts = { ...HISTORY_SCAN_DEFAULTS, ...options }
   const commits = await git.getLog(cwd, { maxCount: opts.maxCommits })
   const facts = await commitFacts(git, cwd, commits)
+
+  // L1 逐提交轻析（V1.0 §96 第一层）：预算有界，单条失败回落 commit subject。
+  if (opts.summaries !== undefined) {
+    const budget = Math.min(opts.summaries.maxSummarized, facts.length)
+    for (let index = 0; index < budget; index++) {
+      const fact = facts[index]!
+      try {
+        fact.aiSummary = await opts.summaries.run(fact)
+      } catch {
+        fact.aiSummary = fact.subject
+      }
+    }
+  }
+
   const clusters = clusterCommits(facts, opts)
 
   const records: ImportedChangeRecord[] = []
@@ -141,6 +165,7 @@ export async function scanHistory(
       projectId,
       title: cluster[0]!.subject,
       commitShas: cluster.map((fact) => fact.hash),
+      commitSummaries: cluster.slice(0, 5).map((fact) => fact.aiSummary ?? fact.subject),
       firstCommitAt: cluster[0]!.committedAt,
       lastCommitAt: cluster[cluster.length - 1]!.committedAt,
       files: files.slice(0, 50),
