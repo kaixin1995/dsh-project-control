@@ -4,7 +4,6 @@
  * - sidebar.footer.action
  * - tool.call.toolview
  * - conversation.session.header.actions
- * - conversation.view
  *
  * @module dsh-client-project-control
  */
@@ -22,6 +21,7 @@ export function apply(ctx: any): void {
   // 1. 侧边栏底部操作入口 (Sidebar Footer Action)
   slots.register({
     name: 'sidebar.footer.action',
+    id: 'project-control-action',
   }, () => {
     return React.createElement(
       'button',
@@ -43,13 +43,14 @@ export function apply(ctx: any): void {
           console.log('Project Control sidebar entry clicked')
         },
       },
-      '📊 项目控制 (Project Control)',
+      '📊 项目控制',
     )
   })
 
   // 2. 自定义变更卡片工具视图 (Tool Call Toolview for analyze_change)
   slots.register({
     name: 'tool.call.toolview',
+    key: 'analyze_change',
   }, (props: any) => {
     if (props?.toolName !== 'analyze_change') return null
 
@@ -67,6 +68,7 @@ export function apply(ctx: any): void {
   // 3. 会话标题状态徽标 (Conversation Session Header Actions)
   slots.register({
     name: 'conversation.session.header.actions',
+    id: 'project-control-badge',
   }, () => {
     return React.createElement(
       'div',
@@ -82,24 +84,7 @@ export function apply(ctx: any): void {
           alignItems: 'center',
         },
       },
-      '🛡️ Project Insight 运行中',
-    )
-  })
-
-  // 4. 会话视图扩展插槽 (Conversation View)
-  slots.register({
-    name: 'conversation.view',
-  }, () => {
-    return React.createElement(
-      'div',
-      {
-        'data-testid': 'project-control-panel-overlay',
-        style: {
-          padding: '8px 12px',
-          fontSize: '12px',
-          opacity: 0.9,
-        },
-      },
+      '🛡️ Project Insight 活跃',
     )
   })
 }

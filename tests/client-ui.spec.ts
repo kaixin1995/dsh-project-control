@@ -26,7 +26,6 @@ describe('Client UI & Slot Registration (T7.1 - T7.4)', () => {
     expect(registeredSlots).toContain('sidebar.footer.action')
     expect(registeredSlots).toContain('tool.call.toolview')
     expect(registeredSlots).toContain('conversation.session.header.actions')
-    expect(registeredSlots).toContain('conversation.view')
   })
 
   it('T7.2: renders ChangeCard React element with correct props and badges', () => {
