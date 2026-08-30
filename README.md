@@ -22,15 +22,16 @@ AI 项目变更认知与核查工具 —— [deepseek-harness](https://github.co
 
 ## 仓库状态
 
-- [x] 立项与设计范围文档：[docs/design-scope.md](docs/design-scope.md)（**待业主审查**，审查通过前不开发）
-- [ ] M1 宿主骨架 + git 证据 + `/insight` 变更摘要报告
-- [ ] M2 影响三级图 + 侵入核查 + 风险/测试建议
-- [ ] M3 项目记忆库 + `/why` + 记忆工具
-- [ ] M4 开发笔记 + 学习模式
-- [ ] M5 Web UI（客户端打包管线 + 工具卡片 + 侧边面板）
-- [ ] M6 自动提醒 + bundle 打包 + `dsh plugin add` 安装验证
+- [x] 产品总纲（业主确认）：[docs/product-master-plan.md](docs/product-master-plan.md)（V0.4 全文收编）
+- [x] 工程实施案：[docs/design-scope.md](docs/design-scope.md)（五阶段映射，**待业主审查**，审查通过前不开发）
+- [x] 总纲逐节映射：[docs/v04-section-mapping.md](docs/v04-section-mapping.md)（101 节穷尽，含 3 处已论证的字面差异）
+- [ ] P1 "AI 到底改了什么"：项目识别 + 老项目轻量初始化 + Change + 分析管线 + 记忆库 + Web 首块 UI
+- [ ] P2 "过程怎么控制"：状态机 + 已确定/冲突检测 + 执行中心 + Plan 对接本体
+- [ ] P3 "真的做好了吗"：Reviewer/Verifier + Review Issue + 模型等级 + 成本统计
+- [ ] P4 "项目为什么变成今天这样"：完整 Git 历史重建 + 演化 + 时间线
+- [ ] P5 "开发者理解了吗"：学习模式全家桶
 
-里程碑与范围细节见 [docs/design-scope.md](docs/design-scope.md)。
+阶段与范围细节见 [docs/design-scope.md](docs/design-scope.md)。
 
 ## 开发与安装（规划）
 

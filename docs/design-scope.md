@@ -1,177 +1,142 @@
-# dsh-project-insight 设计范围文档
+# dsh-project-insight 工程实施案（V1 · 基于产品总纲 V0.4）
 
-> 状态：**待业主审查** —— 审查通过前不进入开发。审查意见请直接批注在本文件。
-> 依据：业主产品初稿《AI 项目变更认知与核查工具》+ 对 dsh 本体源码的逐条可行性验证（2026-08-30）。
-> 铁律：零 dsh 本体改动；全部通过本体文档化扩展点实现。
+> 状态：**待业主审查**。审查通过前不进入开发。
+> 文档关系：[product-master-plan.md](product-master-plan.md) = 产品方向唯一权威（业主确认）；本文档 = 工程实施映射；[v04-section-mapping.md](v04-section-mapping.md) = 总纲全部 101 节的逐节穷尽映射。
+> 铁律：**零 dsh 本体改动**；全部通过本体文档化扩展点实现。
 
 ---
 
-## 一、可行性结论（已逐条代码验证）
+## 一、架构总原则（把总纲翻译成工程约束的四条）
+
+1. **执行归本体，插件做编排与采证。** Run/Step/断点/重试全部复用本体（会话 turn/step 全落日志、会话 resume 即断点恢复、`llm-retry` 指数退避、`jobs` 后台作业、`agent.cancel()` 停止）；插件不建第二个执行引擎（仓外插件也没有驱动循环的权限面）。插件的 Run/Step 是**对本体事实的引用与聚合**，不是重放。
+2. **事实优先，AI 结论分级。** 插件只从可验证来源采证（git、会话日志 `tool/result`、Build/Test 输出、`assistant/message` 自带的 usage）；一切 AI 判断落盘时带 `confidence: fact | confirmed | inferred`（对应总纲 §84），推断永不静默升级为事实。
+3. **持久状态全部落目标仓库 `.insight/`。** 仓外插件禁止新增会话事件类型（重启会被本体拒读），模型可见内容经工具结果 / `deferContext` / `agent.inject()` 进入。
+4. **UI 只做插槽加法。** 只往 list/keyed 槽注册（`sidebar.footer.action`、`conversation.view`、`conversation.session.header.actions`、`tool.call.toolview`、`shell.overlay`）；**绝不 shadow 任何 single 槽**（会驱逐出厂 UI，破坏性且不可逆于体验）。
+
+---
+
+## 二、五阶段工程映射（对应总纲 §93–97）
+
+### P1 —— "AI 到底改了什么"（总纲 §93）
+
+| 项 | 内容 |
+|---|---|
+| 交付 | 项目识别（新旧项目检测）；**老项目轻量初始化**（最近 N commit 的 Imported Change 重建，走 L0+L1+L2 分层，见 §四）；Change 对象（创建/关联会话/基础状态）；`analyze_change` 完整分析管线（摘要/影响三级+无法确认/最小侵入/方案合理性与备选/风险/测试建议/轻量学习点）；基础流程图（文本链）；开发笔记；Commit 关联；`recall_project`/`record_decision`/`write_dev_note` 工具；`/insight` `/note` `/why` 命令；Web：工具卡片 + 「项目认知」页签（`conversation.view`）+ 侧边入口 |
+| 复用本体 | tools / commands / systemPrompt / llm（一次性调用）/ subprocess（git、rg）/ lsp（可选）/ fs / 插槽系统 + 客户端打包管线 |
+| 验证点 | M5 首日先以最小空客户端插件验证 `lib/client.js` 加载 |
+
+### P2 —— "AI 开发过程怎么控制"（总纲 §94）
+
+| 项 | 内容 |
+|---|---|
+| 交付 | Change 完整状态机（待分析→讨论中→方案确认→开发中→待 Review→待验证→完成/归档/取消）；需求管理（原始需求自动取自会话日志 + AI 整理 + 待确认清单）；**已确定事项 + 冲突检测**（监听 `fs/observed` 与 `tools/post-execute`，对照 confirmed 规则提示冲突）；执行中心视图（聚合本体 jobs + 会话状态 + 暂停/停止走编排级 `agent.cancel()`）；**Plan 对接本体 plan-mode**（引用 `/plan`、`exit_plan_mode`、`plan/mode` 日志状态，不自建 Plan 对象）；Build/Test 结果采证（从会话 `tool/result` 提取）；修改前后流程对比 |
+| 复用本体 | plan-mode、jobs、会话 resume（断点）、fs 事件、commands |
+
+### P3 —— "AI 到底有没有真正做好"（总纲 §95）
+
+| 项 | 内容 |
+|---|---|
+| 交付 | **Reviewer**（隔离子代理：`ctx.subagents` 起 per-child model 的独立审查代理，或一次性 LLM 评审）；**Verifier**（同机制 + 采证：需求逐条核对、已确定核查、Build/Test 证据、Review Issue 处理状态）；Review Issue 落盘与状态流转；证据式验收报告；**模型等级体系**（Fast/Standard/Reasoning/Verifier → 具体 provider/model 的配置映射，`modelTiers` 配置节）；经济/均衡/高质量策略预设；自动升级建议器（修改面过大/触碰公共契约/连续失败时建议升级）；成本统计（聚合会话 usage，按 Change/阶段分账） |
+| 复用本体 | subagents（per-child model）、会话 usage 数据、token-meter 投影 |
+
+### P4 —— "项目为什么变成今天这样"（总纲 §96）
+
+| 项 | 内容 |
+|---|---|
+| 交付 | **完整 Legacy Bootstrap**（范围选择+规模预估、进度页、暂停/继续/断点续跑）；Commit 聚类成 Imported Change（时间窗口+文件重叠启发式）；模块演化（模块卡历史聚合）；功能演化（Feature 版本链）；项目时间线；历史补充确认（[确认]/[修改描述]/[不确定]/[忽略] → confidence 升级）；历史风险提醒（修改高频事故模块时主动 recall） |
+| 复用本体 | git（subprocess）、记忆库机制（P1 建立） |
+
+### P5 —— "开发者是否真正理解"（总纲 §97）
+
+| 项 | 内容 |
+|---|---|
+| 交付 | 学习模式配置（主语言/项目语言）；跨语言解释（学习管线）；Review 教学模式（Reviewer 输出的教学变体）；Change 学习总结（3–5 知识点，P1 已有轻量版深化）；知识接触记录（`.insight/learning/`：已接触/频繁出现/建议重点学习） |
+
+---
+
+## 三、已验证的可行性结论（不变，沿用前版）
 
 | 需求 | 可行性 | 机制 |
 |---|---|---|
 | 模型工具 / 斜杠命令 / prompt 段落 | ✅ 纯运行时 API | `ctx.tools.register(defineTool)`、`ctx.commands.register`、`ctx.systemPrompt.section` |
-| 一次性 LLM 分析调用 | ✅ | `ctx.llm.stream` + BlockAssembler（范本：本体 compaction summarizer、session-title-llm） |
-| git / rg / LSP 证据收集 | ✅ | `ctx.subprocess.spawn`（范本：本体 tool-fs-search 的 ripgrep）；`ctx.lsp` 可选注入 |
-| 文件写入（沙箱/E2B 远程世界兼容） | ✅ | `ctx.fs.writeText` + CAS 意图（`createIfAbsent` / `replaceIfVersion`） |
-| **自定义 Web UI（面板/布局/卡片）** | ✅ 有条件 | `dsh.client` 双入口包 + 预构建 `lib/client.js`（惰性 CJS 工厂格式），运行时进入 `__DSH_BOOT__` 图，经 `/plugins` 路由下发，无需重建 Web 应用（本体文档明示此路径零仓库改动） |
-| 持久会话事件 | ❌ 硬约束绕开 | 仓外插件新增 SessionEventMap 类型重启后会被本体拒读 → 本插件零会话事件，持久状态全走 `.insight/` 文件 |
+| 一次性 LLM 分析调用 | ✅ | `ctx.llm.stream` + BlockAssembler（范本：本体 compaction summarizer） |
+| git / rg / LSP 证据 | ✅ | `ctx.subprocess.spawn`；`ctx.lsp` 可选注入 |
+| 文件写入（沙箱/E2B 兼容） | ✅ | `ctx.fs` + CAS 意图 |
+| 隔离 Reviewer/Verifier | ✅ | `ctx.subagents`（per-child model） |
+| 自定义 Web UI | ✅ 有条件 | `dsh.client` 双入口包 + 预构建 `lib/client.js`（惰性 CJS 工厂格式，自行用 esbuild 复刻，契约见 AGENTS.md）；运行时进入 `__DSH_BOOT__` 图 |
+| 持久会话事件 | ❌ 绕开 | 零会话事件；状态全走 `.insight/` |
+| 默认落地视图改为项目首页 | ❌ 不做破坏性方案 | 本体 `DEFAULT_VIEW_ID='chat'` 硬编码；改为"一键可达"的首页仪表盘页签（见 §五） |
 
-**两个必须正视的成本**：
+## 四、Legacy Bootstrap 分层预算（总纲 §8–20 的成本设计）
 
-1. **客户端打包格式需自行复刻**：产物必须是 CJS、`entryFileNames: 'client.js'`、逐字包裹 `window.__ModuleLoader__.load({ id: <pkg>, factory: (require) => { … return module.exports } })`；外部依赖仅限 8 个平台词（react、react-dom、cordis、client-store、ui-slots、ui-primitives 及其子路径）+ `dsh.client.external` 声明的图内行。本体不发布该构建预设（`packages/client/tsdown.client.ts` 为仓内文件），本插件用 esbuild 写等效配置（约 30 行）。开发期自带 watcher 重写 `lib/client.js`，本体宿主侧 HMR 自动热重载页面。
-2. **面板数据通道**：仓外无法使用 typert 生成的 Remote 命名空间（本体构建期工具、仓内专属）。方案：宿主半边在 `ctx.webServer` 注册自有 JSON 路由（`/insight-plugin/api/...`），处理器内自复刻本体 Origin/Host 信任围栏；工具卡片数据直接来自落盘的 `tool/result` meta，无需 RPC。
+**原则：LLM 只花在判断上，事实零成本。**
 
----
+| 层 | 内容 | 成本 |
+|---|---|---|
+| L0 事实层 | `git log` 统计、文件清单、模块聚合、高频修改榜、时间窗口——纯本地计算 | 零 LLM |
+| L1 全量轻析 | 每个 commit 仅一句话"改了什么/涉及哪些模块"（Fast 等级；输入只给 stat + 关键 diff 摘要，≤2KB/commit） | ~150 token 出/2K 入 × commit 数 |
+| L2 聚类 | 时间窗口 + 文件重叠 + 分支启发式聚成 Imported Change；仅歧义处用 Fast 裁决 | 近零 |
+| L3 重点详析 | 仅对"大 Change / 触碰公共契约 / 用户指定"用 Standard 详析（背景/取舍/后果） | 按选择 |
 
-## 二、包结构与组成（规划）
+配套机制：游标文件记录分析进度（`.insight/history/cursor.json`），支持暂停/续跑/重开续；范围选项（50/100 commit、6 个月、1 年、全量、指定区间）+ 预估规模展示（L0 先算）；`maxCommitsPerRun` 防失控。Imported Change 一律标 `confidence: inferred`，人工确认后升级 `confirmed`。
 
-```
-dsh-project-insight/                     # npm 包（业主自有 scope）
-├── package.json                         # dsh.bundle.patch + dsh.client + exports['./client'] + 生产依赖声明
-├── cordis.patch.yml                     # bundle 安装层：插入宿主行（裸名=自身子路径导出）
-├── src/                                 # ── 宿主半边（Node）──
-│   ├── service.ts                       # ProjectInsightService → ctx.projectInsight（编排器）
-│   ├── git.ts                           # git status/diff/log/show（ctx.subprocess，cwd=会话 cwd∩沙箱根）
-│   ├── evidence.ts                      # 证据收集：diff 解析、文件分组、rg 引用、可选 LSP findReferences
-│   ├── session-task.ts                  # 从会话日志取本 turn 任务原文（"为什么改"的唯一权威来源）
-│   ├── analyzer.ts                      # LLM 综合分析（JSON schema 输出，失败重试 1 次→降级纯文本）
-│   ├── report.ts                        # Markdown 报告/笔记渲染
-│   ├── memory.ts                        # .insight/ 记忆库：目录/索引/CAS 写入/摘要抑制
-│   ├── tools.ts                         # 5 个模型工具
-│   ├── commands.ts                      # /insight /note /why
-│   ├── api-route.ts                     # 面板 JSON 路由（webServer + 信任围栏）
-│   └── prompts.ts                       # insight:policy 段落 + 分析提示词
-├── src/client/                          # ── 浏览器半边 ──
-│   ├── index.ts                         # dsh.client 入口：注册 UI
-│   ├── toolviews/                       # analyze_change / query_impact 专属工具卡片（keyed toolview）
-│   ├── panel/                           # 「项目认知」侧边面板：最近分析、commit 时间线、决策浏览
-│   └── locales.ts                       # ctx.locale.register(ns, {zh,en})
-├── build-client.mjs                     # esbuild 复刻惰性 CJS 工厂格式
-└── tests/                               # vitest：纯函数 + git 临时仓库 fixture
-```
+## 五、UI 能力边界（已验证，2026-08-30）
 
-宿主行（cordis.patch.yml 插入 4 行）：`service`（inject: llm,subprocess,fs,webServer）、`tools`、`commands`、`insight-ui`（空 apply，仅为携带 dsh.client 进图）。
+| 总纲需求 | 结论 | 机制 |
+|---|---|---|
+| 侧边面板/入口 | ✅ 加法 | `sidebar.footer.action`（list；范本 ui-cordis 的 CordisPanel） |
+| 主区域整页（项目认知/Change 工作台/执行中心/历史页） | ✅ 加法 | `conversation.view`（list；自带页签；范本 ui-trajectory；`replaceRisk: none`） |
+| 会话头操作按钮 | ✅ 加法 | `conversation.session.header.actions`（list；范本 ui-jobs） |
+| 工具富卡片 | ✅ | `tool.call.toolview`（keyed 按工具名） |
+| 无会话全屏面板 | ✅ | `shell.overlay`（list；自行接管指针事件） |
+| **默认落地视图 = 项目首页** | ⚠️ 调整实现 | 本体硬编码；改为「项目认知」页签 + `openView()` 一键直达 + 侧边仪表盘。**不做 single 槽 shadow**（驱逐出厂 UI） |
+
+布局调整原则：一切经插槽加法完成，页面内部布局由本插件组件自管。
 
 ---
 
-## 三、项目记忆设计（四套本体范本合成）
-
-### 3.1 存储：仓库内 `.insight/`（可配置根，默认目标项目仓库根）
+## 六、数据模型（`.insight/`）
 
 ```
 .insight/
-├── insight.config.yaml      # 项目级覆盖（可选）
+├── insight.config.yaml
+├── project.md                     # 项目卡（名称/语言/框架/数据库/消息系统/核心模块索引）
+├── changes/<id>/                  # 原生 Change
+│   ├── change.md                  # frontmatter{id,title,type,status,createdAt,sessionRefs[],commits[],confidence}
+│   ├── requirements.md            # 原始需求（会话原文摘录）+ AI 整理 + 待确认清单
+│   ├── confirmed.md               # 已确定事项（规则，供冲突检测）
+│   ├── analysis/*.md              # 变更分析报告
+│   ├── review/*.md                # Review Issue
+│   ├── verification.md            # 证据式验收记录
+│   └── notes.md                   # 开发笔记
+├── history/                       # Git 历史重建（P4）
+│   ├── imported-changes/*.md      # frontmatter{commits[],period,confidence:inferred}
+│   ├── timeline.md                # 项目时间线
+│   └── cursor.json                # 重建进度游标
 ├── memory/
-│   ├── modules/*.md         # 模块卡：frontmatter{name,path,tags} + 正文(职责/关键类/表/消息/依赖)
-│   ├── decisions/*.md       # 决策卡：frontmatter{date,title,commits,modules,status} + 正文(背景/取舍/后果)
-│   └── flows/*.md           # 流程卡：frontmatter{name,level:project|feature|code,entry} + 正文(链路描述)
-├── notes/*.md               # 开发笔记：frontmatter{date,task,commits} + 模板章节(功能/需求/修改/影响/未影响/设计说明/风险/测试)
-├── analysis/*.md            # 变更分析报告：frontmatter{rev,date,task} + 正文(摘要/影响三级/侵入核查/替代方案/风险/测试建议/学习点)
-└── index.json               # 派生索引（可随时重建；建议 gitignore）
+│   ├── modules/*.md               # 模块卡（frontmatter 含 confidence）
+│   ├── decisions/*.md             # 决策卡
+│   ├── flows/*.md                 # 流程卡（level: project|feature|code）
+│   └── rules.md                   # 项目规则（总纲 §73）
+├── notes/                         # 独立开发笔记
+├── analysis/                      # 未挂 Change 的临时分析
+└── learning/                      # P5：知识接触记录
 ```
 
-全部为 frontmatter Markdown（与本体 skill-filesystem 同构格式），git 可 diff、人工可直接编辑、跨工具可迁移。默认约定：`.insight/` 进 git（团队共享记忆）；`.insight/index.json` 忽略。
+记忆机制沿用前版四范本合成：渐进披露（目录注入 + 工具按需加载）、摘要抑制（SHA digest）、变更感知（FsVersion+SHA 缓存）、CAS 写入（`FS_STALE_VERSION`=人先改→重读合并）、召回内容 `<untrusted>` 框。**新增**：全部卡片 frontmatter 带 `confidence` 字段（fact/confirmed/inferred），查询回答按总纲 §83/§85 标注来源与不确定性。
 
-### 3.2 机制（逐条对应本体范本）
+## 七、分析管线 / 工具与命令 / 配置 / 测试（沿用前版，要点）
 
-| 机制 | 本体范本 | 要点 |
-|---|---|---|
-| 渐进披露 | skill-filesystem + tool-skill | 注入模型的常驻内容只有目录（每条 name + 一句话摘要，字节预算内）；全文由 `recall_project` 工具按需加载 |
-| 摘要抑制 | skill-catalog 的 SHA 摘要 | 目录内容未变（digest 相同）不重复注入；变化时整体替换而非追加 |
-| 变更感知 | agent-instructions | `FsVersion` + 内容 SHA 缓存：未变文件不重读；人/模型改动记忆文件产生 set/replace/remove 增量通知 |
-| 写入安全 | fs CAS | `stat` 取版本 → `replaceIfVersion` 写回；`FS_STALE_VERSION` = 人先改了 → 重读合并（人的编辑永远优先） |
-| 信任边界 | session-reference | 召回的历史正文包 `<untrusted>` 框注入，防止记忆内容被当指令执行 |
-| 监视 | skill-filesystem | chokidar（depth 限制 + awaitWriteFinish）+ 监听 `fs/observed` 加速本方写入失效 |
+- 管线：静态证据（git diff/status/log + rg 引用 + 可选 LSP findReferences，全部 file:line 可溯源）→ 任务上下文（会话日志取本 turn 用户原文）→ LLM 综合（JSON schema：summary / impacts 四级（直接/间接/潜在/**无法确认**）/ intrusion+alternatives / risks / testSuggestions / learnings / flows；失败重试 1 次降级纯文本）→ 落盘 + 索引。
+- 工具：`analyze_change`、`query_impact`、`recall_project`、`record_decision`、`write_dev_note`（P1）；P2 增 `confirm_fact`/`check_conflicts`；P3 增 `run_review`、`run_verification`。
+- 命令：`/insight`、`/note`、`/why`（P1）；P2 增 `/change`、`/confirmed`；P3 增 `/review`、`/verify`。
+- 配置新增：`modelTiers{fast,standard,reasoning,verifier}`（等级→provider/model 映射）、`legacyBootstrap{defaultCommits,maxCommitsPerRun,inputBudgetPerCommit}`、`projectLanguage`/`userPrimaryLanguage`（P5）。
+- 测试：vitest 纯函数 + git 临时仓库 fixture；`pnpm mock:llm` + headless `--patch` 集成；UI 经 watcher→本体 HMR 手动验收；`dsh plugin add` 安装验证（P 末期）。
 
-### 3.3 写入权与生命周期
+## 八、风险与开放问题
 
-- **模型起草、人生效**：`record_decision` / `write_dev_note` / 模块卡更新由模型生成草稿落盘 → 开发者 `git diff` 审阅 → 随 commit 进库（"人是最终决策者"）。
-- **分析报告自动生成**：每次 `/insight` 或 `analyze_change` 落盘，frontmatter 记录 rev/task 关联。
-- **查询**：`/why <问题>` 与 `recall_project` = rg 检索索引 → 命中卡片 → LLM 归纳作答（附 file:line 溯源）。
-
----
-
-## 四、分析管线（静态证据 + LLM 综合）
-
-1. **证据（无模型，全部可溯源）**：`git status --porcelain`、`git diff [--cached]`、`git log/show`（collect 输出上限 `maxDiffBytes`，lossy 报错）；变更文件按模块分组；变更符号的 rg 引用检索；`ctx.lsp` 可用时 `findReferences`（`ctx.get('lsp')` 可选，缺失降级 rg 并在报告标注证据等级）。
-2. **任务上下文**：`session-task.ts` 从 `exec.agent.session` 派生本 turn 用户消息原文。
-3. **LLM 综合**：一次 `ctx.llm.stream` 调用（路由 config 指定，缺省回落会话当前路由；deadline/输入上限仿 session-title-llm）。输出 JSON schema：`summary`、`impacts{direct/indirect/potential}`（每项带证据引用）、`intrusion{touched,expected,verdict,alternatives[{name,pros,cons,recommended}]}`、`risks[]`、`testSuggestions[]`、`learnings[≤3]`、`flows[]`。校验失败重试 1 次 → 降级纯文本。
-4. **产物**：Markdown 报告落 `.insight/analysis/`，索引同步；工具结果返回摘要 + 报告路径 + 结构化 meta（供 UI 卡片渲染）。
-
-**流程图呈现**：报告内为 mermaid 代码块 + 文本链；Web 卡片中用自定义 React 树组件渲染（本体聊天 markdown 不支持 mermaid，不引本体改动）。
-
----
-
-## 五、交互面清单
-
-**模型工具（5 个，含 presentCall/presentResult 与并发分类）**：
-
-| 工具 | 作用 |
-|---|---|
-| `analyze_change(scope, depth)` | 完整变更分析（quick/full；full 含学习点与替代方案） |
-| `query_impact(target)` | 文件/符号的三级影响图 |
-| `recall_project(query)` | 检索项目记忆并归纳作答 |
-| `record_decision(title, rationale, refs)` | 起草决策卡落盘 |
-| `write_dev_note(draft)` | 按模板起草开发笔记 |
-
-**斜杠命令**：`/insight [quick|full]`（命令内直接跑管线，不占模型轮）、`/note <text>`、`/why <query>`。
-
-**prompt 段落**：`insight:policy`（order 3000）——告知工具存在与使用时机（提交前分析、重大取舍后记决策）。
-
-**Web UI（一期交付）**：
-
-- `analyze_change` / `query_impact` 专属工具卡片（keyed toolview，按工具名注册）：三级影响树、侵入核查结论、替代方案对照。
-- 「项目认知」侧边面板：最近分析列表、commit 时间线（点开看该次分析/笔记/决策）、决策记录浏览。
-- 布局经插槽系统融入（侧边列表项、会话节点），不改本体布局代码。
-- 文案全部经 `ctx.locale.register`（zh/en 双语）。
-
-**自动提醒（默认关，`remindBeforeCommit` 配置）**：监听 `fs/observed` 按 agent 记录本 turn 写入；`agent/turn-stopping` 时有写且未分析 → `agent.inject()` 一条提醒（只提醒不强制）。
-
----
-
-## 六、配置（schemastery，全部 cordis.yml 可覆盖）
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `memoryRoot` | `.insight` | 记忆根（相对目标项目仓库根） |
-| `analysisProvider` / `analysisModel` | 空（回落会话路由） | 分析用模型 |
-| `analysisMaxTokens` | `4096` | 单次分析输出上限 |
-| `analysisTimeoutMs` | `120000` | 分析 deadline |
-| `maxDiffBytes` | `262144` | diff 证据字节预算 |
-| `lspEvidence` | `true` | LSP 可用则用 |
-| `remindBeforeCommit` | `false` | turn 末未分析提醒 |
-| `reportLanguage` | `auto` | 报告语言（跟随会话输入语言） |
-| `panelEnabled` | `true` | 侧边面板开关 |
-
----
-
-## 七、里程碑（每步可独立验收）
-
-| 阶段 | 交付 |
-|---|---|
-| M1 | 宿主骨架 + git 证据 + `/insight` 变更摘要报告落盘 |
-| M2 | 影响三级图（rg/LSP 证据）+ 侵入核查 + 替代方案 + 风险/测试建议 |
-| M3 | 记忆库全套（modules/decisions/flows/notes + 目录注入 + 摘要抑制）+ `/why` + recall/record 工具 |
-| M4 | 开发笔记模板 + 学习模式（Top3 学习点） |
-| M5 | Web UI：client 打包管线 + 工具卡片 + 侧边面板 + i18n + JSON 路由 |
-| M6 | 自动提醒 + bundle 打包（`dsh.bundle.patch` + 生产依赖声明）+ `dsh plugin add` 安装验证 + README |
-
-## 八、测试与验证
-
-- vitest 单测：diff 解析、报告渲染、索引/CAS、目录摘要抑制；git fixture 用临时目录 init。
-- 集成：本体自带 `pnpm mock:llm`（无 key）+ `pnpm dsh --profile headless --patch ./dsh-project-insight/cordis.yml "..."`。
-- UI：dev watcher 重写 `lib/client.js` → 本体 HMR 自动重载 → 浏览器手动验收 + 截图。
-- 安装：`dsh plugin --profile demo add ./dsh-project-insight` → `--dump-config` 验证层 → 启动验证。
-
-## 九、一期明确不做
-
-自动修改代码、CI/CD、需求/Bug 管理、权限系统、跨项目聚合、远程/团队同步记忆、mermaid 富渲染（一期树/文本）、Python SDK 专属面（工具自动可用，无专属 UI）、typert Remote 命名空间。
-
-## 十、风险与开放问题
-
-1. **客户端打包格式复刻**是最大工程风险：格式契约已完全查明（wrapper/externals/命名），M5 首日先用最小空插件验证加载，再铺 UI。
-2. 自有 JSON 路由需自复刻 Origin/Host 信任围栏（本体内置围栏只护 `/api` 与 mux）。
-3. LSP 依赖语言服务器存在，缺失自动降级并标注。
-4. 大 diff 截断策略（按文件采样，报告明示）。
-5. 本仓库位于本体仓库根目录内仅为开发便利（tsx 加载与 node_modules 解析），本体经 `.git/info/exclude` 屏蔽；未来发布走独立 npm/仓库。
+1. 客户端打包格式复刻仍是最大工程风险（P1 首日最小验证）。
+2. 自有 JSON 路由需自复刻 Origin/Host 信任围栏。
+3. 大历史重建成本靠 §四 分层控制；L1 单 commit 输入预算超限自动降级为仅 L0。
+4. LSP 缺失自动降级 rg 并标注证据等级。
+5. 「首页优先」按 §五 调整为实现为"一键可达"；如未来本体开放默认视图扩展点再跟进（不改本体）。

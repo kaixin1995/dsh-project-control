@@ -27,6 +27,13 @@
 | 注入提醒 | `agent.inject(createUserMessage({...source:{kind:'plugin',...}}))` | `packages/guard/repeat-tool-reminder`、hooks-codex |
 | Web UI | 双入口包：`package.json` 声明 `dsh.client`（platform web + inject 依赖行）+ 预构建 `lib/client.js`；客户端经 `ctx.slots.register` / `ctx.slots.inject('tool.call.toolview', ...)` / `ctx.uiConversation.events.register` 注册 | `packages/client/ui-goal`、`packages/client/ui-skill` |
 
+### 插槽边界（已验证，2026-08-30）
+
+- **只用加法**（list/keyed 槽）：`sidebar.footer.action`（侧边入口，范本 ui-cordis）、`conversation.view`（**主区域整页页签**，范本 ui-trajectory，`replaceRisk: none`）、`conversation.session.header.actions`（会话头按钮，范本 ui-jobs）、`tool.call.toolview`（工具卡片）、`shell.overlay`（无会话全屏浮层）。
+- **禁止 shadow 任何 single 槽**（root/sidebar/conversation/details…）：低优先级注册会驱逐出厂 UI 及其全部子槽，破坏性。
+- 本体默认落地视图硬编码（`DEFAULT_VIEW_ID='chat'`，ConversationSession.tsx:26）："首页优先于聊天"无仓外无破坏实现 → 一律实现为「项目认知」页签 + `openView()` 一键直达 + 侧边仪表盘。
+- 无路由概念：页面切换 = 会话选择 + `conversation.view` 页签状态（每会话持久化）。
+
 ## 客户端打包格式契约（本体不发布构建预设，需自行复刻）
 
 - 产物：CJS，`lib/client.js`，`package.json` 的 `exports['./client']` 指向它。
@@ -51,4 +58,5 @@
 
 - **本体**：`deepseek-harness/` 仓库（D:\Code\deepseek-harness）。
 - **插件 / 本仓库**：`dsh-project-insight/`，独立本地 git 仓库，暂不推送云端。
-- **业主**：本插件的产品决策人；设计范围文档（`docs/design-scope.md`）在其审查通过前不进入开发。
+- **业主**：本插件的产品决策人。
+- **文档层级**：`docs/product-master-plan.md` = 产品方向唯一权威（V0.4，业主确认）；`docs/design-scope.md` = 工程实施案（五阶段 P1–P5）；`docs/v04-section-mapping.md` = 总纲 101 节逐节映射。冲突时以总纲定方向、以工程案定做法。
