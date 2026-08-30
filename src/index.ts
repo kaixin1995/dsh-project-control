@@ -54,7 +54,8 @@ export function apply(ctx: Context, config: ProjectControlConfig = {}): void {
         void resolveFullConfig(value as never)
       },
       setSource: (current: unknown) => {
-        service.liveConfig = resolveFullConfig(current as never)
+        // 以组合配置为基底合并用户设置层（空层/缺字段不得重置组合值，如 workspaceMode）
+        service.liveConfig = resolveFullConfig({ ...fullConfig, ...((current as object) ?? {}) } as never)
       },
       onChange: () => {},
     })

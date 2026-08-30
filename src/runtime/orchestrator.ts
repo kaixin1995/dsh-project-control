@@ -417,7 +417,8 @@ export class RunOrchestrator {
 
       // 真值校验（V1.0 §51/§111）：claimedOutcome ≠ 成功。
       const after = await this.snapshots.capture(cwd)
-      const workspaceChanged = after.diffHash !== before.diffHash
+      // untracked 新文件不进 git diff，但会进 porcelain status → 联合判定
+      const workspaceChanged = after.statusHash !== before.statusHash || after.diffHash !== before.diffHash
       const claimed = state.outcome
 
       if (claimed === undefined) {
