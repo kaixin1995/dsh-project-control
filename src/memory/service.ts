@@ -1,6 +1,7 @@
 /**
- * Project Memory Service: records architecture decisions, patterns, risk hotspots, and learned concepts.
- * Implements truth-level protection and human confirmation promotion.
+ * 项目记忆服务（Project Memory Service）：
+ * 记录架构决策、模式规则、风险热点、学习概念、用户偏好与项目日志。
+ * 融合 Git 分支感知过滤、5 级真值防降级保护与人类确认晋升机制。
  *
  * @module dsh-project-control/memory/service
  */
@@ -20,13 +21,15 @@ export interface RecordMemoryParams {
   relatedFiles?: string[]
   evidenceIds?: EvidenceId[]
   isHumanConfirmed?: boolean
+  gitBranch?: string
+  tags?: string[]
 }
 
 export class MemoryService {
   constructor(private readonly memoriesRepo: DomainRepository<MemoryRecord, MemoryId>) {}
 
   /**
-   * Record a new memory entry with truth level validation.
+   * 记录新的记忆条目，支持分支绑定与真值等级校验。
    */
   async recordMemory(params: RecordMemoryParams): Promise<MemoryRecord> {
     const now = Date.now()
@@ -40,6 +43,8 @@ export class MemoryService {
       relatedFiles: params.relatedFiles ?? [],
       evidenceIds: params.evidenceIds ?? [],
       isHumanConfirmed: params.isHumanConfirmed ?? false,
+      gitBranch: params.gitBranch,
+      tags: params.tags ?? [],
       createdAt: now,
       updatedAt: now,
     }
@@ -49,7 +54,7 @@ export class MemoryService {
   }
 
   /**
-   * Confirm a memory entry by human, promoting its truthLevel to 'fact' and setting isHumanConfirmed = true.
+   * 人工确认记忆条目，将其晋升为绝对真值 (truthLevel = 'fact') 并标记 isHumanConfirmed = true。
    */
   async confirmMemory(id: MemoryId): Promise<MemoryRecord> {
     const memory = this.memoriesRepo.get(id)
@@ -63,11 +68,11 @@ export class MemoryService {
   }
 
   /**
-   * Update existing memory ensuring no truth level downgrade.
+   * 更新记忆内容，严格执行 5 级真值防降级检查。
    */
   async updateMemory(
     id: MemoryId,
-    updates: Partial<Pick<MemoryRecord, 'title' | 'content' | 'relatedFiles' | 'truthLevel'>>,
+    updates: Partial<Pick<MemoryRecord, 'title' | 'content' | 'relatedFiles' | 'truthLevel' | 'gitBranch' | 'tags'>>,
   ): Promise<MemoryRecord> {
     const memory = this.memoriesRepo.get(id)
     if (!memory) throw new Error(`Memory not found: ${id}`)
@@ -82,6 +87,8 @@ export class MemoryService {
     if (updates.content) memory.content = updates.content
     if (updates.relatedFiles) memory.relatedFiles = updates.relatedFiles
     if (updates.truthLevel) memory.truthLevel = updates.truthLevel
+    if (updates.gitBranch !== undefined) memory.gitBranch = updates.gitBranch
+    if (updates.tags) memory.tags = updates.tags
     memory.updatedAt = Date.now()
 
     await this.memoriesRepo.save(memory)
@@ -89,7 +96,7 @@ export class MemoryService {
   }
 
   /**
-   * Query memories by project and optional filters.
+   * 查询项目记忆，支持按类型、文件路径、人工确认状态以及 Git 分支进行多维过滤。
    */
   queryMemories(
     projectId: ProjectId,
@@ -97,6 +104,8 @@ export class MemoryService {
       type?: MemoryType
       filePath?: string
       humanConfirmedOnly?: boolean
+      gitBranch?: string
+      tag?: string
     } = {},
   ): MemoryRecord[] {
     return this.memoriesRepo.list(m => {
@@ -106,15 +115,22 @@ export class MemoryService {
       if (options.filePath && (!m.relatedFiles || !m.relatedFiles.includes(options.filePath))) {
         return false
       }
+      // Git 分支感知过滤：如果指定了分支，匹配该分支的专属记忆以及未限制分支的通用记忆
+      if (options.gitBranch && m.gitBranch && m.gitBranch !== options.gitBranch) {
+        return false
+      }
+      if (options.tag && (!m.tags || !m.tags.includes(options.tag))) {
+        return false
+      }
       return true
     })
   }
 
   /**
-   * Export all confirmed project memories to Markdown format for documentation or context injection.
+   * 导出项目记忆为 Markdown 格式，便于系统提示词或文档呈现。
    */
-  exportToMarkdown(projectId: ProjectId): string {
-    const memories = this.queryMemories(projectId)
+  exportToMarkdown(projectId: ProjectId, gitBranch?: string): string {
+    const memories = this.queryMemories(projectId, { gitBranch })
     if (memories.length === 0) return '# Project Memory\n\nNo recorded memories yet.'
 
     const lines: string[] = ['# Project Memory\n']
@@ -124,10 +140,15 @@ export class MemoryService {
       pattern_rule: [],
       risk_hotspot: [],
       learned_concept: [],
+      user_profile: [],
+      project_log: [],
+      daily_log: [],
     }
 
     for (const m of memories) {
-      grouped[m.type].push(m)
+      if (grouped[m.type]) {
+        grouped[m.type].push(m)
+      }
     }
 
     for (const [type, items] of Object.entries(grouped)) {
@@ -135,7 +156,8 @@ export class MemoryService {
       lines.push(`## ${type.replace(/_/g, ' ').toUpperCase()}`)
       for (const item of items) {
         const badge = item.isHumanConfirmed ? '✅ [Human Confirmed]' : `ℹ️ [Truth: ${item.truthLevel}]`
-        lines.push(`### ${item.title} ${badge}`)
+        const branchBadge = item.gitBranch ? ` [Branch: ${item.gitBranch}]` : ''
+        lines.push(`### ${item.title} ${badge}${branchBadge}`)
         lines.push(item.content)
         if (item.relatedFiles && item.relatedFiles.length > 0) {
           lines.push(`*Related files*: ${item.relatedFiles.map(f => `\`${f}\``).join(', ')}`)

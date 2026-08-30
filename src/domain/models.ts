@@ -191,9 +191,16 @@ export interface VerificationRecord {
 }
 
 // -----------------------------------------------------------------------------
-// 8. Memory Entity
+// 8. 记忆实体（Memory Entity）
 // -----------------------------------------------------------------------------
-export type MemoryType = 'architecture_decision' | 'pattern_rule' | 'risk_hotspot' | 'learned_concept'
+export type MemoryType =
+  | 'architecture_decision'
+  | 'pattern_rule'
+  | 'risk_hotspot'
+  | 'learned_concept'
+  | 'user_profile'
+  | 'project_log'
+  | 'daily_log'
 
 export interface MemoryRecord {
   id: MemoryId
@@ -205,6 +212,8 @@ export interface MemoryRecord {
   relatedFiles?: string[]
   evidenceIds: EvidenceId[]
   isHumanConfirmed: boolean
+  gitBranch?: string
+  tags?: string[]
   createdAt: number
   updatedAt: number
 }

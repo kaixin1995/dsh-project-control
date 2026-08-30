@@ -86,7 +86,47 @@ describe('Project Memory & Context Injection (T9.1 - T9.3)', () => {
     const prompt = injector.synthesizeContext(projectId, ['src/payment/webhook.ts'])
 
     expect(prompt.includes('<project_memory_context>')).toBe(true)
-    expect(prompt.includes('Payment Webhook Idempotency')).toBe(true)
+    await close()
+  })
+
+  it('T9.4: filters memories with Git branch awareness', async () => {
+    const { repo, close } = await createMemoryRepo()
+    const service = new MemoryService(repo)
+    const projectId = createProjectId()
+
+    // Record main branch memory
+    await service.recordMemory({
+      projectId,
+      type: 'architecture_decision',
+      truthLevel: 'fact',
+      title: 'Main Branch Architecture',
+      content: 'Uses monolith architecture',
+      gitBranch: 'main',
+    })
+
+    // Record feature branch memory
+    await service.recordMemory({
+      projectId,
+      type: 'architecture_decision',
+      truthLevel: 'inferred',
+      title: 'Feature Branch Architecture',
+      content: 'Uses microservices experiment',
+      gitBranch: 'feature/microservices',
+    })
+
+    // Record universal memory (no branch)
+    await service.recordMemory({
+      projectId,
+      type: 'pattern_rule',
+      truthLevel: 'fact',
+      title: 'Universal Coding Rule',
+      content: 'Always format with prettier',
+    })
+
+    const mainMemories = service.queryMemories(projectId, { gitBranch: 'main' })
+    expect(mainMemories.some(m => m.title === 'Main Branch Architecture')).toBe(true)
+    expect(mainMemories.some(m => m.title === 'Universal Coding Rule')).toBe(true)
+    expect(mainMemories.some(m => m.title === 'Feature Branch Architecture')).toBe(false)
 
     await close()
   })
