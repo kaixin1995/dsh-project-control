@@ -9,6 +9,10 @@ class MockSlotsService extends Service {
     super(ctx, 'slots', true)
   }
 
+  inject(slotName: string, callback: Function) {
+    return callback()
+  }
+
   register(descriptor: { name: string }, component: Function) {
     this.registeredSlots.push(descriptor.name)
     return () => {}
