@@ -46,6 +46,7 @@ export const coreDomainSpec = defineDomain({
     runs: domainTable(recordSchema),
     steps: domainTable(recordSchema),
     attempts: domainTable(recordSchema),
+    confirmed: domainTable(recordSchema),
   },
 })
 
@@ -74,6 +75,7 @@ export const historyDomainSpec = defineDomain({
   tables: {
     checkpoints: domainTable(recordSchema),
     imported_changes: domainTable(recordSchema),
+    history_cursor: domainTable(recordSchema),
     issues: domainTable(recordSchema),
     verifications: domainTable(recordSchema),
     memories: domainTable(recordSchema),

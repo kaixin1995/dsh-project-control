@@ -261,4 +261,17 @@ export class GitAdapter {
       return false
     }
   }
+
+  /**
+   * Resolve the current HEAD SHA (used as a history-scan cursor anchor).
+   * @param cwd - repository working directory.
+   * @returns the HEAD SHA, or undefined outside a git repository.
+   */
+  async getHeadSha(cwd: string): Promise<string | undefined> {
+    try {
+      return await this.revParse(cwd, 'HEAD')
+    } catch {
+      return undefined
+    }
+  }
 }

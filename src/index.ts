@@ -15,6 +15,7 @@ import { ProjectControlService, apply as serviceApply } from './plugin/service.t
 import { apply as toolsApply, registerTools } from './plugin/tools.ts'
 import { apply as commandsApply, registerCommands } from './plugin/commands.ts'
 import { apply as apiRouteApply, registerApiRoute } from './plugin/api-route.ts'
+import { registerConflictGuard } from './plugin/confirmed.ts'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { PROJECT_CONTROL_SETTINGS_SCHEMA } from './config.ts'
 import { resolveFullConfig, type ProjectControlFullConfig } from './config.ts'
@@ -26,7 +27,7 @@ export const name = 'project-control'
  * 注入的服务依赖（直接读取的服务必须在此声明；storageDomain / webServer 为
  * 可选动态注入——headless 等面不挂载，静默降级，不阻塞激活）。
  */
-export const inject = ['tools', 'commands', 'agents', 'jobs', 'sessions', 'llm']
+export const inject = ['tools', 'commands', 'agents', 'jobs', 'sessions', 'llm', 'systemPrompt']
 
 /**
  * 插件装配函数：创建服务、提供 projectControl、启动存储（动态）、
@@ -57,6 +58,23 @@ export function apply(ctx: Context, config: ProjectControlConfig = {}): void {
       },
       onChange: () => {},
     })
+  })
+
+  // 已确定约束冲突拦截（V1.0 §31）：AI 写禁改文件 → deny
+  registerConflictGuard(ctx, service)
+
+  // 习惯引导段落（V0.4 §11 自动链 + extension-cookbook「Memory」行）：
+  // 引导 AI 在提交前分析、重大取舍后记决策/记忆。
+  ctx.systemPrompt?.section?.({
+    name: 'project-control:policy',
+    order: 3000,
+    text: () => [
+      'Project control habits:',
+      '- BEFORE declaring a coding task complete (and before the developer commits), call analyze_change on the working diff so the change record has a semantic summary.',
+      '- AFTER a significant design decision or trade-off, call record_memory (architecture_decision) with the decision and its rationale.',
+      '- For multi-step work, create a plan first; execute it with start_run so progress is tracked and verified.',
+      '- Never call confirm_memory yourself: only the developer confirms memory items.',
+    ].join('\n'),
   })
 
   registerTools(ctx)

@@ -45,9 +45,21 @@ export interface ProjectControlFullConfig {
   /** 确定性验收命令（按项目技术栈在 cordis.yml / settings 配置）。 */
   buildCommand?: string
   testCommand?: string
+  /** 执行工作区模式：current=直接改当前工作区；isolated-worktree=每次 Run 在独立 worktree（V1.0 §38）。 */
+  workspaceMode?: 'current' | 'isolated-worktree'
+  /** 学习模式（V1.0 §78/79）：主语言↔项目语言映射解释。 */
+  learning?: {
+    primaryLanguage?: string
+    projectLanguage?: string
+  }
   /** 一次性 LLM 调用上限。 */
   analysisMaxTokens: number
   analysisTimeoutMs: number
+  workspaceMode: 'current' | 'isolated-worktree'
+  learning: {
+    primaryLanguage?: string
+    projectLanguage?: string
+  }
 }
 
 /** 解析后的配置（全部字段就绪）。 */
@@ -79,6 +91,11 @@ export const PROJECT_CONTROL_SETTINGS_SCHEMA: z<ProjectControlFullConfig> = z.ob
   }),
   buildCommand: z.string(),
   testCommand: z.string(),
+  workspaceMode: z.union(['current', 'isolated-worktree']).default('current'),
+  learning: z.object({
+    primaryLanguage: z.string(),
+    projectLanguage: z.string(),
+  }),
   analysisMaxTokens: z.number().min(256).default(4096),
   analysisTimeoutMs: z.number().min(5000).default(120000),
 })
@@ -100,6 +117,8 @@ export const PROJECT_CONTROL_DEFAULTS: ProjectControlFullConfig = {
   },
   analysisMaxTokens: 4096,
   analysisTimeoutMs: 120000,
+  workspaceMode: 'current',
+  learning: {},
 }
 
 /** 解析用户配置：合并默认值并做加载期校验（fail loud）。 */
@@ -111,6 +130,7 @@ export function resolveFullConfig(input?: Partial<ProjectControlFullConfig>): Re
     budgets: { ...PROJECT_CONTROL_DEFAULTS.budgets, ...input?.budgets },
     retry: { ...PROJECT_CONTROL_DEFAULTS.retry, ...input?.retry },
     bootstrap: { ...PROJECT_CONTROL_DEFAULTS.bootstrap, ...input?.bootstrap },
+    learning: { ...PROJECT_CONTROL_DEFAULTS.learning, ...input?.learning },
   }
   if (merged.retry.baseDelayMs > merged.retry.maxDelayMs) {
     throw new Error('project-control: retry.baseDelayMs must not exceed retry.maxDelayMs')

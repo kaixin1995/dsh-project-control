@@ -93,6 +93,33 @@ export function apply(ctx: any): void {
     })
   })
 
+  // ── 3. 聊天工具卡片（执行/评审/验收）──────────────────────────────────
+  const simpleResultCard = (title: string): ((props: any) => any) => (props: any) => {
+    const output = props?.output
+    const text = typeof output === 'string'
+      ? output
+      : output?.summary ?? output?.issues ?? output?.details ?? (output ? JSON.stringify(output, null, 2) : '执行中…')
+    return React.createElement(
+      'div',
+      {
+        style: {
+          border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
+          borderRadius: '8px',
+          padding: '10px 12px',
+          margin: '4px 0',
+          background: 'var(--dsw-alias-bg-layer-1, #fafafa)',
+          fontSize: '12px',
+          lineHeight: 1.6,
+          whiteSpace: 'pre-wrap',
+          maxHeight: 260,
+          overflowY: 'auto',
+        },
+      },
+      React.createElement('div', { style: { fontWeight: 600, marginBottom: '4px' } }, title),
+      String(text),
+    )
+  }
+
   // ── 3. analyze_change 专属工具卡片 ─────────────────────────────────────
   ctx.slots.inject('tool.call.toolview', () => {
     return ctx.slots.register({
@@ -111,4 +138,14 @@ export function apply(ctx: any): void {
       })
     })
   })
+
+  for (const [toolKey, title] of [
+    ['start_run', '🚀 执行 Run'],
+    ['run_review', '🔍 代码评审'],
+    ['run_verification', '✅ 验收验证'],
+  ] as const) {
+    ctx.slots.inject('tool.call.toolview', () => {
+      return ctx.slots.register({ name: 'tool.call.toolview', key: toolKey }, simpleResultCard(title))
+    })
+  }
 }

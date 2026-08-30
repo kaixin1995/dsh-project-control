@@ -97,6 +97,19 @@
 - query_impact 工具 + collectSymbolReferences（lsp-evidence.ts）：LSP findReferences 优先（lsp_symbol 证据）→ 缺失/失败降级 rg（file_ast 证据 + lspFailed 标注）；三路径单测覆盖。真机：无 LSP 环境 file_ast + 4 引用命中。
 - **ESM bundle 禁 require()**：esbuild ESM 输出把 require 换成运行时抛错 shim，try/catch 会静默吞掉（曾导致分析器文件枚举恒空）→ 一律顶部静态 import。
 
+**V1.0 收尾交付事实（2026-08-30 第二轮）**
+- B1 三级影响图：/impact 返回 ImpactEngine 的 direct/indirect/potential + riskLevel/riskScore（引用边投进 ProjectGraph 后 computeImpact）。
+- B2 worktree：workspaceMode='isolated-worktree' 时 startRun 自动建 .worktrees/<runId>（失败保留现场）；默认 current。
+- B3 模型升级：attempt>1 且 retry.allowModelEscalation → 该 Attempt 自动用 reasoning 路由。
+- B4 已确定约束：core 域 confirmed 表；tools/pre-execute 监听（confirmed.ts）对 write/edit/str_replace_editor 命中 forbiddenPaths 直接 deny；端点 /confirmed、/confirmed/remove；总览页管理卡片。
+- B5 成本：/state runs[].costUsd（CostTracker 聚合 attempt usage）；执行中心成本列。
+- B6 分块续跑：historyCursor 表 + /history/status + /bootstrap(resume=true,fromCommit)；历史页「继续扫描」按钮。
+- B7 聊天卡片：start_run/run_review/run_verification keyed toolview（结果文本卡）。
+- B8 write_agent_note 工具：写目标仓 .agents/notes/proposed/<date>-<slug>.md。
+- B9 学习：explain_concept（跨语言解释）/summarize_learning（概念入库）/概念列表进 /state 与记忆页。
+- B10 insight:policy prompt 段落（order 3000）已注册——AI 自动习惯引导层生效。
+- B11 历史风险提醒：执行步骤 prompt 自动注入 checkpoint hotFiles 命中警告。
+
 **待查证（下一会话优先）**
 - 源码启动（repo CLI）下 web 的 `__DSH_BOOT__` 图为空（连官方 ui 包都未进图，无告警——疑似 `loader.internal.resolveSync` 在 tsx/Windows 下静默失败、warn 被内部 logger 吞掉）。用户日常 3080 用的是全局安装 rc.7，图正常。需决定：插件验证走哪条运行时路径，或定位 resolveSync 问题（vendor 代码，受零改动铁律约束，只能上报或绕过）。
 

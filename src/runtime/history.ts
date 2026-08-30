@@ -30,6 +30,8 @@ export interface ImportedChangeRecord {
 
 export interface HistoryScanOptions {
   maxCommits: number
+  /** 分块续跑：只处理该提交之后的新提交（git log from..HEAD）。 */
+  fromCommit?: string
   /** 聚类时间窗口（毫秒）：相邻提交间隔超过该值则切开新簇。 */
   clusterGapMs: number
   /** L1 逐提交轻析（Fast 级）；调用方注入 LLM 回调，扫描本身保持无 ctx 依赖。 */
@@ -134,7 +136,10 @@ export async function scanHistory(
   options: Partial<HistoryScanOptions> = {},
 ): Promise<ImportedChangeRecord[]> {
   const opts = { ...HISTORY_SCAN_DEFAULTS, ...options }
-  const commits = await git.getLog(cwd, { maxCount: opts.maxCommits })
+  const commits = await git.getLog(cwd, {
+    maxCount: opts.maxCommits,
+    ...(opts.fromCommit === undefined ? {} : { from: opts.fromCommit }),
+  })
   const facts = await commitFacts(git, cwd, commits)
 
   // L1 逐提交轻析（V1.0 §96 第一层）：预算有界，单条失败回落 commit subject。

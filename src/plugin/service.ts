@@ -98,6 +98,8 @@ export class ProjectControlService {
       attempts: new DomainRepository<AttemptRecord>(this.coreDomainHandle.table('attempts')),
       checkpoints: new DomainRepository<ProjectBootstrapCheckpoint>(this.historyDomainHandle.table('checkpoints')),
       importedChanges: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('imported_changes')),
+      historyCursor: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('history_cursor')),
+      confirmed: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('confirmed')),
       evidence: new DomainRepository<EvidenceRecord>(this.analysisDomainHandle.table('evidence')),
       issues: new DomainRepository<ReviewIssueRecord>(this.historyDomainHandle.table('issues')),
       verifications: new DomainRepository<VerificationRecord>(this.historyDomainHandle.table('verifications')),

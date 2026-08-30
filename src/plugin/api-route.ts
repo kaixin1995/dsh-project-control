@@ -17,9 +17,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { BootstrapPipeline } from '../bootstrap/pipeline.ts'
 import { GenericLanguageAnalyzer } from '../analysis/language.ts'
 import { collectSymbolReferences } from '../analysis/lsp-evidence.ts'
+import { ImpactEngine } from '../analysis/impact.ts'
+import { CostTracker } from '../model/cost.ts'
+import { ProjectGraph } from '../analysis/graph.ts'
 import { ProjectService } from '../domain/project.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
 import { resolveDeploymentRoute } from '../config.ts'
 import type { ProjectControlService } from './service.ts'
 
@@ -117,6 +121,18 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   })
 }
 
+/** 读取历史扫描游标（分块续跑；无游标返回空对象）。 */
+function readHistoryCursor(service: ProjectControlService): { lastCommit?: string; processedCount?: number } {
+  const cursor = service.store?.historyCursor?.get('cursor')
+  if (cursor === undefined || cursor === null) return {}
+  return cursor as { lastCommit?: string; processedCount?: number }
+}
+
+/** 写历史扫描游标。 */
+function writeHistoryCursor(service: ProjectControlService, lastCommit: string, processedCount: number): void {
+  void service.store?.historyCursor?.save({ id: 'cursor', lastCommit, processedCount })
+}
+
 /** 采纳当前项目：内存未恢复时回落最后一个已持久化项目（重启后首次 API 调用场景）。 */
   function adoptProject(service: ProjectControlService): { id: string } | undefined {
     if (service.currentProject !== undefined) return service.currentProject
@@ -145,6 +161,19 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
   const memories = store.memories.list()
   const evidence = store.evidence.list()
   const checkpoint = store.checkpoints.list().at(-1) ?? null
+  const costTracker = new CostTracker()
+  const runCostUsd = (runId: string): number => {
+    let usd = 0
+    for (const attempt of store.attempts.list((attempt) => attempt.runId === runId)) {
+      if (attempt.tokenUsage === undefined) continue
+      usd += costTracker.calculateCost(attempt.model ?? 'deepseek-v4-flash', {
+        input: attempt.tokenUsage.input,
+        output: attempt.tokenUsage.output,
+        total: attempt.tokenUsage.total,
+      }).costUsd
+    }
+    return Number(usd.toFixed(4))
+  }
   return {
     ready: true,
     project: project === null ? null : {
@@ -168,6 +197,7 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       status: run.status,
       startedAt: run.startedAt ?? null,
       finishedAt: run.finishedAt ?? null,
+      costUsd: runCostUsd(run.id),
     })),
     attemptsCount: attempts.length,
     importedChanges: (store.importedChanges?.list() ?? []).slice(-100).map((item) => ({
@@ -194,6 +224,19 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       type: verification.type,
       status: verification.status,
       createdAt: verification.createdAt,
+    })),
+    confirmed: (store.confirmed?.list() ?? []).filter((item) => (item as { status?: string }).status === 'active').map((item) => ({
+      id: (item as { id: string }).id,
+      type: (item as { type: string }).type,
+      text: (item as { text: string }).text,
+      forbiddenPaths: (item as { forbiddenPaths?: string[] }).forbiddenPaths ?? [],
+    })),
+    concepts: (store.concepts?.list() ?? []).slice(-50).map((concept) => ({
+      id: concept.id,
+      name: concept.name,
+      category: concept.category,
+      description: concept.description,
+      occurrences: concept.occurrences,
     })),
     memories: memories.map((memory) => ({
       id: memory.id,
@@ -288,6 +331,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const checkpoint = await pipeline.runBootstrap(ensured.project.id, rootPath)
           const scanHistoryFlag = body['includeHistory'] === true
           const wantSummaries = service.liveConfig.bootstrap.historySummaries || body['summarize'] === true
+          const resume = body['resume'] === true
           let importedCount = 0
           if (scanHistoryFlag && service.store.importedChanges !== undefined) {
             // L1 逐提交轻析：config 开关或调用方显式请求时启用；Fast 等级路由，成本有界。
@@ -316,8 +360,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                   },
                 }
               : undefined
-            const imported = await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits: typeof body['maxCommits'] === 'number' ? Math.min(body['maxCommits'], service.liveConfig.bootstrap.maxCommitsPerRun) : service.liveConfig.bootstrap.defaultMaxCommits, summaries })
+            const maxCommits = typeof body['maxCommits'] === 'number' ? Math.min(body['maxCommits'], service.liveConfig.bootstrap.maxCommitsPerRun) : service.liveConfig.bootstrap.defaultMaxCommits
+            const cursor = readHistoryCursor(service)
+            const imported = resume && cursor.lastCommit !== undefined
+              ? await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, summaries, fromCommit: cursor.lastCommit })
+              : await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, summaries })
             importedCount = imported.length
+            const lastHash = await service.git.getHeadSha(rootPath)
+            if (lastHash !== undefined) writeHistoryCursor(service, lastHash, importedCount)
           }
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
@@ -338,6 +388,64 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
         // ── 工作台按钮化操作端点（全部走部署路由，不依赖聊天会话）──────────
 
         // 分析当前改动（数字证据 + LLM 语义摘要；changeId 可选挂靠）。
+        if (req.method === 'POST' && routePath === '/confirmed') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const text = typeof body['text'] === 'string' ? body['text'] : ''
+            if (text === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'text is required' }))
+              return
+            }
+            const item = addConfirmedItem(service, {
+              type: (typeof body['type'] === 'string' && ['requirement', 'constraint', 'decision', 'non-goal'].includes(body['type']) ? body['type'] : 'constraint') as never,
+              text,
+              forbiddenPaths: Array.isArray(body['forbiddenPaths']) ? body['forbiddenPaths'] as string[] : [],
+            })
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, id: item.id }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        if (req.method === 'POST' && routePath === '/confirmed/remove') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const removed = id === '' ? false : removeConfirmedItem(service, id)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: removed }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        if (req.method === 'GET' && routePath === '/history/status') {
+          const cursor = readHistoryCursor(service)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            cursor,
+            importedChanges: service.store?.importedChanges?.list().length ?? 0,
+            canResume: cursor.lastCommit !== undefined,
+          }))
+          return
+        }
+
         if (req.method === 'POST' && routePath === '/analyze') {
           try {
             const body = await readJsonBody(req)
@@ -609,6 +717,18 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 character: typeof body['character'] === 'number' ? body['character'] : 0,
               },
             )
+
+            // 三级影响图（V1.0 §85-90）：把引用边 + 变更文件投进 ProjectGraph，
+            // ImpactEngine 归类 direct/indirect + 风险分。
+            const graph = new ProjectGraph()
+            for (const reference of evidence.references) {
+              if (reference.filePath === '') continue
+              graph.addNode({ id: reference.filePath, type: 'file', label: reference.filePath, filePath: reference.filePath })
+              graph.addEdge({ source: reference.filePath, target: filePath, type: 'references', evidenceId: undefined })
+            }
+            const engine = new ImpactEngine()
+            const impact = engine.computeImpact([filePath || symbolName], graph)
+
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
               evidenceSource: evidence.source,
@@ -618,6 +738,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 filePath: reference.filePath,
                 line: reference.line,
               })),
+              impact: {
+                riskLevel: impact.riskLevel,
+                riskScore: impact.riskScore,
+                direct: impact.impactedItems.filter((item) => item.level === 'direct').map((item) => item.node.id).slice(0, 30),
+                indirect: impact.impactedItems.filter((item) => item.level === 'indirect').map((item) => item.node.id).slice(0, 30),
+                potential: impact.impactedItems.filter((item) => item.level === 'potential').map((item) => item.node.id).slice(0, 30),
+                affectedTests: impact.affectedTests.slice(0, 20),
+              },
             }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })

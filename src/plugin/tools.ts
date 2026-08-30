@@ -346,13 +346,99 @@ ${result.references}` }]
     },
   })
 
+  // ── 学习（T10）────────────────────────────────────────────────────────
+
+  const explainConceptTool = defineTool({
+    name: 'explain_concept',
+    description: 'Explain a concept from the current project language in terms of the developer primary language, contrast the two, and list review checkpoints. Grounded in project memory when relevant items exist.',
+    parameters: {
+      concept: { type: 'string', required: true, description: 'The concept to explain, e.g. "goroutine".' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args: { concept: string }, exec: ToolRunContext) {
+      const service = control(ctx)
+      const route = resolveAnalysisRoute(service, 'standard', exec.agent?.session)
+      const cfg = service.liveConfig
+      const primary = cfg.learning?.primaryLanguage ?? "the developer's primary language"
+      const project = cfg.learning?.projectLanguage ?? 'the project language'
+      const memoryBlock = service.memoryContextText?.(service.currentProject?.id, []) ?? ''
+      const analysis = await runLlmAnalysis(ctx, {
+        prompt: [
+          'Explain the concept "' + args.concept + '" (from ' + project + ') to a developer whose primary language is ' + primary + '.',
+          'Structure: 1) map it to the closest primary-language construct, 2) key differences in scheduling/lifetime/ownership, 3) how THIS project uses it, 4) three code-review checkpoints.',
+          'Be concise and concrete.',
+          memoryBlock === '' ? '' : 'Project context:\n' + memoryBlock,
+        ].filter((line) => line !== undefined).join('\n'),
+        provider: route.provider,
+        model: route.model,
+        maxTokens: service.liveConfig.analysisMaxTokens,
+        timeoutMs: service.liveConfig.analysisTimeoutMs,
+        sessionId: exec.agent?.session.id,
+        purpose: 'project-control-learning',
+      })
+      return analysis.text
+    },
+  })
+
+  const summarizeLearningTool = defineTool({
+    name: 'summarize_learning',
+    description: 'Produce the "worth understanding" learning summary for a change: the 3-5 concepts most worth studying, each with why it matters here. Records each concept into the learning tracker.',
+    parameters: {
+      changeId: { type: 'string', required: true, description: 'Target change id.' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args: { changeId: string }, exec: ToolRunContext) {
+      const store = requireStore(ctx)
+      const change = getChange(args.changeId)
+      const diff = await git.getDiff(workdir(exec))
+      const route = resolveAnalysisRoute(service, 'standard', exec.agent?.session)
+      const cfg = service.liveConfig
+      const analysis = await runLlmAnalysis(ctx, {
+        prompt: [
+          'List the 3-5 concepts from this diff most worth a developer studying, one per line:',
+          'CONCEPT | category (language-feature | framework | pattern | tooling) | why it matters here (one sentence)',
+          '',
+          'Developer primary language: ' + (cfg.learning?.primaryLanguage ?? 'unspecified') + '; project language: ' + (cfg.learning?.projectLanguage ?? 'unspecified'),
+          '',
+          'Diff:',
+          diff.patch,
+        ].join('\n'),
+        provider: route.provider,
+        model: route.model,
+        maxTokens: service.liveConfig.analysisMaxTokens,
+        timeoutMs: service.liveConfig.analysisTimeoutMs,
+        sessionId: exec.agent?.session.id,
+        purpose: 'project-control-learning',
+      })
+      for (const line of analysis.text.split('\n').map((line) => line.trim())) {
+        const parts = line.split('|').map((part) => part.trim())
+        if (parts.length < 3) continue
+        await service.conceptService?.learnConcept({
+          projectId: change.projectId,
+          name: parts[0]!,
+          category: (['language-feature', 'framework', 'pattern', 'tooling'].includes(parts[1]!) ? parts[1] : 'pattern') as never,
+          description: parts[2]!,
+        })
+      }
+      void store
+      return analysis.text
+    },
+  })
+
   // ── Review 与 Verification ───────────────────────────────────────────
 
   const runReviewTool = defineTool({
     name: 'run_review',
     description: 'Run an independent code review over the current workspace diff (read-only; records review issues, never modifies code).',
     parameters: {
-      changeId: { type: 'string', description: 'Target change id the review belongs to.' },
+      changeId: { type: 'string', required: true, description: 'Target change id the review belongs to.' },
+      teach: { type: 'string', description: "Set 'true' for teaching mode: each issue also explains why it matters and what to check next time (learning mode)." },
     },
     output: {
       schema: {
@@ -368,11 +454,12 @@ ${result.references}` }]
         return [{ type: 'text', text: `Review found ${result.issuesFound} issue(s):\n${result.issues}` }]
       },
     },
-    async execute(args: { changeId: string }, exec: ToolRunContext) {
+    async execute(args: { changeId: string; teach?: string }, exec: ToolRunContext) {
       const service = control(ctx)
       const store = requireStore(ctx)
       const cwd = workdir(exec)
       const change = getChange(args.changeId)
+      const teach = args.teach === 'true'
       const diff = await git.getDiff(cwd)
       const route = resolveAnalysisRoute(service, 'reasoning', exec.agent?.session)
       const memoryBlock = service.memoryContextText?.(change.projectId, []) ?? ''
@@ -380,6 +467,7 @@ ${result.references}` }]
         prompt: [
           'You are an independent code reviewer. Review the diff below for correctness, error handling, concurrency, resource leaks, security, and over-reach (changes beyond the stated need).',
           'Answer with one issue per line in the exact format: SEVERITY | category | title | evidence location | suggested fix',
+          ...(teach ? ['TEACHING MODE: after each issue line, add a line starting with LEARN: explaining why this class of bug matters and the checkpoint to review next time.'] : []),
           'SEVERITY is one of critical/high/medium/low/info. If the diff is clean, answer exactly: CLEAN',
           '',
           `Change objective: ${change.title} — ${change.description ?? ''}`,
@@ -606,6 +694,36 @@ ${result.references}` }]
     },
   })
 
+  const writeAgentNoteTool = defineTool({
+    name: 'write_agent_note',
+    description: 'Write a design-decision Agent Note into the target repository under .agents/notes/proposed/. Only for significant decisions (architecture/protocol/process changes); never for ordinary bug fixes.',
+    parameters: {
+      title: { type: 'string', required: true, description: 'Note title; becomes the file slug.' },
+      body: { type: 'string', required: true, description: 'Markdown body: Problem / Proposal / Alternatives considered / Consequences.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        additionalProperties: false,
+      },
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { path: string }
+        return [{ type: 'text', text: 'Agent note written: ' + result.path }]
+      },
+    },
+    async execute(args: { title: string; body: string }, exec: ToolRunContext) {
+      const cwd = workdir(exec)
+      const slug = args.title.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'note'
+      const dir = cwd.replace(/\\/g, '/') + '/.agents/notes/proposed'
+      const { mkdirSync, writeFileSync } = await import('node:fs')
+      const path = dir + '/' + new Date().toISOString().slice(0, 10) + '-' + slug + '.md'
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(path, '# ' + args.title + '\n\nStatus: proposed\n\n' + args.body + '\n', 'utf8')
+      return { path }
+    },
+  })
+
   const tools = [
     createChangeTool,
     listChangesTool,
@@ -615,6 +733,9 @@ ${result.references}` }]
     queryImpactTool,
     runReviewTool,
     runVerificationTool,
+    writeAgentNoteTool,
+    explainConceptTool,
+    summarizeLearningTool,
     recordMemoryTool,
     confirmMemoryTool,
     recallProjectTool,

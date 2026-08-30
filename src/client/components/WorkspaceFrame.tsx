@@ -23,7 +23,7 @@ export interface WorkspaceState {
   reason?: string
   project?: { id: string; name: string; rootPath: string; createdAt: number } | null
   changes?: Array<{ id: string; title: string; type: string; status: string; source: string; updatedAt: number }>
-  runs?: Array<{ id: string; changeId: string; status: string; startedAt: number | null; finishedAt: number | null }>
+  runs?: Array<{ id: string; changeId: string; status: string; startedAt: number | null; finishedAt: number | null; costUsd?: number }>
   attemptsCount?: number
   memories?: Array<{ id: string; type: string; truthLevel: string; title: string; isHumanConfirmed: boolean; gitBranch: string | null; createdAt: number }>
   evidenceCount?: number
@@ -32,6 +32,8 @@ export interface WorkspaceState {
   issues?: Array<{ id: string; changeId: string; severity: string; category: string; title: string; status: string }>
   verifications?: Array<{ id: string; changeId: string; name: string; type: string; status: string; createdAt: number }>
   bootstrap?: { id: string; summary: string; techStack: string[]; manifestFiles: string[]; symbolsCount: number; createdAt: number } | null
+  confirmed?: Array<{ id: string; type: string; text: string; forbiddenPaths: string[] }>
+  concepts?: Array<{ id: string; name: string; category: string; description: string; occurrences: number }>
 }
 
 /**
@@ -114,6 +116,19 @@ export const WORKSPACE_DICT = {
     'verify.records': '验收记录',
     'verify.noRecords': '暂无验收记录。',
     'evidence.recent': '最近证据',
+    'confirmed.title': '已确定事项（人工确认，AI 禁改自动拦截）',
+    'confirmed.add': '添加已确定',
+    'confirmed.text': '约束/需求内容',
+    'confirmed.paths': '禁改路径（逗号分隔，选填）',
+    'confirmed.remove': '移除',
+    'confirmed.none': '暂无已确定事项。添加后 AI 修改禁改路径将被自动拒绝。',
+    'exec.col.cost': '成本(估)',
+    'history.continue': '继续扫描（从上次进度）',
+    'concepts.title': '学习概念',
+    'concepts.none': '暂无学习概念。对 change 调用 summarize_learning 后自动积累。',
+    'concepts.col.name': '概念',
+    'concepts.col.category': '类别',
+    'concepts.col.count': '次数',
     'error.load': '加载失败',
   },
   en: {
@@ -175,6 +190,19 @@ export const WORKSPACE_DICT = {
     'verify.records': 'Verification records',
     'verify.noRecords': 'No verification records yet.',
     'evidence.recent': 'Recent evidence',
+    'confirmed.title': 'Confirmed items (human-confirmed; AI edits to forbidden paths are auto-denied)',
+    'confirmed.add': 'Add confirmed item',
+    'confirmed.text': 'Requirement / constraint text',
+    'confirmed.paths': 'Forbidden paths (comma separated, optional)',
+    'confirmed.remove': 'Remove',
+    'confirmed.none': 'No confirmed items yet. AI edits to forbidden paths will be auto-denied once added.',
+    'exec.col.cost': 'Cost (est)',
+    'history.continue': 'Continue scan (from last cursor)',
+    'concepts.title': 'Learning concepts',
+    'concepts.none': 'No learning concepts yet. Run summarize_learning on a change to accumulate.',
+    'concepts.col.name': 'Concept',
+    'concepts.col.category': 'Category',
+    'concepts.col.count': 'Count',
     'error.load': 'Failed to load',
   },
 } as const
@@ -281,6 +309,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [changeDesc, setChangeDesc] = useState('')
   const [memoryTitle, setMemoryTitle] = useState('')
   const [memoryContent, setMemoryContent] = useState('')
+  const [confirmedText, setConfirmedText] = useState('')
+  const [confirmedPaths, setConfirmedPaths] = useState('')
 
   useEffect(() => {
     let disposed = false
@@ -335,6 +365,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
+  const removeConfirmed = async (id: string): Promise<void> => {
+    await runAction('removeConfirmed', '/project-control/api/confirmed/remove', { id })
+  }
+
   const runBootstrap = async (): Promise<void> => {
     setBootstrapping(true)
     try {
@@ -386,6 +420,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const issues = state?.issues ?? []
   const verifications = state?.verifications ?? []
   const recentEvidence = state?.recentEvidence ?? []
+  const confirmed = state?.confirmed ?? []
+  const concepts = state?.concepts ?? []
 
   const tabs: Array<{ key: TabKey; label: string }> = [
     { key: 'overview', label: t('tab.overview') },
@@ -459,7 +495,30 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 ),
                 React.createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '8px' } }, bootstrap.summary),
               ),
-            )),
+            ),
+        React.createElement(Card, { title: t('confirmed.title') },
+          React.createElement('div', { style: styles.formRow },
+            React.createElement('input', { style: styles.input, placeholder: t('confirmed.text'), value: confirmedText, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setConfirmedText(e.target.value) } }),
+            React.createElement('input', { style: styles.input, placeholder: t('confirmed.paths'), value: confirmedPaths, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setConfirmedPaths(e.target.value) } }),
+            React.createElement('button', {
+              style: styles.button, disabled: busy !== null || confirmedText === '',
+              onClick: () => { void runAction('addConfirmed', '/project-control/api/confirmed', { type: 'constraint', text: confirmedText, forbiddenPaths: confirmedPaths.split(',').map((path) => path.trim()).filter((path) => path !== '') }).then(() => { setConfirmedText(''); setConfirmedPaths('') }) },
+            }, busy === 'addConfirmed' ? t('action.running') : t('confirmed.add')),
+          ),
+          confirmed.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('confirmed.none'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('tbody', null, confirmed.map((item) => React.createElement('tr', { key: item.id },
+                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge('#c586c0') }, item.type)),
+                  React.createElement('td', { style: styles.td }, item.text),
+                  React.createElement('td', { style: styles.td }, item.forbiddenPaths.join(', ') || '—'),
+                  React.createElement('td', { style: styles.td }, React.createElement('button', {
+                    style: { ...styles.secondary, padding: '2px 8px', fontSize: '11px' },
+                    onClick: () => { void removeConfirmed(item.id) },
+                  }, t('confirmed.remove'))),
+                ))),
+              )),
+        ),
 
       // ── 变更工作台：新建表单 + 列表 ──
       tab === 'changes' && React.createElement(React.Fragment, null,
@@ -502,18 +561,20 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             ? React.createElement('div', { style: styles.empty }, t('state.noRuns'))
             : React.createElement('table', { style: styles.table },
                 React.createElement('thead', null, React.createElement('tr', null,
-                  ['exec.col.change', 'exec.col.status', 'exec.col.started'].map((key) =>
+                  ['exec.col.change', 'exec.col.status', 'exec.col.started', 'exec.col.cost'].map((key) =>
                     React.createElement('th', { key, style: styles.th }, t(key)))),
                 ),
                 React.createElement('tbody', null, runs.map((run) => React.createElement('tr', { key: run.id },
                   React.createElement('td', { style: styles.td }, run.changeId),
                   React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(run.status === 'completed' ? '#4ec9b0' : '#dcdcaa') }, run.status)),
                   React.createElement('td', { style: styles.td }, formatTime(run.startedAt)),
+                  React.createElement('td', { style: styles.td }, run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'),
                 ))),
               )),
       ),
 
       // ── 记忆与学习：记录表单 + 列表（含确认） + Review/验收/证据 ──
+      // ── 记忆与学习：记录表单 + 列表（含确认） + 学习概念 + Review/验收/证据 ──
       tab === 'memory' && React.createElement(React.Fragment, null,
         React.createElement(Card, { title: t('action.recordMemory') },
           React.createElement('div', { style: styles.formRow },
@@ -545,6 +606,20 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         style: { ...styles.button, padding: '2px 8px', fontSize: '11px' },
                         onClick: () => { void confirmMemory(memory.id) },
                       }, t('memory.confirm'))),
+                ))),
+              )),
+        React.createElement(Card, { title: t('concepts.title') },
+          concepts.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('concepts.none'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('thead', null, React.createElement('tr', null,
+                  ['concepts.col.name', 'concepts.col.category', 'concepts.col.count'].map((key) =>
+                    React.createElement('th', { key, style: styles.th }, t(key)))),
+                ),
+                React.createElement('tbody', null, concepts.map((concept) => React.createElement('tr', { key: concept.id },
+                  React.createElement('td', { style: styles.td }, concept.name),
+                  React.createElement('td', { style: styles.td }, concept.category),
+                  React.createElement('td', { style: styles.td }, String(concept.occurrences)),
                 ))),
               )),
         React.createElement(Card, { title: t('review.issues') },
@@ -583,13 +658,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               )),
       ),
 
-      // ── 历史：扫描按钮 + Imported Change 列表 ──
+      // ── 历史：扫描/续跑按钮 + Imported Change 列表 ──
       tab === 'history' && React.createElement(React.Fragment, null,
         React.createElement(Card, null,
-          React.createElement('button', {
-            style: styles.button, disabled: busy !== null,
-            onClick: () => { void runAction('scanHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30 }) },
-          }, busy === 'scanHistory' ? t('action.running') : t('action.scanHistory')),
+          React.createElement('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+            React.createElement('button', {
+              style: styles.button, disabled: busy !== null,
+              onClick: () => { void runAction('scanHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30 }) },
+            }, busy === 'scanHistory' ? t('action.running') : t('action.scanHistory')),
+            React.createElement('button', {
+              style: styles.secondary, disabled: busy !== null,
+              onClick: () => { void runAction('continueHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30, resume: true }) },
+            }, busy === 'continueHistory' ? t('action.running') : t('history.continue')),
+          ),
         ),
         resultPanel,
         React.createElement(Card, { title: t('history.imported') },
