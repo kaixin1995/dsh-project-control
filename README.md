@@ -31,7 +31,8 @@ AI 项目变更认知与核查工具 —— [deepseek-harness](https://github.co
 - [x] **T1 领域模型与存储**（已完成：12种Branded ID/ULID/状态机矩阵/Truth model/CAS/三域Repository/ProjectService）
 - [x] **T2 Git 变更分析**（已完成：GitAdapter/WorkspaceSnapshot/baseRevision追踪/EvidenceManager/ChangeService/analyze_change工具/insight命令）
 - [x] **T3 影响分析**（已完成：GenericLanguageAnalyzer/ProjectGraph/4级ImpactEngine/ContractAnalyzer）
-- [ ] **T4 执行运行时** ← 下一步（development-plan §三）
+- [x] **T4 执行运行时**（已完成：PlanDagScheduler/StepAttemptRunner/WorktreeManager/RecoveryScanner）
+- [ ] **T5 模型路由与成本核算** ← 下一步（development-plan §三）
 - [ ] T5 模型路由/成本 → T6 Review/Verification → T7 客户端 UI → T8 Legacy Bootstrap（简化）= **首版**
 - [ ] T9 记忆 → T10 学习 → T11 打包安装 →（后置：C# Roslyn 宿主、并行 Plan）
 
