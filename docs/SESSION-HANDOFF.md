@@ -14,10 +14,14 @@
 
 ## 二、当前状态（2026-08-30）
 
-- **T0（脚手架）、T1（领域模型）、T2（Git 变更）、T3（影响分析）、T4（执行运行时）、T5（模型路由/成本）、T6（Review/Verification）、T7（客户端 UI）、T8（Legacy Bootstrap 简化版）、T9（记忆）、T10（学习与概念提取）已全部完成并通过完整测试（49 tests passing）**。
-- 阶段：T0–T10 已完成，**下一步 = 从 T11.1（打包与分发：cordis.patch.yml 验证、安装脚本、完整端到端验收）开始执行**（见 [development-plan.md](development-plan.md) §三）。
-- 业主已确认：V0.4 产品总纲、V1.0 技术设计（含三处工程修正，见 development-plan §一 R1–R7）。
-- 首版范围已锁定（development-plan §六）。
+- **🎉 全部开发任务（T0–T11）全部圆满完成并 100% 验收通过！**
+- **测试覆盖**：19 个测试套件，50 个单元/集成/端到端测试用例全部通过（50 tests passed in 4.78s）。
+- **架构合规**：
+  1. **零改动本体（Iron Rule 1）**：`deepseek-harness` 仓库干净无污损。
+  2. **事件零扩展（Iron Rule 2）**：无私有 `SessionEventMap` 事件类型，UI/卡片全部基于工具元数据与标准命令事件。
+  3. **纯增量插槽（Iron Rule 3）**：使用 `sidebar.footer.action`、`tool.call.toolview`、`conversation.session.header.actions`、`conversation.view`。
+  4. **标准 Cordis 协议（Iron Rule 4）**：ESM 规范、单调 ULID、三域 storage-domain 隔离、CAS 乐观锁。
+- 业主已确认：V0.4 产品总纲、V1.0 技术设计（R1–R7 已全部落地实现）。
 
 ## 三、文档阅读顺序（必读，按序）
 

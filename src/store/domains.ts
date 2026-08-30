@@ -67,6 +67,7 @@ export const historyDomainSpec = defineDomain({
     issues: domainTable(z.any()),
     verifications: domainTable(z.any()),
     memories: domainTable(z.any()),
+    concepts: domainTable(z.any()),
     items: domainTable(DummyItemSchema),
   },
 })

@@ -42,7 +42,7 @@ export class ConceptService {
    */
   async learnConcept(params: CreateConceptParams): Promise<ConceptRecord> {
     const existing = this.conceptsRepo.list(
-      c => c.projectId === params.projectId && c.name.toLowerCase() === params.name.toLowerCase(),
+      c => c.projectId === params.projectId && (c.name?.toLowerCase() === params.name.toLowerCase()),
     )[0]
 
     const now = Date.now()

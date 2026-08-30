@@ -78,4 +78,5 @@ export interface ProjectControlStore {
   issues: DomainRepository<ReviewIssueRecord, IssueId>
   verifications: DomainRepository<VerificationRecord, VerificationId>
   memories: DomainRepository<MemoryRecord, MemoryId>
+  concepts?: DomainRepository<any, any>
 }
