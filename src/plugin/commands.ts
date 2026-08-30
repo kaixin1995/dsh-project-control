@@ -98,4 +98,3 @@ export function apply(ctx: Context): void {
   }, 'project-control: commands registration')
 }
 
-export default apply

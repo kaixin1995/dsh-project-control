@@ -109,4 +109,3 @@ export function apply(ctx: any, config: ProjectControlConfig = {}): void {
   })
 }
 
-export default apply

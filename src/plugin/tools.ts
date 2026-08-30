@@ -136,4 +136,3 @@ export function apply(ctx: Context): void {
   }, 'project-control: tools registration')
 }
 
-export default apply
