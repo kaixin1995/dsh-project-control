@@ -75,6 +75,13 @@
 - 本体压缩功能依赖模型 contextWindow 元数据：自定义路由缺 `contextWindow` 时自动压缩静默失效（只 warn 一次），详见本体根 `AGENT_PROJECT_GUIDE.md` 的排错记录。
 - 本体资料总览见 `../AGENT_PROJECT_GUIDE.md`（本体根目录的本地未跟踪文件）。
 
+**rc.2 全局 CLI 运行时事实（2026-08-30 真机验证）**
+- `ctx.plugin(fn)` 挂载函数子插件时**不识别 fn 的 `inject` 导出**，子 fiber 内读取未声明服务会抛 `cannot get property without inject` 且被静默吞掉 → bundle 入口（index.ts）**内联注册全部能力**，服务经闭包传递；子入口文件的 apply 仅保留给 Loader 行挂载（Loader 行会正常识别 inject）。
+- 0.1.1 起 storage 栈（storage/storage-json/storage-domain）只在 web / sdk 面 mount，headless 没有 → 插件对 storageDomain / webServer 一律用 `ctx.inject([...], cb)` 动态可选注入，静默降级。
+- domain schema 用 zod（schemastery 无 `.any()`，`z.any` 为 undefined → 记录校验必炸）；插件仓库 node_modules/zod 是指向本体 .pnpm 存储的 Windows junction，供开发期解析。
+- 全局 dsh 已升级 0.1.0-rc.7 → **0.1.1-rc.2**（npm latest）；credentials 嵌套布局兼容 ✓。rc.2 端到端：headless 模型真实回复 ✓；web bootstrap 扫描真实仓库入库 ✓ + /state 真实状态 ✓ + client bundle 进启动图 ✓ + Origin 围栏 403 ✓。
+- 源码启动（repo CLI）下 web 的 __DSH_BOOT__ 图为空的异常仍在待查（全局 CLI 无此问题）。
+
 **待查证（下一会话优先）**
 - 源码启动（repo CLI）下 web 的 `__DSH_BOOT__` 图为空（连官方 ui 包都未进图，无告警——疑似 `loader.internal.resolveSync` 在 tsx/Windows 下静默失败、warn 被内部 logger 吞掉）。用户日常 3080 用的是全局安装 rc.7，图正常。需决定：插件验证走哪条运行时路径，或定位 resolveSync 问题（vendor 代码，受零改动铁律约束，只能上报或绕过）。
 

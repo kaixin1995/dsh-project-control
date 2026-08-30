@@ -14,7 +14,7 @@ import { createProjectId } from '../domain/ids.ts'
 export const name = 'project-control-commands'
 export const inject = ['commands']
 
-export function apply(ctx: Context): void {
+export function registerCommands(ctx: Context): void {
   const git = new GitAdapter()
   const evidenceManager = new EvidenceManager()
   const languageAnalyzer = new GenericLanguageAnalyzer()
@@ -98,3 +98,8 @@ export function apply(ctx: Context): void {
   }, 'project-control: commands registration')
 }
 
+
+/** 独立挂载入口（Loader 行；bundle 路径经 index.ts 的 registerCommands 内联注册）。 */
+export function apply(ctx: Context): void {
+  registerCommands(ctx)
+}

@@ -10,12 +10,12 @@
  * @module dsh-project-control/store/domains
  */
 
-import z from '@deepseek-ai/schemastery'
+import { z } from 'zod'
 
 /** 存储域格式版本号 */
 export const DOMAIN_FORMAT_VERSION = 1
 
-/** 宽松记录 schema：仓储层字段校验由领域服务负责，这里只保证可解析（.parse 存在）。 */
+/** 宽松记录 schema：仓储层字段校验由领域服务负责，这里只要求可解析。z.any() 的 .parse 恒等返回。 */
 const recordSchema = z.any()
 
 export function domainTable<K extends string = string, V = unknown>(schema: any) {

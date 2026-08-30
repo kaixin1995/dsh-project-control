@@ -189,9 +189,8 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
 /**
  * 注册 API 路由（独立插件入口，由 cordis.yml / cordis.patch.yml 挂载）。
  */
-export function apply(ctx: Context): void {
-  const service = ctx.projectControl as ProjectControlService
-  // webServer 只存在于 web 面 composition：headless / sdk / acp 无此服务，
+export function registerApiRoute(ctx: Context, service: ProjectControlService): void {
+  // webServer 只存在于挂载了 web 面的 composition：headless / sdk / acp 无此服务，
   // ctx.inject 静默不触发，插件照常激活（不产生 pending）。
   ctx.inject(['webServer'], (scope: Context) => {
     const webServer = scope.webServer
@@ -208,8 +207,15 @@ export function apply(ctx: Context): void {
         const routePath = url.pathname.slice(ROUTE_PREFIX.length)
 
         if (req.method === 'GET' && routePath === '/state') {
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify(buildState(service)))
+          try {
+            const body = JSON.stringify(buildState(service))
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(body)
+          } catch (error) {
+            ctx.logger?.warn?.()
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
           return
         }
 
@@ -264,4 +270,9 @@ export function apply(ctx: Context): void {
 
     ctx.effect(() => disposeRoute, 'project-control: api route')
   })
+}
+
+/** 独立挂载入口（Loader 行；bundle 路径经 index.ts 的 registerApiRoute 内联注册）。 */
+export function apply(ctx: Context): void {
+  registerApiRoute(ctx, ctx.projectControl as ProjectControlService)
 }

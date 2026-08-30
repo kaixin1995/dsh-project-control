@@ -17,7 +17,7 @@ import { ChangeId } from '../domain/ids.ts'
 export const name = 'project-control-tools'
 export const inject = ['tools']
 
-export function apply(ctx: Context): void {
+export function registerTools(ctx: Context): void {
   const git = new GitAdapter()
   const evidenceManager = new EvidenceManager()
 
@@ -82,4 +82,9 @@ export function apply(ctx: Context): void {
   })
 
   ctx.effect(() => ctx.tools.register(analyzeChangeTool), 'project-control: analyze_change tool')
+}
+
+/** 独立挂载入口（Loader 行；bundle 路径经 index.ts 的 registerTools 内联注册）。 */
+export function apply(ctx: Context): void {
+  registerTools(ctx)
 }

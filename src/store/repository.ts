@@ -85,6 +85,8 @@ export interface ProjectControlStore {
   runs: DomainRepository<RunRecord, RunId>
   steps: DomainRepository<StepRecord, StepId>
   attempts: DomainRepository<AttemptRecord, AttemptId>
+  /** 引导检查点仓储（history 域） */
+  checkpoints: DomainRepository<ProjectBootstrapCheckpoint, string>
   evidence: DomainRepository<EvidenceRecord, EvidenceId>
   issues: DomainRepository<ReviewIssueRecord, IssueId>
   verifications: DomainRepository<VerificationRecord, VerificationId>
