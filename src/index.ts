@@ -6,26 +6,28 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import servicePlugin, { ProjectControlService } from './plugin/service.ts'
-import toolsPlugin from './plugin/tools.ts'
-import commandsPlugin from './plugin/commands.ts'
+import { ProjectControlService, apply as servicePlugin } from './plugin/service.ts'
+import { apply as toolsPlugin } from './plugin/tools.ts'
+import { apply as commandsPlugin } from './plugin/commands.ts'
+import { apply as apiRoutePlugin } from './plugin/api-route.ts'
 
 /** 插件名称 */
 export const name = 'project-control'
 /** 注入的服务依赖 */
-export const inject = ['storage', 'tools', 'commands']
+export const inject = ['storage', 'tools', 'commands', 'webServer']
 
 /**
- * 插件装配函数：挂载服务插件、工具插件与命令插件
+ * 插件装配函数：挂载服务插件、工具插件、命令插件与 API 路由插件
  */
 export function apply(ctx: Context): void {
   ctx.plugin(servicePlugin)
   ctx.plugin(toolsPlugin)
   ctx.plugin(commandsPlugin)
+  ctx.plugin(apiRoutePlugin)
 }
 
 // 导出服务与子插件
-export { ProjectControlService, servicePlugin, toolsPlugin, commandsPlugin }
+export { ProjectControlService, servicePlugin, toolsPlugin, commandsPlugin, apiRoutePlugin }
 
 // 导出领域基础与 ID 体系
 export * from './domain/brand.ts'

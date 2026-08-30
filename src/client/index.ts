@@ -1,76 +1,94 @@
 /**
  * Client plugin entry for dsh-project-control.
- * Registers UI components using ctx.slots.inject to wait on slot declarations safely:
- * - conversation.view: 📊 项目控制 (Project Control Dashboard View Tab)
- * - sidebar.footer.action: 📊 项目控制 (Sidebar Action Button)
- * - tool.call.toolview: Custom change card for analyze_change
- * - conversation.session.header.actions: Header badge
+ *
+ * 布局架构（已验证，2026-08-30）：
+ * - 工作台遮蔽官方 `details` 槽（priority -10，官方 DetailsPanel 留在账本上，
+ *   卸载我们的注册即恢复），渲染在主框架 details 列；
+ * - WorkspaceFrame 注入样式表，把官方网格视觉换列：聊天（centerCol）最右、
+ *   工作台（detailsCol）居中 1fr；无会话落地页（data-details-collapsed）
+ *   自动恢复原生列序；
+ * - 左侧官方导航、官方聊天本体零改动；
+ * - 侧边栏按钮在「项目工作台 ⇄ 官方详情面板」间切换（可逆）；
+ * - `tool.call.toolview` 为 analyze_change 保留专属卡片；
+ * - 文案全部经 ctx.locale 词典（zh / en）。
  *
  * @module dsh-client-project-control
  */
 
 import React from 'react'
 import { ChangeCard } from './components/ChangeCard.ts'
-import { ProjectControlView } from './components/ProjectControlView.tsx'
+import { WORKSPACE_DICT, WorkspaceFrame } from './components/WorkspaceFrame.tsx'
+
+const NS = 'project-control'
 
 export const name = 'client-project-control'
-export const inject = ['slots']
+export const inject = ['slots', 'locale']
 
 export function apply(ctx: any): void {
-  const slots = ctx.get('slots')
-  if (!slots || typeof slots.inject !== 'function') return
+  ctx.effect(() => ctx.locale.register(NS, { zh: WORKSPACE_DICT.zh, en: WORKSPACE_DICT.en }), 'project-control: dictionaries')
 
-  // 1. 会话主视图 Tab 页签 (Conversation View Tab) - 与 Chat / Trajectory 并列
-  slots.inject('conversation.view', () => {
-    return slots.register({
-      name: 'conversation.view',
-      id: 'project-control',
-      order: 20,
-      label: () => '📊 项目控制',
-    }, (props: any) => {
-      return React.createElement(ProjectControlView, props)
-    })
+  // ── 1. 项目工作台：遮蔽 details 槽（可逆）───────────────────────────────
+  let workspaceEnabled = true
+  let disposeWorkspace: (() => void) | undefined
+
+  const registerWorkspace = (): void => {
+    disposeWorkspace = ctx.slots.register({
+      name: 'details',
+      priority: -10,
+      locale: NS,
+    }, WorkspaceFrame)
+  }
+  const unregisterWorkspace = (): void => {
+    disposeWorkspace?.()
+    disposeWorkspace = undefined
+  }
+
+  ctx.slots.inject('details', () => {
+    if (workspaceEnabled) registerWorkspace()
+    return () => {
+      unregisterWorkspace()
+    }
   })
 
-  // 2. 侧边栏底部操作入口 (Sidebar Footer Action)
-  slots.inject('sidebar.footer.action', () => {
-    return slots.register({
+  // ── 2. 侧边栏底部：工作台 ⇄ 官方详情 切换 ─────────────────────────────
+  ctx.slots.inject('sidebar.footer.action', () => {
+    return ctx.slots.register({
       name: 'sidebar.footer.action',
-      id: 'project-control-action',
+      id: 'project-control-toggle',
     }, () => {
       return React.createElement(
         'button',
         {
-          'data-testid': 'project-control-sidebar-entry',
+          'data-testid': 'project-control-sidebar-toggle',
+          title: '项目工作台 ⇄ 详情面板',
           style: {
-            display: 'flex',
-            alignItems: 'center',
-            gap: '6px',
-            padding: '6px 10px',
-            fontSize: '12px',
-            background: 'none',
-            border: 'none',
-            color: 'inherit',
-            cursor: 'pointer',
-            opacity: 0.85,
+            display: 'flex', alignItems: 'center', gap: '6px',
+            padding: '6px 10px', fontSize: '12px',
+            background: 'none', border: 'none',
+            color: 'inherit', cursor: 'pointer', opacity: 0.85,
           },
           onClick: () => {
-            console.log('Project Control sidebar entry clicked')
+            workspaceEnabled = !workspaceEnabled
+            try {
+              if (workspaceEnabled && disposeWorkspace === undefined) registerWorkspace()
+              else if (!workspaceEnabled) unregisterWorkspace()
+            } catch (error: unknown) {
+              console.warn('[project-control] workspace toggle failed', error)
+            }
           },
         },
-        '📊 项目控制',
+        '🧭 工作台',
       )
     })
   })
 
-  // 3. 自定义变更卡片工具视图 (Tool Call Toolview for analyze_change)
-  slots.inject('tool.call.toolview', () => {
-    return slots.register({
+  // ── 3. analyze_change 专属工具卡片 ─────────────────────────────────────
+  ctx.slots.inject('tool.call.toolview', () => {
+    return ctx.slots.register({
       name: 'tool.call.toolview',
       key: 'analyze_change',
     }, (props: any) => {
       if (props?.toolName !== 'analyze_change') return null
-
       const output = props?.output
       return React.createElement(ChangeCard, {
         title: '变更分析报告 (Change Analysis)',
@@ -80,31 +98,6 @@ export function apply(ctx: any): void {
         evidenceId: output?.evidenceId,
         status: output ? 'completed' : 'analyzing',
       })
-    })
-  })
-
-  // 4. 会话标题状态徽标 (Conversation Session Header Actions)
-  slots.inject('conversation.session.header.actions', () => {
-    return slots.register({
-      name: 'conversation.session.header.actions',
-      id: 'project-control-badge',
-    }, () => {
-      return React.createElement(
-        'div',
-        {
-          'data-testid': 'project-control-header-badge',
-          style: {
-            fontSize: '11px',
-            padding: '2px 8px',
-            borderRadius: '4px',
-            backgroundColor: 'var(--dsh-status-bg, rgba(78, 201, 176, 0.15))',
-            color: 'var(--dsh-status-text, #4ec9b0)',
-            display: 'inline-flex',
-            alignItems: 'center',
-          },
-        },
-        '🛡️ Project Insight 活跃',
-      )
     })
   })
 }
