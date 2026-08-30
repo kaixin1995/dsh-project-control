@@ -14,8 +14,8 @@
 
 ## 二、当前状态（2026-08-30）
 
-- **T0（脚手架）、T1（领域模型）、T2（Git 变更）、T3（影响分析）、T4（执行运行时）、T5（模型路由/成本）、T6（Review & Verification 引擎）已全部完成并通过完整测试（42 tests passing）**。
-- 阶段：T0–T6 已完成，**下一步 = 从 T7.1（客户端 UI：Chat Cards / Tool View / Sidebar / State Sync）开始执行**（见 [development-plan.md](development-plan.md) §三）。
+- **T0（脚手架）、T1（领域模型）、T2（Git 变更）、T3（影响分析）、T4（执行运行时）、T5（模型路由/成本）、T6（Review & Verification 引擎）、T7（客户端 UI）已全部完成并通过完整测试（44 tests passing）**。
+- 阶段：T0–T7 已完成，**下一步 = 从 T8.1（Legacy Bootstrap 简化版：BootstrapPipeline / ProjectBootstrapRecord）开始执行**（见 [development-plan.md](development-plan.md) §三）。
 - 业主已确认：V0.4 产品总纲、V1.0 技术设计（含三处工程修正，见 development-plan §一 R1–R7）。
 - 首版范围已锁定（development-plan §六）。
 
