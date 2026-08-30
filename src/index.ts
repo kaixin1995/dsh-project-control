@@ -24,8 +24,6 @@ export function apply(ctx: Context): void {
   ctx.plugin(commandsPlugin)
 }
 
-export default apply
-
 // 导出服务与子插件
 export { ProjectControlService, servicePlugin, toolsPlugin, commandsPlugin }
 
