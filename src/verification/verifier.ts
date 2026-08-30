@@ -1,9 +1,9 @@
 /**
- * Verifier interface and 4-tier priority execution chain.
- * Tier 1: Deterministic Build / Test (deterministic, zero-LLM ground truth)
- * Tier 2: Static Evidence / Diff Assertions
- * Tier 3: LLM Evaluation / Heuristic Review
- * Tier 4: Human Sign-off
+ * 4 层验证器接口与执行链（Verifier Hierarchy）。
+ * Tier 1: 确定性构建 / 编译与测试（Deterministic Build / Unit Test，零 LLM 地面真值）
+ * Tier 2: 静态事实证据与 Diff 断言（Static Evidence & Diff Assertion）
+ * Tier 3: LLM 启发式代码审查（LLM Heuristic Code Review）
+ * Tier 4: 人工确认签署（Human Sign-off）
  *
  * @module dsh-project-control/verification/verifier
  */
@@ -33,7 +33,7 @@ export interface Verifier {
 }
 
 /**
- * Tier 1: Deterministic Build / Typecheck Verifier
+ * Tier 1: 确定性构建 / 编译验证器
  */
 export class DeterministicBuildVerifier implements Verifier {
   readonly name = 'Deterministic Build Check'
@@ -69,7 +69,7 @@ export class DeterministicBuildVerifier implements Verifier {
 }
 
 /**
- * Tier 1: Unit Test Verifier
+ * Tier 1: 自动化单元测试验证器
  */
 export class UnitTestVerifier implements Verifier {
   readonly name = 'Automated Unit Tests'
@@ -105,7 +105,7 @@ export class UnitTestVerifier implements Verifier {
 }
 
 /**
- * Tier 2: Static Evidence / Diff Assertion Verifier
+ * Tier 2: 静态证据与 Diff 一致性验证器
  */
 export class EvidenceDiffVerifier implements Verifier {
   readonly name = 'Static Evidence & Diff Consistency'
@@ -139,7 +139,7 @@ export class EvidenceDiffVerifier implements Verifier {
 }
 
 /**
- * Tier 3: LLM Code Review Verifier
+ * Tier 3: LLM 启发式代码审查验证器
  */
 export class LlmReviewVerifier implements Verifier {
   readonly name = 'LLM Heuristic Code Review'

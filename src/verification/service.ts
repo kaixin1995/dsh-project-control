@@ -1,5 +1,7 @@
 /**
- * Verification Runner executing verifiers by strict priority order and recording results.
+ * 验证执行管道服务（Verification Runner）。
+ * 依据 4 层优先级严格顺序执行验证器，在 Tier 1 确定性构建/单测失败时短路拦截，并持久化全部验证记录。
+ *
  * @module dsh-project-control/verification/service
  */
 
@@ -33,10 +35,10 @@ export class VerificationRunner {
   ) {}
 
   /**
-   * Run verification pipeline adhering to the 4-tier priority hierarchy.
+   * 按照 4 层优先级继承体系执行验证管道。
    */
   async runPipeline(params: RunVerificationParams): Promise<VerificationPipelineResult> {
-    // Sort verifiers by priority ascending (1 is highest priority)
+    // 按优先级升序排序（1 为最高优先级）
     const sortedVerifiers = [...this.verifiers].sort((a, b) => a.priority - b.priority)
 
     const records: VerificationRecord[] = []
@@ -44,7 +46,7 @@ export class VerificationRunner {
     let hasDeterministicFailure = false
 
     for (const verifier of sortedVerifiers) {
-      // Short-circuit: If a Tier 1 deterministic check failed, skip lower priority checks
+      // 短路逻辑：若 Tier 1 确定性检验失败，直接跳过后续低优先级检查
       if (hasDeterministicFailure && verifier.priority > 1) {
         continue
       }

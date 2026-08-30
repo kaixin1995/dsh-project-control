@@ -1,17 +1,32 @@
 /**
- * State machine models and transition validation matrices.
- * Implements Change(9), Run(10), Step(11), Attempt(6) states.
+ * 状态机模型与合法状态迁移校验矩阵。
+ * 覆盖变更 (Change/9状态)、运行 (Run/10状态)、步骤 (Step/11状态)、尝试 (Attempt/6状态)。
  *
  * @module dsh-project-control/domain/state-machine
  */
 
+/**
+ * 穷举检查兜底函数：当联合类型产生未处理分支时抛出异常。
+ */
 export function assertNever(x: never, message = 'Unexpected value in exhaustive check'): never {
   throw new Error(`${message}: ${JSON.stringify(x)}`)
 }
 
 // -----------------------------------------------------------------------------
-// 1. Change Status (9 states)
+// 1. 变更状态（Change Status - 9 种状态）
 // -----------------------------------------------------------------------------
+/**
+ * 变更状态枚举：
+ * - draft: 草稿中
+ * - analyzing: 变更分析中
+ * - ready: 就绪（可开始执行）
+ * - executing: 正在执行中
+ * - reviewing: 审查中
+ * - verifying: 验证中
+ * - completed: 已完成（终态）
+ * - failed: 失败（可恢复/重新规划）
+ * - cancelled: 已取消
+ */
 export type ChangeStatus =
   | 'draft'
   | 'analyzing'
@@ -42,9 +57,9 @@ const CHANGE_TRANSITIONS: Record<ChangeStatus, readonly ChangeStatus[]> = {
   executing: ['reviewing', 'verifying', 'ready', 'failed', 'cancelled'],
   reviewing: ['verifying', 'executing', 'failed', 'cancelled'],
   verifying: ['completed', 'reviewing', 'executing', 'failed', 'cancelled'],
-  completed: [], // Terminal
-  failed: ['ready', 'analyzing', 'draft'], // Recoverable
-  cancelled: ['draft'], // Can be reopened to draft
+  completed: [], // 终态
+  failed: ['ready', 'analyzing', 'draft'], // 可恢复重试
+  cancelled: ['draft'], // 可重新激活回草稿
 }
 
 export function canTransitionChange(from: ChangeStatus, to: ChangeStatus): boolean {
@@ -60,8 +75,21 @@ export function assertChangeTransition(from: ChangeStatus, to: ChangeStatus): vo
 }
 
 // -----------------------------------------------------------------------------
-// 2. Run Status (10 states)
+// 2. 运行状态（Run Status - 10 种状态）
 // -----------------------------------------------------------------------------
+/**
+ * 运行实例状态枚举：
+ * - queued: 排队中
+ * - running: 运行中
+ * - paused: 暂停
+ * - blocked: 阻塞中
+ * - retrying: 重试中
+ * - verifying: 校验中
+ * - succeeded: 成功（终态）
+ * - failed: 失败
+ * - cancelled: 取消
+ * - interrupted: 异常中断（可恢复）
+ */
 export type RunStatus =
   | 'queued'
   | 'running'
@@ -94,10 +122,10 @@ const RUN_TRANSITIONS: Record<RunStatus, readonly RunStatus[]> = {
   blocked: ['running', 'cancelled', 'failed', 'interrupted'],
   retrying: ['running', 'failed', 'cancelled', 'interrupted'],
   verifying: ['succeeded', 'failed', 'running', 'cancelled', 'interrupted'],
-  succeeded: [], // Terminal
-  failed: ['queued'], // Rerunnable
-  cancelled: [], // Terminal
-  interrupted: ['queued', 'running', 'failed', 'cancelled'], // Recoverable via recovery scanner
+  succeeded: [], // 终态
+  failed: ['queued'], // 可重新加入队列
+  cancelled: [], // 终态
+  interrupted: ['queued', 'running', 'failed', 'cancelled'], // 崩溃扫描器可恢复
 }
 
 export function canTransitionRun(from: RunStatus, to: RunStatus): boolean {
@@ -113,7 +141,7 @@ export function assertRunTransition(from: RunStatus, to: RunStatus): void {
 }
 
 // -----------------------------------------------------------------------------
-// 3. Step Status (11 states)
+// 3. 步骤状态（Step Status - 11 种状态）
 // -----------------------------------------------------------------------------
 export type StepStatus =
   | 'pending'
@@ -148,12 +176,12 @@ const STEP_TRANSITIONS: Record<StepStatus, readonly StepStatus[]> = {
   running: ['paused', 'retrying', 'succeeded', 'failed', 'blocked', 'cancelled', 'interrupted'],
   paused: ['running', 'cancelled', 'interrupted'],
   retrying: ['running', 'failed', 'cancelled', 'interrupted'],
-  succeeded: [], // Terminal
-  failed: ['ready', 'pending'], // Rerunnable
-  skipped: ['ready', 'pending'], // Resettable
+  succeeded: [], // 终态
+  failed: ['ready', 'pending'], // 可重置
+  skipped: ['ready', 'pending'], // 可重新启用
   blocked: ['ready', 'cancelled', 'failed'],
-  cancelled: [], // Terminal
-  interrupted: ['ready', 'failed', 'cancelled'], // Recoverable
+  cancelled: [], // 终态
+  interrupted: ['ready', 'failed', 'cancelled'], // 可恢复
 }
 
 export function canTransitionStep(from: StepStatus, to: StepStatus): boolean {
@@ -169,7 +197,7 @@ export function assertStepTransition(from: StepStatus, to: StepStatus): void {
 }
 
 // -----------------------------------------------------------------------------
-// 4. Attempt Status (6 states)
+// 4. 单次尝试状态（Attempt Status - 6 种状态）
 // -----------------------------------------------------------------------------
 export type AttemptStatus =
   | 'running'
@@ -190,11 +218,11 @@ export const ATTEMPT_STATUSES: readonly AttemptStatus[] = [
 
 const ATTEMPT_TRANSITIONS: Record<AttemptStatus, readonly AttemptStatus[]> = {
   running: ['succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'],
-  succeeded: [], // Terminal
-  failed: [], // Terminal
-  cancelled: [], // Terminal
-  timed_out: [], // Terminal
-  interrupted: [], // Terminal (Recovery creates a NEW Attempt)
+  succeeded: [], // 终态
+  failed: [], // 终态
+  cancelled: [], // 终态
+  timed_out: [], // 终态
+  interrupted: [], // 终态（中断恢复后开启新 Attempt）
 }
 
 export function canTransitionAttempt(from: AttemptStatus, to: AttemptStatus): boolean {

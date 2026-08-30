@@ -1,5 +1,7 @@
 /**
- * Project Control core service definition and registration.
+ * Project Control 核心服务定义与 Cordis 注册。
+ * 提供 `ctx.projectControl` 服务接入点与配置 Schema。
+ *
  * @module dsh-project-control/plugin/service
  */
 
