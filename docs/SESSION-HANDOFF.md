@@ -14,8 +14,8 @@
 
 ## 二、当前状态（2026-08-30）
 
-- **T0（脚手架与前置验证）与 T1（领域模型与存储）已全部完成并通过完整单测**。
-- 阶段：T0/T1 已完成，**下一步 = 从 T2.1（Git 变更分析与适配层）开始执行**（见 [development-plan.md](development-plan.md) §三）。
+- **T0（脚手架与前置验证）、T1（领域模型与存储）、T2（Git 变更分析与 Evidence 基础）已全部完成并通过完整测试（28 tests passing）**。
+- 阶段：T0/T1/T2 已完成，**下一步 = 从 T3.1（影响分析与 LanguageAnalyzer/Project Graph）开始执行**（见 [development-plan.md](development-plan.md) §三）。
 - 业主已确认：V0.4 产品总纲、V1.0 技术设计（含三处工程修正，见 development-plan §一 R1–R7）。
 - 首版范围已锁定（development-plan §六）。
 
