@@ -130,3 +130,25 @@ export function resolveTierRoute(
   if (tier && tier.provider && tier.model) return { provider: tier.provider, model: tier.model }
   return undefined
 }
+
+/** 部署级默认路由解析：settings 等级覆盖 → agent-default-model 服务 → 旧式兜底。 */
+export function resolveDeploymentRoute(
+  ctx: unknown,
+  modelClass: ModelClass,
+  config: ResolvedProjectControlConfig,
+): { provider: string; model: string } {
+  const tier = config.modelTiers[modelClass]
+  if (tier && tier.provider && tier.model) return { provider: tier.provider, model: tier.model }
+  try {
+    // ctx.get 是可选服务的官方读取通道（不触发属性代理的 inject 门禁）。
+    const selection = (ctx as { get?: (name: string) => unknown }).get?.('agentDefaultModel') as
+      | { currentSelection?: () => { provider?: string; model?: string } }
+      | undefined
+    const current = selection?.currentSelection?.()
+    if (current?.provider && current?.model) return { provider: current.provider, model: current.model }
+  } catch {
+    // 服务未挂载 / 抛错：继续兜底
+  }
+  const fallbackModel = modelClass === 'reasoning' || modelClass === 'verifier' ? 'deepseek-v4-reasoner' : 'deepseek-v4-flash'
+  return { provider: 'deepseek-official', model: fallbackModel }
+}

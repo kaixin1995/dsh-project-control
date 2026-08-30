@@ -91,6 +91,12 @@
 - ctx.agents.create 子代理：meta.origin='subagent'，setup 注册 project_control_step_complete；usage 从子会话 assistant/message 事件聚合。
 - 客户端 details 槽面板默认轨道宽 0：WorkspaceFrame 挂载时调用 ctx.layout.openDetails()（inject 需声明 'layout'）打开轨道；无会话落地页轨道恒 0，原生英雄页不受影响。
 
+**T8-L1 / T3.1 交付事实（2026-08-30）**
+- L1 逐提交轻析已实装：scanHistory 接 summaries 回调（api-route 以 resolveDeploymentRoute 解析 Fast 路由，maxSummarized=30，单条失败回落 subject 并 console.error）；真机验证 4 提交 → 真实 LLM 语义句、零失败、15s。
+- 部署路由解析 resolveDeploymentRoute(ctx, tier, cfg)：settings 等级覆盖 → **ctx.get('agentDefaultModel').currentSelection()**（ctx.get 是可选服务官方通道，属性代理读取会触发 inject 门禁）→ deepseek-v4 兜底。本机部署真实路由 = llm-pi-ai aitool/1M（settings.yaml llm-pi-ai.providers.aitool）。
+- query_impact 工具 + collectSymbolReferences（lsp-evidence.ts）：LSP findReferences 优先（lsp_symbol 证据）→ 缺失/失败降级 rg（file_ast 证据 + lspFailed 标注）；三路径单测覆盖。真机：无 LSP 环境 file_ast + 4 引用命中。
+- **ESM bundle 禁 require()**：esbuild ESM 输出把 require 换成运行时抛错 shim，try/catch 会静默吞掉（曾导致分析器文件枚举恒空）→ 一律顶部静态 import。
+
 **待查证（下一会话优先）**
 - 源码启动（repo CLI）下 web 的 `__DSH_BOOT__` 图为空（连官方 ui 包都未进图，无告警——疑似 `loader.internal.resolveSync` 在 tsx/Windows 下静默失败、warn 被内部 logger 吞掉）。用户日常 3080 用的是全局安装 rc.7，图正常。需决定：插件验证走哪条运行时路径，或定位 resolveSync 问题（vendor 代码，受零改动铁律约束，只能上报或绕过）。
 

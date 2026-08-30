@@ -19,6 +19,7 @@ import { GenericLanguageAnalyzer } from '../analysis/language.ts'
 import { ProjectService } from '../domain/project.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { resolveDeploymentRoute } from '../config.ts'
 import type { ProjectControlService } from './service.ts'
 
 export const name = 'project-control-api'
@@ -284,9 +285,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               ? {
                   maxSummarized: 30,
                   run: async (fact: { subject: string; files: string[]; insertions: number; deletions: number }) => {
-                    const tier = service.liveConfig.modelTiers.fast
-                    const provider = tier?.provider || 'deepseek-official'
-                    const model = tier?.model || 'deepseek-chat'
+                    const route = resolveDeploymentRoute(ctx, 'fast', service.liveConfig)
+                    const provider = route.provider
+                    const model = route.model
                     const result = await runLlmAnalysis(ctx, {
                       prompt: [
                         'Summarize what this commit changed in ONE short sentence (<= 25 words), in the same language as the commit message.',

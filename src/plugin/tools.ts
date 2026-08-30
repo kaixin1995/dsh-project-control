@@ -18,6 +18,7 @@ import { EvidenceManager } from '../analysis/evidence.ts'
 import { ChangeService } from '../domain/change.ts'
 import { ChangeId } from '../domain/ids.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { resolveDeploymentRoute } from '../config.ts'
 import { collectSymbolReferences } from '../analysis/lsp-evidence.ts'
 import { GenericLanguageAnalyzer } from '../analysis/language.ts'
 import { VerificationRunner } from '../verification/service.ts'
@@ -41,7 +42,7 @@ function resolveAnalysisRoute(
   if (tierRoute && tierRoute.provider && tierRoute.model) return tierRoute
   const routed = agentSession?.requestHeader?.()?.config
   if (routed && routed.provider && routed.model) return { provider: routed.provider, model: routed.model }
-  return { provider: 'deepseek', model: tier === 'reasoning' || tier === 'verifier' ? 'deepseek-reasoner' : 'deepseek-chat' }
+  return resolveDeploymentRoute(ctx, tier, service.liveConfig)
 }
 
 /** 统一取当前服务实例。 */

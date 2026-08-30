@@ -9,11 +9,11 @@ describe('Model Routing & Cost Tracking (T5.1 - T5.4)', () => {
 
     // 4 Model classes
     const fast = router.resolveModelClass('fast')
-    expect(fast.model).toBe('deepseek-chat')
+    expect(fast.model).toBe('deepseek-v4-flash')
     expect(fast.supportsThinking).toBe(false)
 
     const reasoning = router.resolveModelClass('reasoning')
-    expect(reasoning.model).toBe('deepseek-reasoner')
+    expect(reasoning.model).toBe('deepseek-v4-reasoner')
     expect(reasoning.supportsThinking).toBe(true)
 
     // Stage based

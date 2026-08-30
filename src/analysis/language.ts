@@ -5,7 +5,7 @@
  * @module dsh-project-control/analysis/language
  */
 
-import { readFileSync, existsSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { TruthLevel } from '../domain/truth.ts'
 
@@ -142,7 +142,6 @@ export class GenericLanguageAnalyzer implements LanguageAnalyzer {
     const scan = (dir: string, prefix = '') => {
       let entries: string[] = []
       try {
-        const { readdirSync } = require('node:fs')
         entries = readdirSync(dir)
       } catch {
         return
@@ -153,7 +152,6 @@ export class GenericLanguageAnalyzer implements LanguageAnalyzer {
         const full = join(dir, entry)
         const rel = prefix ? `${prefix}/${entry}` : entry
         try {
-          const { statSync } = require('node:fs')
           if (statSync(full).isDirectory()) {
             scan(full, rel)
           } else if (/\.(ts|tsx|js|jsx|cs|py|go|rs|java)$/i.test(entry)) {

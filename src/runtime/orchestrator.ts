@@ -37,7 +37,7 @@ import { MemoryService } from '../memory/service.ts'
 import { MemoryContextInjector } from '../memory/context.ts'
 import { ConceptService } from '../learning/concept.ts'
 import { PatternLearner } from '../learning/patterns.ts'
-import type { ResolvedProjectControlConfig } from '../config.ts'
+import { resolveDeploymentRoute, type ResolvedProjectControlConfig } from '../config.ts'
 import type { EvidenceManager } from '../analysis/evidence.ts'
 
 /** 步骤 Attempt 的执行产物（由 step_complete 工具回传 + 编排器校验）。 */
@@ -438,9 +438,10 @@ export class RunOrchestrator {
   private resolveStepRoute(_change: ChangeRecord): { provider: string; model: string; modelClass: ModelClass } {
     const cfg = this.deps.config()
     const descriptor = this.router.resolveForStage('step_attempt')
-    const provider = cfg.modelTiers.standard?.provider || descriptor.provider
-    const model = cfg.modelTiers.standard?.model || descriptor.model
-    return { provider, model, modelClass: 'standard' }
+    const tier = cfg.modelTiers.standard
+    if (tier?.provider && tier?.model) return { provider: tier.provider, model: tier.model, modelClass: 'standard' }
+    const deployment = resolveDeploymentRoute(this.deps.ctx, 'standard', cfg)
+    return { provider: deployment.provider, model: deployment.model, modelClass: 'standard' }
   }
 
   /** 是否只读步骤（分析 / 审查类，不要求工作区变化）。 */

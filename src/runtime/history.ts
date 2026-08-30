@@ -144,7 +144,8 @@ export async function scanHistory(
       const fact = facts[index]!
       try {
         fact.aiSummary = await opts.summaries.run(fact)
-      } catch {
+      } catch (error) {
+        console.error('[pc] L1 summarize failed:', error instanceof Error ? error.message : String(error))
         fact.aiSummary = fact.subject
       }
     }
