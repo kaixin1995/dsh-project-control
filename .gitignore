@@ -1,0 +1,13 @@
+# build artifacts
+node_modules/
+lib/
+dist/
+*.tsbuildinfo
+
+# local runtime state
+.insight/
+*.log
+
+# editor
+.vscode/
+.idea/
