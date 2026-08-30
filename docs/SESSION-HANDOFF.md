@@ -14,8 +14,8 @@
 
 ## 二、当前状态（2026-08-30）
 
-- **T0（脚手架）、T1（领域模型）、T2（Git 变更）、T3（影响分析）、T4（执行运行时）、T5（模型路由/成本）、T6（Review & Verification 引擎）、T7（客户端 UI）、T8（Legacy Bootstrap 简化版）、T9（记忆与上下文注入）已全部完成并通过完整测试（47 tests passing）**。
-- 阶段：T0–T9 已完成，**下一步 = 从 T10.1（学习与概念提取：ConceptService / PatternLearning）开始执行**（见 [development-plan.md](development-plan.md) §三）。
+- **T0（脚手架）、T1（领域模型）、T2（Git 变更）、T3（影响分析）、T4（执行运行时）、T5（模型路由/成本）、T6（Review/Verification）、T7（客户端 UI）、T8（Legacy Bootstrap 简化版）、T9（记忆）、T10（学习与概念提取）已全部完成并通过完整测试（49 tests passing）**。
+- 阶段：T0–T10 已完成，**下一步 = 从 T11.1（打包与分发：cordis.patch.yml 验证、安装脚本、完整端到端验收）开始执行**（见 [development-plan.md](development-plan.md) §三）。
 - 业主已确认：V0.4 产品总纲、V1.0 技术设计（含三处工程修正，见 development-plan §一 R1–R7）。
 - 首版范围已锁定（development-plan §六）。
 
