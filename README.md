@@ -35,7 +35,8 @@ AI 项目变更认知与核查工具 —— [deepseek-harness](https://github.co
 - [x] **T5 模型路由与成本核算**（已完成：ModelRouter/CostTracker/CostGuard预算硬约束）
 - [x] **T6 Review & Verification 引擎**（已完成：四层Priority Verifier/ReviewIssueManager/VerificationRunner）
 - [x] **T7 客户端 UI**（已完成：ChangeCard/Slot注册/lib/client.js打包与状态同步）
-- [ ] **T8 Legacy Bootstrap（简化）** ← 下一步（首版冲刺）
+- [x] **T8 Legacy Bootstrap（简化）**（已完成：4阶段轻量扫描/Checkpoint持久化/bootstrap命令与工具）= **首版核心全线贯通**
+- [ ] **T9 记忆与概念提取** ← 下一步（development-plan §三）
 - [ ] T5 模型路由/成本 → T6 Review/Verification → T7 客户端 UI → T8 Legacy Bootstrap（简化）= **首版**
 - [ ] T9 记忆 → T10 学习 → T11 打包安装 →（后置：C# Roslyn 宿主、并行 Plan）
 
