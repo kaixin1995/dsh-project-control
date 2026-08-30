@@ -27,7 +27,7 @@ mkdirSync(outDir, { recursive: true })
 const zodNodePath = resolve(rootDir, '../node_modules/.pnpm/zod@4.4.3/node_modules')
 
 // 1. Build Host ESM bundle (lib/index.js)
-// Bundle zod and local modules; mark only dsh / schemastery as external
+// Inlines all dependencies (zod, schemastery, cosmokit) for 100% self-containment
 await esbuild.build({
   entryPoints: [resolve(rootDir, 'src/index.ts')],
   outfile: resolve(outDir, 'index.js'),
@@ -36,10 +36,11 @@ await esbuild.build({
   target: 'node20',
   platform: 'node',
   nodePaths: [zodNodePath],
+  alias: {
+    '@deepseek-ai/schemastery': resolve(rootDir, '../vendor/schemastery/src/index.ts'),
+    '@deepseek-ai/cosmokit': resolve(rootDir, '../vendor/cosmokit/src/index.ts'),
+  },
   external: [
-    '@deepseek-ai/cordis',
-    '@deepseek-ai/schemastery',
-    '@deepseek-ai/dsh-*',
     'react',
     'react-dom',
   ],

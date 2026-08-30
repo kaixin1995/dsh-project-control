@@ -5,7 +5,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { z as zod } from 'zod'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+
+export function defineTool<T>(options: T): T {
+  return options
+}
 import { GitAdapter } from '../git/adapter.ts'
 import { EvidenceManager } from '../analysis/evidence.ts'
 import { ChangeService } from '../domain/change.ts'
