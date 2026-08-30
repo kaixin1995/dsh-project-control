@@ -23,15 +23,15 @@ AI 项目变更认知与核查工具 —— [deepseek-harness](https://github.co
 ## 仓库状态
 
 - [x] 产品总纲（业主确认）：[docs/product-master-plan.md](docs/product-master-plan.md)（V0.4 全文收编）
-- [x] 工程实施案：[docs/design-scope.md](docs/design-scope.md)（五阶段映射，**待业主审查**，审查通过前不开发）
-- [x] 总纲逐节映射：[docs/v04-section-mapping.md](docs/v04-section-mapping.md)（101 节穷尽，含 3 处已论证的字面差异）
-- [ ] P1 "AI 到底改了什么"：项目识别 + 老项目轻量初始化 + Change + 分析管线 + 记忆库 + Web 首块 UI
-- [ ] P2 "过程怎么控制"：状态机 + 已确定/冲突检测 + 执行中心 + Plan 对接本体
-- [ ] P3 "真的做好了吗"：Reviewer/Verifier + Review Issue + 模型等级 + 成本统计
-- [ ] P4 "项目为什么变成今天这样"：完整 Git 历史重建 + 演化 + 时间线
-- [ ] P5 "开发者理解了吗"：学习模式全家桶
+- [x] 技术设计（工程权威）：[docs/AI 项目认知与开发控制插件.md](docs/AI%20项目认知与开发控制插件.md)（V1.0，161 节；三处仓外约束修正见开发计划 R1–R3）
+- [x] **开发任务清单：[docs/development-plan.md](docs/development-plan.md)**（T0–T11 全任务分解 + 测试清单；**当前执行依据**）
+- [x] 新会话入口：[docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)
+- [x] 历史参考：[docs/v04-section-mapping.md](docs/v04-section-mapping.md)、[docs/design-scope.md](docs/design-scope.md)（部分被 V1.0 取代）
+- [ ] **T0 前置验证与脚手架** ← 下一步（development-plan §三）
+- [ ] T1 领域模型与存储 → T2 Git 变更分析 → T3 影响分析 → T4 执行运行时 → T5 模型路由/成本 → T6 Review/Verification → T7 客户端 UI → T8 Legacy Bootstrap（简化）= **首版**
+- [ ] T9 记忆 → T10 学习 → T11 打包安装 →（后置：C# Roslyn 宿主、并行 Plan）
 
-阶段与范围细节见 [docs/design-scope.md](docs/design-scope.md)。
+任务、完成标准与测试细节见 [docs/development-plan.md](docs/development-plan.md)。
 
 ## 开发与安装（规划）
 

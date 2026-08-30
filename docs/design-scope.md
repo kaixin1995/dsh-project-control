@@ -1,5 +1,7 @@
 # dsh-project-insight 工程实施案（V1 · 基于产品总纲 V0.4）
 
+> ⚠️ **历史参考文档（2026-08-30 起部分取代）**：工程技术决策已被 [AI 项目认知与开发控制插件.md](AI%20项目认知与开发控制插件.md)（V1.0 技术设计）取代——存储改走 storage-domain 三域（废弃 `.insight/` 文件方案）、Plan 为插件自有持久对象（非对接 plan-mode）、UI 经加法插槽。当前执行依据 = [development-plan.md](development-plan.md)。本文件保留五阶段产品映射视角供参考。
+
 > 状态：**待业主审查**。审查通过前不进入开发。
 > 文档关系：[product-master-plan.md](product-master-plan.md) = 产品方向唯一权威（业主确认）；本文档 = 工程实施映射；[v04-section-mapping.md](v04-section-mapping.md) = 总纲全部 101 节的逐节穷尽映射。
 > 铁律：**零 dsh 本体改动**；全部通过本体文档化扩展点实现。

@@ -5,12 +5,21 @@
 ## 不可违背的约束
 
 1. **零本体改动**：绝不修改 `deepseek-harness/` 内任何被 git 跟踪的文件。本体对本目录的屏蔽靠其 `.git/info/exclude`（本地文件，非本体内容）。需要本体新能力时，先确认它是否已是文档化扩展点；不是则调整本插件设计，而不是改本体。
-2. **禁止新增会话事件类型**：仓外插件新增 `SessionEventMap` 事件可以在运行中追加，但**重启后持久化日志会被本体拒读**（`KNOWN_SESSION_EVENT_TYPES` 只扫描本体 `packages/*/*/src`，见本体 `packages/core/session/src/known-event-types.ts` 头注释）。本插件持久状态一律走仓库内 `.insight/` 文件，模型可见内容经工具结果 / `deferContext` / `agent.inject()` 进入。
+2. **禁止新增会话事件类型**：仓外插件新增 `SessionEventMap` 事件可以在运行中追加，但**重启后持久化日志会被本体拒读**（`KNOWN_SESSION_EVENT_TYPES` 只扫描本体 `packages/*/*/src`，见本体 `packages/core/session/src/known-event-types.ts` 头注释）。本插件持久状态走 storage-domain；模型可见内容经工具结果 / `deferContext` / `agent.inject()` 进入；**聊天卡片（Run/Review/Verification Card）一律骑核心事件类型**：插件工具的 `tool/call`+`tool/result`（meta 携带卡片数据）与命令的 `command/run`+`command/done`——ConversationNode 匹配这些即可回放（V1.0 §118–124 据此修正，见 development-plan R1）。
 3. **ESM**：`"type": "module"`，`.ts` 相对导入带 `.ts` 后缀。开发期经本体 tsx ESM 钩子加载。
 4. **bundle 依赖声明**：`cordis.patch.yml` 中每个裸名插件行必须是本包 `package.json` 的**生产依赖**，否则不会被链入 profile 的 `node_modules`（本体 `verify-cordis-config` 门禁与 `healProfileModuleFallback` 均按此规则工作）。
 5. **注册即效果**：所有注册走 `ctx.effect()` / `ctx.on()` / 注册方法返回的 disposer；瀑布监听（`tools/pre-execute`、`tools/execute`、`tools/post-execute`、`agent/pre-step`、`agent/request`、`llm/stream`、`system-prompt/assemble`）**必须调用 `next()`** 委托。
 6. **可配置不硬编码**：部署间可能不同的值必须是 schemastery `Config` 字段（cordis.yml 可改）；自包含约束写进 schema 让加载期失败。
 7. **UI 文案走词典**：客户端组件文案经 `ctx.locale.register(ns, { zh, en })`，不硬编码。
+8. **禁止向本体仓库写任何内容**——包括本体 `.agents/notes/proposed/`（V1.0 §154 Phase 0 据此取消）。设计记录只在本仓库 `docs/`。
+9. **执行归本体、插件做编排**：Run/Step 引用本体会话事实（每 Attempt 一个独立 Agent Session，经 `ctx.agents.create` + `setup()` 注册插件工具）；`ctx.jobs` 只是运行时载体（JobId≠RunId）；重试/退避/断点由插件 Retry 引擎与本体会话 resume 协作，不重建执行引擎。
+
+## 命名与存储决策（2026-08-30 定）
+
+- 命名按 V1.0 文档：服务键 `ctx.projectControl`、设置 namespace `project-control`、npm 包 `dsh-project-control`（客户端 `dsh-client-project-control`）；仓库名 `dsh-project-insight` 保留为历史目录名。
+- 存储走本体 storage-domain 三域：`project-control-core`（权威状态）/`project-control-analysis`（可再生）/`project-control-history`（历史重建），数据落 DSH_HOME（不进目标项目 git）；目标项目内长期文档经 Agent-Note 集成（T9.3）补回仓库。早期 `.insight/` 文件方案已废弃。
+- C# Roslyn 外部分析宿主后置（接口按 V1.0 §79 预留），首版用 generic analyzer。
+- worktree 一律建在目标项目根内（默认 `<root>/.worktrees/<runId>/`），否则被沙箱 workspace-write 拒绝。
 
 ## 允许使用的扩展点（白名单）
 
@@ -59,4 +68,4 @@
 - **本体**：`deepseek-harness/` 仓库（D:\Code\deepseek-harness）。
 - **插件 / 本仓库**：`dsh-project-insight/`，独立本地 git 仓库，暂不推送云端。
 - **业主**：本插件的产品决策人。
-- **文档层级**：`docs/product-master-plan.md` = 产品方向唯一权威（V0.4，业主确认）；`docs/design-scope.md` = 工程实施案（五阶段 P1–P5）；`docs/v04-section-mapping.md` = 总纲 101 节逐节映射。冲突时以总纲定方向、以工程案定做法。
+- **文档层级**：`docs/AI 项目认知与开发控制插件.md` = **V1.0 技术设计（工程权威，161 节；§118–124/§127/§154-Phase0 已被 development-plan R1–R3 修正）**；`docs/development-plan.md` = 开发任务清单（唯一执行依据，含修正决定 R1–R7）；`docs/SESSION-HANDOFF.md` = 新会话入口；`docs/product-master-plan.md` = 产品总纲（V0.4，业主确认）；`docs/v04-section-mapping.md`、`docs/design-scope.md` = 历史参考（design-scope 的存储/UI/Plan 决策已被 V1.0 取代）。冲突时：产品以总纲定方向，工程以 V1.0+development-plan 定做法。
