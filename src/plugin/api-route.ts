@@ -16,6 +16,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { BootstrapPipeline } from '../bootstrap/pipeline.ts'
 import { GenericLanguageAnalyzer } from '../analysis/language.ts'
+import { collectSymbolReferences } from '../analysis/lsp-evidence.ts'
 import { ProjectService } from '../domain/project.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
@@ -116,7 +117,16 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   })
 }
 
-/** 截断证据摘要用于列表展示。 */
+/** 采纳当前项目：内存未恢复时回落最后一个已持久化项目（重启后首次 API 调用场景）。 */
+  function adoptProject(service: ProjectControlService): { id: string } | undefined {
+    if (service.currentProject !== undefined) return service.currentProject
+    const last = service.store?.projects.list().at(-1)
+    if (last === undefined) return undefined
+    service.currentProject = last
+    return last
+  }
+
+  /** 截断证据摘要用于列表展示。 */
 function trimSnippet(text: string, max = 160): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`
 }
@@ -240,7 +250,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(body)
           } catch (error) {
-            ctx.logger?.warn?.()
+            ctx.logger?.warn?.(`project-control: state build failed: ${String(error)}`)
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
           }
@@ -318,6 +328,330 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               symbolsCount: checkpoint.topLevelSymbols.length,
               importedChanges: importedCount,
             }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // ── 工作台按钮化操作端点（全部走部署路由，不依赖聊天会话）──────────
+
+        // 分析当前改动（数字证据 + LLM 语义摘要；changeId 可选挂靠）。
+        if (req.method === 'POST' && routePath === '/analyze') {
+          try {
+            const body = await readJsonBody(req)
+            const project = adoptProject(service)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized; click Initialize first' }))
+              return
+            }
+            const route = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
+            const diff = await service.git.getDiff(cwd)
+            const evidence = service.evidenceManager.createEvidence({
+              projectId: service.currentProject?.id ?? 'prj_ad_hoc',
+              source: 'git_diff',
+              truthLevel: 'fact',
+              locator: 'git:diff:HEAD..worktree',
+              content: diff.patch,
+            })
+            let semantic = ''
+            if (diff.filesChanged > 0) {
+              try {
+                const analysis = await runLlmAnalysis(ctx, {
+                  prompt: [
+                    'Summarize what this code change does in 3-6 bullet points, for a developer who has not seen the diff.',
+                    'Cover: purpose, behavior added/removed, modules affected, and any public-contract (API/DB/message/config) change.',
+                    'Be concrete; no speculation. Answer in the same language as the diff context.',
+                    '',
+                    `Files: ${diff.filesChanged} (+${diff.insertions}/-${diff.deletions})`,
+                    '',
+                    'Diff:',
+                    diff.patch,
+                  ].join('\n'),
+                  provider: route.provider,
+                  model: route.model,
+                  maxTokens: service.liveConfig.analysisMaxTokens,
+                  timeoutMs: service.liveConfig.analysisTimeoutMs,
+                  purpose: 'project-control-analysis',
+                })
+                semantic = analysis.text
+              } catch (error: unknown) {
+                semantic = `(semantic summary unavailable: ${error instanceof Error ? error.message : String(error)})`
+              }
+            }
+            const summary = [
+              semantic === '' ? '工作区当前无未提交改动。' : semantic,
+              `(numeric: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions}; evidence ${evidence.id})`,
+            ].join('\n')
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              summary,
+              filesChanged: diff.filesChanged,
+              insertions: diff.insertions,
+              deletions: diff.deletions,
+              diffHash: diff.diffHash,
+              evidenceId: evidence.id,
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 新建变更。
+        if (req.method === 'POST' && routePath === '/changes') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const title = typeof body['title'] === 'string' ? body['title'] : ''
+            const description = typeof body['description'] === 'string' ? body['description'] : ''
+            if (title === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'title is required' }))
+              return
+            }
+            const project = adoptProject(service)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized; run bootstrap first' }))
+              return
+            }
+            const changeService = new ChangeService(service.store.changes, service.git, service.evidenceManager)
+            const change = await changeService.createChange(project.id as never, title, description, cwd)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, changeId: change.id, status: change.status }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 独立评审当前改动（Reasoning 级；changeId 提供时落 Issue，否则只返回文本）。
+        if (req.method === 'POST' && routePath === '/review') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = adoptProject(service)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const diff = await service.git.getDiff(cwd)
+            if (diff.filesChanged === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ issuesFound: 0, issues: '工作区无改动，无可评审内容。' }))
+              return
+            }
+            const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+            const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : undefined
+            const analysis = await runLlmAnalysis(ctx, {
+              prompt: [
+                'You are an independent code reviewer. Review the diff below for correctness, error handling, concurrency, resource leaks, security, and over-reach.',
+                'Answer with one issue per line in the exact format: SEVERITY | category | title | evidence location | suggested fix',
+                'SEVERITY is one of critical/high/medium/low/info. If the diff is clean, answer exactly: CLEAN',
+                '',
+                'Diff:',
+                diff.patch,
+              ].join('\n'),
+              provider: route.provider,
+              model: route.model,
+              maxTokens: service.liveConfig.analysisMaxTokens,
+              timeoutMs: service.liveConfig.analysisTimeoutMs,
+              purpose: 'project-control-review',
+            })
+            const lines = analysis.text.split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
+            if (changeId !== undefined && changeId !== '') {
+              const change = service.store.changes.get(changeId as never)
+              if (change !== undefined) {
+                const issuesManager = new ReviewIssueManager(service.store.issues)
+                for (const line of lines) {
+                  const parts = line.split('|').map((part) => part.trim())
+                  if (parts.length < 4) continue
+                  const severity = parts[0]!.toLowerCase()
+                  await issuesManager.createIssue({
+                    projectId: change.projectId,
+                    changeId: change.id,
+                    severity: (['critical', 'high', 'medium', 'low', 'info'].includes(severity) ? severity : 'medium') as never,
+                    category: parts[1]!,
+                    title: parts[2]!,
+                    description: `Evidence: ${parts[3]}. Suggested fix: ${parts[4] ?? 'none'}`,
+                  })
+                }
+              }
+            }
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ issuesFound: lines.length, issues: analysis.text }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 验收当前改动（确定性命令按配置；changeId 提供时落验收记录）。
+        if (req.method === 'POST' && routePath === '/verify') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = adoptProject(service)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const cfg = service.liveConfig
+            const diff = await service.git.getDiff(cwd)
+            const changeId = typeof body['changeId'] === 'string' && body['changeId'] !== ''
+              ? body['changeId'] : undefined
+            const change = changeId === undefined ? undefined : service.store.changes.get(changeId as never)
+            const { execFile } = await import('node:child_process')
+            const { promisify } = await import('node:util')
+            const runCommand = promisify(execFile)
+            const verifiers = [
+              ...(cfg.buildCommand
+                ? [new DeterministicBuildVerifier(async (dir) => {
+                    const parts = cfg.buildCommand!.split(' ')
+                    try {
+                      await runCommand(parts[0]!, parts.slice(1), { cwd: dir, timeout: 300_000 })
+                      return { success: true, output: 'build ok' }
+                    } catch (error) {
+                      return { success: false, output: String(error) }
+                    }
+                  })]
+                : []),
+              ...(cfg.testCommand
+                ? [new UnitTestVerifier(async (dir) => {
+                    const parts = cfg.testCommand!.split(' ')
+                    try {
+                      await runCommand(parts[0]!, parts.slice(1), { cwd: dir, timeout: 600_000 })
+                      return { passed: true, details: 'tests ok' }
+                    } catch (error) {
+                      return { passed: false, details: String(error) }
+                    }
+                  })]
+                : []),
+              new EvidenceDiffVerifier(),
+              new LlmReviewVerifier(async (patch) => {
+                const route = resolveDeploymentRoute(ctx, 'verifier', service.liveConfig)
+                const analysis = await runLlmAnalysis(ctx, {
+                  prompt: `Does this diff look complete and correct? Answer PASS or FAIL on the first line, then a one-paragraph critique.\n\nDiff:\n${patch}`,
+                  provider: route.provider,
+                  model: route.model,
+                  maxTokens: service.liveConfig.analysisMaxTokens,
+                  timeoutMs: service.liveConfig.analysisTimeoutMs,
+                  purpose: 'project-control-verification',
+                })
+                return { passed: analysis.text.toUpperCase().startsWith('PASS'), critique: analysis.text }
+              }),
+            ]
+            const runner = new VerificationRunner(service.store.verifications, verifiers)
+            const pipeline = await runner.runPipeline({
+              projectId: (service.currentProject?.id ?? 'prj_ad_hoc') as never,
+              changeId: (change?.id ?? 'adhoc') as never,
+              cwd,
+              changedFiles: [],
+              diffPatch: diff.patch,
+              evidenceIds: [],
+            })
+            const summary = pipeline.records.map((record) => `${record.name}: ${record.status}`).join('; ')
+            const result = pipeline.allPassed ? 'passed' : (pipeline.hasDeterministicFailure ? 'failed' : 'partial')
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ result, details: summary }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 符号影响查询（LSP 优先，降级 rg；证据来源标注）。
+        if (req.method === 'POST' && routePath === '/impact') {
+          try {
+            const body = await readJsonBody(req)
+            const symbolName = typeof body['symbolName'] === 'string' ? body['symbolName'] : ''
+            const filePath = typeof body['filePath'] === 'string' ? body['filePath'] : ''
+            const project = adoptProject(service)
+            const cwd = project?.identity?.rootPath
+            if (symbolName === '' || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'symbolName and an initialized project are required' }))
+              return
+            }
+            const evidence = await collectSymbolReferences(
+              ctx,
+              new GenericLanguageAnalyzer(),
+              symbolName,
+              cwd,
+              filePath,
+              {
+                line: typeof body['line'] === 'number' ? body['line'] : 0,
+                character: typeof body['character'] === 'number' ? body['character'] : 0,
+              },
+            )
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              evidenceSource: evidence.source,
+              lspFailed: evidence.lspFailed,
+              referenceCount: evidence.references.length,
+              references: evidence.references.slice(0, 40).map((reference) => ({
+                filePath: reference.filePath,
+                line: reference.line,
+              })),
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 记录项目记忆（analysis 级；确认走 /memory/confirm）。
+        if (req.method === 'POST' && routePath === '/memory') {
+          if (service.memoryService === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'memory service unavailable' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const title = typeof body['title'] === 'string' ? body['title'] : ''
+            const content = typeof body['content'] === 'string' ? body['content'] : ''
+            if (title === '' || content === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'title and content are required' }))
+              return
+            }
+            const memory = await service.memoryService.recordMemory({
+              projectId: service.currentProject?.id ?? 'prj_ad_hoc',
+              type: (typeof body['memoryType'] === 'string' ? body['memoryType'] : 'project_log') as never,
+              truthLevel: 'analysis',
+              title,
+              content,
+              relatedFiles: Array.isArray(body['relatedFiles']) ? body['relatedFiles'] as string[] : undefined,
+            })
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, memoryId: memory.id, truthLevel: memory.truthLevel }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))

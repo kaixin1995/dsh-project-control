@@ -8,7 +8,8 @@
  * 无会话落地页（data-details-collapsed，details 轨道为 0）恢复原生列序，
  * 英雄页照常显示；工作台此时自然隐藏（0px 轨道）。
  *
- * 数据来自宿主 /project-control/api/state（同源 fetch + 4s 轮询），
+ * 数据来自宿主 /project-control/api/state（同源 fetch + 4s 轮询）；
+ * 操作按钮（分析/评审/验收/建变更/记忆/影响/历史扫描）POST 宿主 API；
  * 全部文案经 locale 词典（zh/en）。
  *
  * @module dsh-client-project-control/components/WorkspaceFrame
@@ -27,10 +28,10 @@ export interface WorkspaceState {
   memories?: Array<{ id: string; type: string; truthLevel: string; title: string; isHumanConfirmed: boolean; gitBranch: string | null; createdAt: number }>
   evidenceCount?: number
   recentEvidence?: Array<{ id: string; source: string; truthLevel: string; locator: string; snippet: string; createdAt: number }>
-  bootstrap?: { id: string; summary: string; techStack: string[]; manifestFiles: string[]; symbolsCount: number; createdAt: number } | null
   importedChanges?: Array<{ id: string; title: string; commitCount: number; firstCommitAt: number; lastCommitAt: number; confidence: number; status: string }>
   issues?: Array<{ id: string; changeId: string; severity: string; category: string; title: string; status: string }>
   verifications?: Array<{ id: string; changeId: string; name: string; type: string; status: string; createdAt: number }>
+  bootstrap?: { id: string; summary: string; techStack: string[]; manifestFiles: string[]; symbolsCount: number; createdAt: number } | null
 }
 
 /**
@@ -60,16 +61,30 @@ export const WORKSPACE_DICT = {
     'tab.changes': '变更工作台',
     'tab.execution': '执行中心',
     'tab.memory': '记忆与学习',
+    'tab.history': '历史',
     'state.project': '当前项目',
     'state.noProject': '尚未初始化项目',
     'state.noProjectHint': '点击「初始化项目」扫描仓库结构、技术栈与符号索引。',
     'action.bootstrap': '初始化项目',
     'action.bootstrapping': '正在初始化…',
+    'action.rescan': '重新初始化 / 扫描',
+    'action.analyze': '分析当前改动',
+    'action.review': '评审当前改动',
+    'action.verify': '验收当前改动',
+    'action.createChange': '新建变更',
+    'action.recordMemory': '记录记忆',
+    'action.scanHistory': '扫描历史（含 LLM 轻析）',
+    'action.running': '执行中…',
+    'form.changeTitle': '变更标题',
+    'form.changeDesc': '需求与背景（选填）',
+    'form.memoryTitle': '记忆标题',
+    'form.memoryContent': '记忆内容（什么与为什么）',
+    'result.panel': '操作结果',
     'state.techStack': '技术栈',
     'state.symbols': '已索引符号',
     'state.manifests': '清单文件',
     'state.evidence': '证据条目',
-    'state.noChanges': '暂无变更任务。在聊天中让 AI 创建 Change 后，这里会实时展示。',
+    'state.noChanges': '暂无变更任务。在聊天中让 AI 创建 Change，或用上方「新建变更」。',
     'state.noRuns': '暂无执行记录。',
     'state.noMemories': '暂无项目记忆。',
     'state.noEvidence': '暂无证据记录。',
@@ -81,27 +96,24 @@ export const WORKSPACE_DICT = {
     'memory.col.type': '类型',
     'memory.col.truth': '真值',
     'memory.col.branch': '分支',
+    'memory.confirm': '确认',
     'exec.col.status': '状态',
     'exec.col.change': '变更',
     'exec.col.started': '开始',
     'exec.attempts': '尝试次数',
-    'evidence.recent': '最近证据',
-    'tab.history': '历史',
+    'exec.hint': '执行（start_run）请在右侧聊天中发起：创建计划后对 AI 说「开始执行该 change」。本页查看进度与结果。',
     'history.imported': 'Imported Change（Git 历史重建）',
     'history.col.title': '标题',
     'history.col.commits': '提交数',
     'history.col.period': '时间',
     'history.col.confidence': '置信度',
     'history.col.status': '状态',
-    'history.noImported': '暂无历史重建记录。点击「初始化项目」并勾选历史扫描，或使用 bootstrap_project 工具。',
+    'history.noImported': '暂无历史重建记录。点击「扫描历史」从 git 历史聚类生成。',
     'review.issues': 'Review 问题',
     'review.noIssues': '暂无 Review 问题。',
-    'review.col.severity': '级别',
-    'review.col.title': '标题',
-    'review.col.status': '状态',
     'verify.records': '验收记录',
     'verify.noRecords': '暂无验收记录。',
-    'memory.confirm': '确认',
+    'evidence.recent': '最近证据',
     'error.load': '加载失败',
   },
   en: {
@@ -110,16 +122,30 @@ export const WORKSPACE_DICT = {
     'tab.changes': 'Changes',
     'tab.execution': 'Execution',
     'tab.memory': 'Memory & Learning',
+    'tab.history': 'History',
     'state.project': 'Current project',
     'state.noProject': 'No project initialized',
     'state.noProjectHint': 'Run "Initialize project" to scan the repository structure, tech stack, and symbol index.',
     'action.bootstrap': 'Initialize project',
     'action.bootstrapping': 'Initializing…',
+    'action.rescan': 'Re-initialize / scan',
+    'action.analyze': 'Analyze working diff',
+    'action.review': 'Review working diff',
+    'action.verify': 'Verify working diff',
+    'action.createChange': 'Create change',
+    'action.recordMemory': 'Record memory',
+    'action.scanHistory': 'Scan history (with LLM notes)',
+    'action.running': 'Running…',
+    'form.changeTitle': 'Change title',
+    'form.changeDesc': 'Requirement and background (optional)',
+    'form.memoryTitle': 'Memory title',
+    'form.memoryContent': 'Memory content (what and why)',
+    'result.panel': 'Action result',
     'state.techStack': 'Tech stack',
     'state.symbols': 'Indexed symbols',
     'state.manifests': 'Manifests',
     'state.evidence': 'Evidence entries',
-    'state.noChanges': 'No change tasks yet. Ask the AI in chat to create a Change and it will appear here.',
+    'state.noChanges': 'No change tasks yet. Ask the AI in chat to create a Change, or use "Create change" above.',
     'state.noRuns': 'No runs yet.',
     'state.noMemories': 'No project memories yet.',
     'state.noEvidence': 'No evidence recorded yet.',
@@ -131,27 +157,24 @@ export const WORKSPACE_DICT = {
     'memory.col.type': 'Type',
     'memory.col.truth': 'Truth',
     'memory.col.branch': 'Branch',
+    'memory.confirm': 'Confirm',
     'exec.col.status': 'Status',
     'exec.col.change': 'Change',
     'exec.col.started': 'Started',
     'exec.attempts': 'Attempts',
-    'evidence.recent': 'Recent evidence',
-    'tab.history': 'History',
+    'exec.hint': 'Runs (start_run) are started from chat: after a plan exists, tell the AI to "start run for the change". This tab shows progress and results.',
     'history.imported': 'Imported Change (rebuilt from git history)',
     'history.col.title': 'Title',
     'history.col.commits': 'Commits',
     'history.col.period': 'Period',
     'history.col.confidence': 'Confidence',
     'history.col.status': 'Status',
-    'history.noImported': 'No imported changes yet. Run Initialize project with history scan, or the bootstrap_project tool.',
+    'history.noImported': 'No imported changes yet. Click "Scan history" to cluster them from git history.',
     'review.issues': 'Review issues',
     'review.noIssues': 'No review issues.',
-    'review.col.severity': 'Severity',
-    'review.col.title': 'Title',
-    'review.col.status': 'Status',
     'verify.records': 'Verification records',
     'verify.noRecords': 'No verification records yet.',
-    'memory.confirm': 'Confirm',
+    'evidence.recent': 'Recent evidence',
     'error.load': 'Failed to load',
   },
 } as const
@@ -208,6 +231,23 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '5px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer',
     fontSize: '12px', background: 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
   },
+  secondary: {
+    padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px',
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
+    background: 'var(--dsw-alias-bg-layer-1, #fafafa)', color: 'var(--dsw-alias-label-primary, #1f2328)',
+  },
+  input: {
+    width: '100%', padding: '6px 10px', borderRadius: '6px', fontSize: '12px',
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
+    background: 'var(--dsw-alias-bg-base, #fff)', color: 'var(--dsw-alias-label-primary, #1f2328)',
+    boxSizing: 'border-box',
+  },
+  formRow: { display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '8px' },
+  result: {
+    whiteSpace: 'pre-wrap', fontSize: '12px', lineHeight: 1.6,
+    background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
+    borderRadius: '6px', padding: '10px 12px', maxHeight: '320px', overflowY: 'auto',
+  },
   badge: (color: string): React.CSSProperties => ({
     display: 'inline-block', padding: '1px 8px', borderRadius: '4px', fontSize: '11px',
     background: `${color}22`, color,
@@ -227,7 +267,7 @@ function Card(props: { title?: string; children?: React.ReactNode }) {
 }
 
 /**
- * 工作台主组件：tab 导航 + 数据面板（轮询宿主 API）。
+ * 工作台主组件：tab 导航 + 数据面板（轮询宿主 API）+ 按钮化操作。
  */
 export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const t = props.t ?? fallbackT
@@ -235,6 +275,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [state, setState] = useState<WorkspaceState | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [bootstrapping, setBootstrapping] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [actionResult, setActionResult] = useState<string | null>(null)
+  const [changeTitle, setChangeTitle] = useState('')
+  const [changeDesc, setChangeDesc] = useState('')
+  const [memoryTitle, setMemoryTitle] = useState('')
+  const [memoryContent, setMemoryContent] = useState('')
 
   useEffect(() => {
     let disposed = false
@@ -259,6 +305,57 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }, [])
 
+  const refreshState = async (): Promise<void> => {
+    const refreshed = await fetch('/project-control/api/state', { headers: { accept: 'application/json' } })
+    if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
+  }
+
+  /** 统一动作执行器：POST 宿主 API，输出进结果面板，完成后刷新状态。 */
+  const runAction = async (name: string, path: string, body: Record<string, unknown>): Promise<void> => {
+    setBusy(name)
+    setActionResult(null)
+    try {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data: unknown = await response.json()
+      if (!response.ok) {
+        const message = (data as { error?: string }).error ?? `HTTP ${response.status}`
+        setActionResult(`✗ ${message}`)
+        return
+      }
+      setActionResult(JSON.stringify(data, null, 2))
+      await refreshState()
+    } catch (error: unknown) {
+      setActionResult(`✗ ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const runBootstrap = async (): Promise<void> => {
+    setBootstrapping(true)
+    try {
+      const response = await fetch('/project-control/api/bootstrap', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data: unknown = await response.json()
+      if (!response.ok) {
+        setLoadError((data as { error?: string }).error ?? `HTTP ${response.status}`)
+        return
+      }
+      await refreshState()
+    } catch (error: unknown) {
+      setLoadError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBootstrapping(false)
+    }
+  }
+
   const confirmMemory = async (memoryId: string): Promise<void> => {
     try {
       const response = await fetch('/project-control/api/memory/confirm', {
@@ -280,38 +377,15 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
-  const runBootstrap = async (): Promise<void> => {
-    setBootstrapping(true)
-    try {
-      const response = await fetch('/project-control/api/bootstrap', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({}),
-      })
-      const data: unknown = await response.json()
-      if (!response.ok) {
-        const message = (data as { error?: string }).error ?? `HTTP ${response.status}`
-        setLoadError(message)
-        return
-      }
-      const refreshed = await fetch('/project-control/api/state', { headers: { accept: 'application/json' } })
-      if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setBootstrapping(false)
-    }
-  }
-
   const project = state?.project ?? null
   const bootstrap = state?.bootstrap ?? null
   const changes = state?.changes ?? []
   const runs = state?.runs ?? []
   const memories = state?.memories ?? []
-  const recentEvidence = state?.recentEvidence ?? []
   const importedChanges = state?.importedChanges ?? []
   const issues = state?.issues ?? []
   const verifications = state?.verifications ?? []
+  const recentEvidence = state?.recentEvidence ?? []
 
   const tabs: Array<{ key: TabKey; label: string }> = [
     { key: 'overview', label: t('tab.overview') },
@@ -320,6 +394,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     { key: 'memory', label: t('tab.memory') },
     { key: 'history', label: t('tab.history') },
   ]
+
+  /** 操作结果面板（所有页签共用）。 */
+  const resultPanel = actionResult !== null
+    ? React.createElement(Card, { title: t('result.panel') },
+        React.createElement('div', { style: styles.result }, actionResult))
+    : null
 
   return React.createElement('div', { style: styles.root, 'data-testid': 'project-control-workspace' },
     React.createElement('style', null, LAYOUT_STYLE),
@@ -335,13 +415,33 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       loadError !== null && React.createElement('div', { style: styles.empty }, `${t('error.load')}: ${loadError}`),
       state?.ready === false && React.createElement('div', { style: styles.empty }, state.reason ?? ''),
 
+      // ── 项目总览：操作栏 + 项目卡 ──
       tab === 'overview' && React.createElement(React.Fragment, null,
+        React.createElement(Card, null,
+          React.createElement('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+            React.createElement('button', {
+              style: styles.button, disabled: bootstrapping,
+              onClick: () => { void runBootstrap() },
+            }, bootstrapping ? t('action.running') : t('action.rescan')),
+            React.createElement('button', {
+              style: styles.secondary, disabled: busy !== null,
+              onClick: () => { void runAction('analyze', '/project-control/api/analyze', {}) },
+            }, busy === 'analyze' ? t('action.running') : t('action.analyze')),
+            React.createElement('button', {
+              style: styles.secondary, disabled: busy !== null,
+              onClick: () => { void runAction('review', '/project-control/api/review', {}) },
+            }, busy === 'review' ? t('action.running') : t('action.review')),
+            React.createElement('button', {
+              style: styles.secondary, disabled: busy !== null,
+              onClick: () => { void runAction('verify', '/project-control/api/verify', {}) },
+            }, busy === 'verify' ? t('action.running') : t('action.verify')),
+          ),
+        ),
+        resultPanel,
         project === null
           ? React.createElement(Card, null,
               React.createElement('div', { style: { fontWeight: 600, fontSize: '13px', marginBottom: '6px' } }, t('state.noProject')),
               React.createElement('div', { style: styles.empty }, t('state.noProjectHint')),
-              React.createElement('button', { style: styles.button, disabled: bootstrapping, onClick: () => { void runBootstrap() } },
-                bootstrapping ? t('action.bootstrapping') : t('action.bootstrap')),
             )
           : React.createElement(Card, { title: `${t('state.project')}：${project.name}` },
               React.createElement('div', { style: styles.row },
@@ -361,57 +461,71 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               ),
             )),
 
-      tab === 'changes' && React.createElement(Card, null,
-        changes.length === 0
-          ? React.createElement('div', { style: styles.empty }, t('state.noChanges'))
-          : React.createElement('table', { style: styles.table },
-              React.createElement('thead', null, React.createElement('tr', null,
-                ['changes.col.title', 'changes.col.type', 'changes.col.status', 'changes.col.updated'].map((key) =>
-                  React.createElement('th', { key, style: styles.th }, t(key)))),
-              ),
-              React.createElement('tbody', null, changes.map((change) => React.createElement('tr', { key: change.id },
-                React.createElement('td', { style: styles.td }, change.title),
-                React.createElement('td', { style: styles.td }, change.type),
-                React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(change.status === 'completed' ? '#4ec9b0' : '#569cd6') }, change.status)),
-                React.createElement('td', { style: styles.td }, formatTime(change.updatedAt)),
-              ))),
-            )),
+      // ── 变更工作台：新建表单 + 列表 ──
+      tab === 'changes' && React.createElement(React.Fragment, null,
+        React.createElement(Card, { title: t('action.createChange') },
+          React.createElement('div', { style: styles.formRow },
+            React.createElement('input', { style: styles.input, placeholder: t('form.changeTitle'), value: changeTitle, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setChangeTitle(e.target.value) } }),
+            React.createElement('input', { style: styles.input, placeholder: t('form.changeDesc'), value: changeDesc, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setChangeDesc(e.target.value) } }),
+            React.createElement('button', {
+              style: styles.button, disabled: busy !== null || changeTitle === '',
+              onClick: () => { void runAction('createChange', '/project-control/api/changes', { title: changeTitle, description: changeDesc }).then(() => { setChangeTitle(''); setChangeDesc('') }) },
+            }, busy === 'createChange' ? t('action.running') : t('action.createChange')),
+          ),
+        ),
+        resultPanel,
+        React.createElement(Card, null,
+          changes.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('state.noChanges'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('thead', null, React.createElement('tr', null,
+                  ['changes.col.title', 'changes.col.type', 'changes.col.status', 'changes.col.updated'].map((key) =>
+                    React.createElement('th', { key, style: styles.th }, t(key)))),
+                ),
+                React.createElement('tbody', null, changes.map((change) => React.createElement('tr', { key: change.id },
+                  React.createElement('td', { style: styles.td }, change.title),
+                  React.createElement('td', { style: styles.td }, change.type),
+                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(change.status === 'completed' ? '#4ec9b0' : '#569cd6') }, change.status)),
+                  React.createElement('td', { style: styles.td }, formatTime(change.updatedAt)),
+                ))),
+              )),
+      ),
 
-      tab === 'execution' && React.createElement(Card, null,
-        React.createElement('div', { style: styles.row },
-          React.createElement('span', null, React.createElement('span', { style: styles.label }, t('exec.attempts')), String(state?.attemptsCount ?? 0))),
-        runs.length === 0
-          ? React.createElement('div', { style: styles.empty }, t('state.noRuns'))
-          : React.createElement('table', { style: styles.table },
-              React.createElement('thead', null, React.createElement('tr', null,
-                ['exec.col.change', 'exec.col.status', 'exec.col.started'].map((key) =>
-                  React.createElement('th', { key, style: styles.th }, t(key)))),
-              ),
-              React.createElement('tbody', null, runs.map((run) => React.createElement('tr', { key: run.id },
-                React.createElement('td', { style: styles.td }, run.changeId),
-                React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(run.status === 'completed' ? '#4ec9b0' : '#dcdcaa') }, run.status)),
-                React.createElement('td', { style: styles.td }, formatTime(run.startedAt)),
-              ))),
-            )),
+      // ── 执行中心：提示 + 汇总 ──
+      tab === 'execution' && React.createElement(React.Fragment, null,
+        React.createElement(Card, null,
+          React.createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, t('exec.hint'))),
+        React.createElement(Card, null,
+          React.createElement('div', { style: styles.row },
+            React.createElement('span', null, React.createElement('span', { style: styles.label }, t('exec.attempts')), String(state?.attemptsCount ?? 0))),
+          runs.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('state.noRuns'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('thead', null, React.createElement('tr', null,
+                  ['exec.col.change', 'exec.col.status', 'exec.col.started'].map((key) =>
+                    React.createElement('th', { key, style: styles.th }, t(key)))),
+                ),
+                React.createElement('tbody', null, runs.map((run) => React.createElement('tr', { key: run.id },
+                  React.createElement('td', { style: styles.td }, run.changeId),
+                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(run.status === 'completed' ? '#4ec9b0' : '#dcdcaa') }, run.status)),
+                  React.createElement('td', { style: styles.td }, formatTime(run.startedAt)),
+                ))),
+              )),
+      ),
 
-      tab === 'history' && React.createElement(Card, { title: t('history.imported') },
-        importedChanges.length === 0
-          ? React.createElement('div', { style: styles.empty }, t('history.noImported'))
-          : React.createElement('table', { style: styles.table },
-              React.createElement('thead', null, React.createElement('tr', null,
-                ['history.col.title', 'history.col.commits', 'history.col.period', 'history.col.confidence', 'history.col.status'].map((key) =>
-                  React.createElement('th', { key, style: styles.th }, t(key)))),
-              ),
-              React.createElement('tbody', null, importedChanges.map((item) => React.createElement('tr', { key: item.id },
-                React.createElement('td', { style: styles.td }, item.title),
-                React.createElement('td', { style: styles.td }, String(item.commitCount)),
-                React.createElement('td', { style: styles.td }, formatTime(item.firstCommitAt)),
-                React.createElement('td', { style: styles.td }, String(item.confidence)),
-                React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(item.status === 'confirmed' ? '#4ec9b0' : '#dcdcaa') }, item.status)),
-              ))),
-            )),
-
+      // ── 记忆与学习：记录表单 + 列表（含确认） + Review/验收/证据 ──
       tab === 'memory' && React.createElement(React.Fragment, null,
+        React.createElement(Card, { title: t('action.recordMemory') },
+          React.createElement('div', { style: styles.formRow },
+            React.createElement('input', { style: styles.input, placeholder: t('form.memoryTitle'), value: memoryTitle, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setMemoryTitle(e.target.value) } }),
+            React.createElement('input', { style: styles.input, placeholder: t('form.memoryContent'), value: memoryContent, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setMemoryContent(e.target.value) } }),
+            React.createElement('button', {
+              style: styles.button, disabled: busy !== null || memoryTitle === '' || memoryContent === '',
+              onClick: () => { void runAction('recordMemory', '/project-control/api/memory', { memoryType: 'project_log', title: memoryTitle, content: memoryContent }).then(() => { setMemoryTitle(''); setMemoryContent('') }) },
+            }, busy === 'recordMemory' ? t('action.running') : t('action.recordMemory')),
+          ),
+        ),
+        resultPanel,
         React.createElement(Card, null,
           memories.length === 0
             ? React.createElement('div', { style: styles.empty }, t('state.noMemories'))
@@ -426,7 +540,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(memory.isHumanConfirmed ? '#4ec9b0' : '#dcdcaa') }, memory.isHumanConfirmed ? 'confirmed' : memory.truthLevel)),
                   React.createElement('td', { style: styles.td }, memory.gitBranch ?? '—'),
                   React.createElement('td', { style: styles.td }, memory.isHumanConfirmed
-                    ? React.createElement('span', { style: styles.badge('#4ec9b0') }, 'confirmed')
+                    ? React.createElement('span', { style: styles.badge('#4ec9b0') }, '✓')
                     : React.createElement('button', {
                         style: { ...styles.button, padding: '2px 8px', fontSize: '11px' },
                         onClick: () => { void confirmMemory(memory.id) },
@@ -465,6 +579,33 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge('#569cd6') }, item.source)),
                   React.createElement('td', { style: styles.td }, item.locator),
                   React.createElement('td', { style: styles.td }, formatTime(item.createdAt)),
+                ))),
+              )),
+      ),
+
+      // ── 历史：扫描按钮 + Imported Change 列表 ──
+      tab === 'history' && React.createElement(React.Fragment, null,
+        React.createElement(Card, null,
+          React.createElement('button', {
+            style: styles.button, disabled: busy !== null,
+            onClick: () => { void runAction('scanHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30 }) },
+          }, busy === 'scanHistory' ? t('action.running') : t('action.scanHistory')),
+        ),
+        resultPanel,
+        React.createElement(Card, { title: t('history.imported') },
+          importedChanges.length === 0
+            ? React.createElement('div', { style: styles.empty }, t('history.noImported'))
+            : React.createElement('table', { style: styles.table },
+                React.createElement('thead', null, React.createElement('tr', null,
+                  ['history.col.title', 'history.col.commits', 'history.col.period', 'history.col.confidence', 'history.col.status'].map((key) =>
+                    React.createElement('th', { key, style: styles.th }, t(key)))),
+                ),
+                React.createElement('tbody', null, importedChanges.map((item) => React.createElement('tr', { key: item.id },
+                  React.createElement('td', { style: styles.td }, item.title),
+                  React.createElement('td', { style: styles.td }, String(item.commitCount)),
+                  React.createElement('td', { style: styles.td }, formatTime(item.firstCommitAt)),
+                  React.createElement('td', { style: styles.td }, String(item.confidence)),
+                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(item.status === 'confirmed' ? '#4ec9b0' : '#dcdcaa') }, item.status)),
                 ))),
               )),
       ),
