@@ -27,8 +27,9 @@ AI 项目变更认知与核查工具 —— [deepseek-harness](https://github.co
 - [x] **开发任务清单：[docs/development-plan.md](docs/development-plan.md)**（T0–T11 全任务分解 + 测试清单；**当前执行依据**）
 - [x] 新会话入口：[docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)
 - [x] 历史参考：[docs/v04-section-mapping.md](docs/v04-section-mapping.md)、[docs/design-scope.md](docs/design-scope.md)（部分被 V1.0 取代）
-- [ ] **T0 前置验证与脚手架** ← 下一步（development-plan §三）
-- [ ] T1 领域模型与存储 → T2 Git 变更分析 → T3 影响分析 → T4 执行运行时 → T5 模型路由/成本 → T6 Review/Verification → T7 客户端 UI → T8 Legacy Bootstrap（简化）= **首版**
+- [x] **T0 前置验证与脚手架**（已完成：脚手架/服务冒烟/客户端bundle/storage-domain/worktree验证）
+- [ ] **T1 领域模型与存储** ← 下一步（development-plan §三）
+- [ ] T2 Git 变更分析 → T3 影响分析 → T4 执行运行时 → T5 模型路由/成本 → T6 Review/Verification → T7 客户端 UI → T8 Legacy Bootstrap（简化）= **首版**
 - [ ] T9 记忆 → T10 学习 → T11 打包安装 →（后置：C# Roslyn 宿主、并行 Plan）
 
 任务、完成标准与测试细节见 [docs/development-plan.md](docs/development-plan.md)。

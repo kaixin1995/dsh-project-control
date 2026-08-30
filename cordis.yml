@@ -1,0 +1,8 @@
+# Development patch for dsh-project-control plugin (direct TypeScript loading)
+- insert:
+    - id: project-control-service
+      name: d:/Code/deepseek-harness/dsh-project-insight/src/plugin/service.ts
+    - id: project-control-tools
+      name: d:/Code/deepseek-harness/dsh-project-insight/src/plugin/tools.ts
+    - id: project-control-commands
+      name: d:/Code/deepseek-harness/dsh-project-insight/src/plugin/commands.ts

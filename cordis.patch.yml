@@ -1,0 +1,8 @@
+# Bundle patch for dsh-project-control installed via profile package
+- insert:
+    - id: project-control-service
+      name: dsh-project-control
+    - id: project-control-tools
+      name: dsh-project-control/src/plugin/tools.ts
+    - id: project-control-commands
+      name: dsh-project-control/src/plugin/commands.ts

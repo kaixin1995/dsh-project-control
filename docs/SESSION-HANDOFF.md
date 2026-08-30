@@ -14,8 +14,8 @@
 
 ## 二、当前状态（2026-08-30）
 
-- **只有文档，零代码**。开发未开始。
-- 阶段：设计已定稿，开发计划已细化到任务级（T0–T11），**下一步 = 从 T0.1 开始执行**（见 [development-plan.md](development-plan.md) §三）。
+- **T0 前置验证与脚手架已全部完成（T0.1–T0.5 全部通过并实测验证）**。
+- 阶段：T0 已完成，**下一步 = 从 T1.1（ID 体系与 ULID）开始执行**（见 [development-plan.md](development-plan.md) §三）。
 - 业主已确认：V0.4 产品总纲、V1.0 技术设计（含三处工程修正，见 development-plan §一 R1–R7）。
 - 首版范围已锁定（development-plan §六）。
 
