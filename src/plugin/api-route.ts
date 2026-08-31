@@ -133,14 +133,41 @@ function writeHistoryCursor(service: ProjectControlService, lastCommit: string, 
   void service.store?.historyCursor?.save({ id: 'cursor', lastCommit, processedCount })
 }
 
-/** 采纳当前项目：内存未恢复时回落最后一个已持久化项目（重启后首次 API 调用场景）。 */
-  function adoptProject(service: ProjectControlService): { id: string } | undefined {
-    if (service.currentProject !== undefined) return service.currentProject
-    const last = service.store?.projects.list().at(-1)
-    if (last === undefined) return undefined
-    service.currentProject = last
-    return last
+/** 从请求体取出会话 id（工作台按钮都会携带），并反查该会话的工作目录。 */
+function sessionCwdOf(service: ProjectControlService, body: Record<string, unknown>): string | undefined {
+  const sessionId = body['sessionId']
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined
+  const session = (service.ctx as any)?.sessions?.get?.(sessionId)
+  const cwd = session?.header?.cwd
+  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+}
+
+/**
+ * 采纳当前项目，按优先级：
+ * 1. 已采纳项目；
+ * 2. 请求携带 sessionId 时反查会话工作目录并 ensureProject（多项目/换工作区场景，页面按钮的主路径）；
+ * 3. 回落最后一个已持久化项目（重启后首次调用）。
+ */
+async function adoptProject(service: ProjectControlService, body: Record<string, unknown> = {}): Promise<{ id: string } | undefined> {
+  const cwd = sessionCwdOf(service, body)
+  if (service.currentProject === undefined || cwd !== undefined) {
+    const root = cwd ?? service.currentProject?.identity.rootPath
+    if (root !== undefined) {
+      const projectService = new ProjectService(
+        service.store.projects,
+        (args, dir) => service.git.runGit(args, dir),
+      )
+      const ensured = await projectService.ensureProject(root)
+      service.currentProject = ensured.project
+      return service.currentProject
+    }
   }
+  if (service.currentProject !== undefined) return service.currentProject
+  const last = service.store?.projects.list().at(-1)
+  if (last === undefined) return undefined
+  service.currentProject = last
+  return last
+}
 
   /** 截断证据摘要用于列表展示。 */
 function trimSnippet(text: string, max = 160): string {
@@ -311,7 +338,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const rootPathRaw = body['rootPath']
             const rootPath = typeof rootPathRaw === 'string' && rootPathRaw.length > 0
               ? rootPathRaw
-              : service.currentProject?.identity.rootPath
+              : sessionCwdOf(service, body)
+                  ?? service.currentProject?.identity.rootPath
             if (rootPath === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'no project root known; pass rootPath' }))
@@ -449,7 +477,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
         if (req.method === 'POST' && routePath === '/analyze') {
           try {
             const body = await readJsonBody(req)
-            const project = adoptProject(service)
+            const project = await adoptProject(service, body)
             const cwd = project?.identity?.rootPath
             if (project === undefined || cwd === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
@@ -526,7 +554,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'title is required' }))
               return
             }
-            const project = adoptProject(service)
+            const project = await adoptProject(service, body)
             const cwd = project?.identity?.rootPath
             if (project === undefined || cwd === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
@@ -553,7 +581,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           try {
             const body = await readJsonBody(req)
-            const project = adoptProject(service)
+            const project = await adoptProject(service, body)
             const cwd = project?.identity?.rootPath
             if (project === undefined || cwd === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
@@ -621,7 +649,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           try {
             const body = await readJsonBody(req)
-            const project = adoptProject(service)
+            const project = await adoptProject(service, body)
             const cwd = project?.identity?.rootPath
             if (project === undefined || cwd === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
@@ -699,7 +727,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const body = await readJsonBody(req)
             const symbolName = typeof body['symbolName'] === 'string' ? body['symbolName'] : ''
             const filePath = typeof body['filePath'] === 'string' ? body['filePath'] : ''
-            const project = adoptProject(service)
+            const project = await adoptProject(service, body)
             const cwd = project?.identity?.rootPath
             if (symbolName === '' || cwd === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })

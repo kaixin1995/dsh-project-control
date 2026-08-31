@@ -444,7 +444,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
   }
 
-  /** 统一动作执行器：POST 宿主 API，输出进结果面板，完成后刷新状态。 */
+  /** 统一动作执行器：POST 宿主 API（携带会话 id 供服务端定位项目工作区），输出进结果面板，完成后刷新状态。 */
   const runAction = async (name: string, path: string, body: Record<string, unknown>): Promise<void> => {
     setBusy(name)
     setActionResult(null)
@@ -452,7 +452,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const response = await fetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...body, sessionId: props.sessionId }),
       })
       const data: unknown = await response.json()
       if (!response.ok) {
@@ -479,7 +479,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const response = await fetch('/project-control/api/bootstrap', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ sessionId: props.sessionId }),
       })
       const data: unknown = await response.json()
       if (!response.ok) {
