@@ -1032,7 +1032,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const shortLabel = (sha: string): string => {
     if (sha === 'working') return t('repo.working')
     const target = allTargets.find((entry) => entry.sha === sha)
-    return `${(target?.meta.split(' · ')[0]) ?? sha.slice(0, 7)} ${target?.label.slice(0, 18) ?? ''}`.trim()
+    return `${(target?.meta.split(' · ')[0]) ?? sha.slice(0, 7)} ${target?.label ?? ''}`.trim()
   }
   const filteredTargets = pickerFilter.trim() === ''
     ? allTargets
@@ -1081,14 +1081,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         </div>
       </Card>
 
-      {/* 提交多选下拉（紧凑，约 1/5 高度以内） */}
+      {/* 提交多选下拉（紧凑；选中内容完整展示，允许自然换行） */}
       <Card title={t('picker.title')}>
         <div style={{ position: 'relative' }}>
-          <button style={{ ...styles.secondary, width: '100%', textAlign: 'left', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }} onClick={() => { setPickerOpen(!pickerOpen) }}>
-            <span>{selectedTargets.length === 0
-              ? t('picker.placeholder')
-              : `${t('picker.selected')} ${selectedTargets.length}：${selectedTargets.map(shortLabel).join('；').slice(0, 80)}`}</span>
-            <span style={{ marginLeft: '8px' }}>▾</span>
+          <button
+            style={{ ...styles.secondary, width: '100%', textAlign: 'left', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', whiteSpace: 'normal' }}
+            onClick={() => { setPickerOpen(!pickerOpen) }}
+          >
+            <span style={{ minWidth: 0 }}>
+              {selectedTargets.length === 0
+                ? t('picker.placeholder')
+                : `${t('picker.selected')} ${selectedTargets.length}：${selectedTargets.map(shortLabel).join('；')}`}
+            </span>
+            <span style={{ marginLeft: '8px', flexShrink: 0 }}>▾</span>
           </button>
           {pickerOpen && (
             <>
@@ -1107,7 +1112,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   />
                   <button style={styles.secondary} onClick={() => { setSelectedTargets([]) }}>{t('picker.clear')}</button>
                 </div>
-                <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+                <div style={{ maxHeight: 420, overflowY: 'auto' }}>
                   {allTargets.map((entry) => (
                     <div
                       key={entry.key}
