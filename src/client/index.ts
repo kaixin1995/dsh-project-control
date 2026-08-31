@@ -41,11 +41,18 @@ export function apply(ctx: any): void {
       },
       // 挂载即打开 details 轨道（面板偏好默认 0）：工作台需要真实宽度；
       // 无会话落地页轨道恒 0，天然保持原生英雄页布局。
+      // 会话切换时官方会 closeDetails —— 延后一拍重新撑开（宏任务晚于父级 effect）。
       (props: any) => {
+        ;(window as any).__pcDbg = ((window as any).__pcDbg ?? []).concat({ sessionId: props.sessionId, hadLayout: !!layout, hadOpen: typeof layout?.openDetails })
         React.useEffect(() => {
           layout?.openDetails?.()
         }, [])
-        return React.createElement(WorkspaceFrame, props)
+        React.useEffect(() => {
+          if (props.sessionId === undefined) return
+          const timer = setTimeout(() => layout?.openDetails?.(), 0)
+          return () => { clearTimeout(timer) }
+        }, [props.sessionId])
+        return React.createElement(WorkspaceFrame, { ...props, layout })
       },
     )
   }

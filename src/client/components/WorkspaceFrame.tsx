@@ -46,6 +46,21 @@ div[class*="frame"][style*="grid-template-columns"] > div[class*="centerCol"] { 
 div[class*="frame"][style*="grid-template-columns"] > div[class*="detailsCol"] { order: 2; }
 div[class*="frame"][style*="grid-template-columns"][data-details-collapsed] > div[class*="centerCol"],
 div[class*="frame"][style*="grid-template-columns"][data-details-collapsed] > div[class*="detailsCol"] { order: 0; }
+div[class*="handle"][data-side="details"] { display: none !important; }
+div[class*="frame"][style*="grid-template-columns"]:not([data-details-collapsed]) {
+  grid-template-columns: auto minmax(0, 1fr) var(--pc-chat-w, 360px) !important;
+}
+div[class*="_root"]:has(span[class*="_sep"]) {
+  display: -webkit-box !important;
+  -webkit-line-clamp: 2 !important;
+  -webkit-box-orient: vertical !important;
+  overflow: hidden !important;
+  white-space: normal !important;
+  text-overflow: clip !important;
+  font-size: 11px !important;
+  line-height: 1.5 !important;
+  max-width: 100% !important;
+}
 `
 
 type TabKey = 'overview' | 'changes' | 'execution' | 'memory' | 'history'
@@ -53,6 +68,8 @@ type TabKey = 'overview' | 'changes' | 'execution' | 'memory' | 'history'
 export interface WorkspaceFrameProps {
   /** 官方 details 槽契约的 locale 注入（我们注册的 project-control 词典）。 */
   t?: (key: string) => string
+  /** 当前会话 id（官方 session 标准属性；切换会话时重新撑开工作台轨道）。 */
+  sessionId?: string
 }
 
 /** 工作台文案词典（zh / en）。 */
@@ -214,6 +231,7 @@ function fallbackT(key: string): string {
 
 const styles: Record<string, React.CSSProperties> = {
   root: {
+    position: 'relative',
     height: '100%',
     display: 'flex',
     flexDirection: 'column',
@@ -311,6 +329,83 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [memoryContent, setMemoryContent] = useState('')
   const [confirmedText, setConfirmedText] = useState('')
   const [confirmedPaths, setConfirmedPaths] = useState('')
+
+  // 会话打开/切换时官方会 closeDetails 收起轨道；看门狗每 500ms 检查，
+  // 只要当前有会话而工作台列宽 < 50px 就重新撑开（确定性，不依赖 effect 时序）。
+  const layoutFace = props.layout
+  useEffect(() => {
+    const dbg = ((window as any).__pcWatch ??= [])
+    const timer = setInterval(() => {
+      const chat = document.querySelector('div[class*="centerCol"]')
+      const width = chat ? Math.round(chat.getBoundingClientRect().width) : -1
+      dbg.push({ chatW: width, sessionId: props.sessionId, hasFace: !!layoutFace })
+      if (dbg.length > 30) dbg.shift()
+      if (width !== -1 && width < 50) {
+        try {
+          layoutFace?.openDetails?.()
+          dbg.push({ reopen: 'called' })
+        } catch (error) {
+          dbg.push({ reopenError: String(error) })
+        }
+      }
+    }, 500)
+    return () => { clearInterval(timer) }
+  }, [props.sessionId, layoutFace])
+
+  /** 以 important 内联样式直接写官方网格模板（最高优先级，任何重渲染不会覆盖）。 */
+  const frameTemplateSet = (chatPx: number): void => {
+    const sidebar = document.querySelector('div[class*="sidebarCol"]')
+    const sidebarW = sidebar ? Math.max(56, Math.round(sidebar.getBoundingClientRect().width)) : 280
+    document.querySelector('div[class*="frame"][style*="grid-template-columns"]')
+      ?.style.setProperty('grid-template-columns', sidebarW + 'px minmax(0, 1fr) ' + chatPx + 'px', 'important')
+  }
+  const chatWidthNow = (): number => {
+    const chat = document.querySelector('div[class*="centerCol"]')
+    return chat ? Math.round(chat.getBoundingClientRect().width) : 360
+  }
+
+  // 聊天列宽记忆（官方 layout store 瞬态）：挂载恢复 + 拖拽直写内联模板。
+  // 模板用 auto 适配侧栏（内容定宽），1fr 给工作台，聊天列取记忆宽度。
+  const applyChatWidth = (chatPx: number): void => {
+    const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]') as HTMLElement | null
+    if (frame === null) return
+    frame.style.gridTemplateColumns = `auto minmax(0, 1fr) ${chatPx}px`
+  }
+
+  useEffect(() => {
+    const saved = Number(localStorage.getItem('pc.chatWidth') ?? '')
+    const apply = (): void => {
+      const chatW = Number.isFinite(saved) && saved >= 280 ? saved : 360
+      const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]') as HTMLElement | null
+      // 仅在当前内联模板与目标不同（或非 important）时写入，避免与 React 互相触发
+      if (frame !== null && frame.style.getPropertyPriority('grid-template-columns') !== 'important') {
+        const sidebar = document.querySelector('div[class*="sidebarCol"]')
+      const sidebarW = sidebar ? Math.max(56, Math.round(sidebar.getBoundingClientRect().width)) : 280
+      frameTemplateSet(chatW)
+      }
+    }
+    apply()
+    const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]')
+    const observer = new MutationObserver(() => { apply() })
+    if (frame !== null) observer.observe(frame, { attributes: true, attributeFilter: ['style'] })
+    return () => { observer.disconnect() }
+  }, [])
+
+  /** 分隔条拖拽：调整聊天列宽（工作台吸收剩余空间），写入 localStorage 记忆。 */
+  const onDividerDown = (e: React.PointerEvent): void => {
+    e.preventDefault()
+    const onMove = (ev: PointerEvent): void => {
+      const width = Math.min(900, Math.max(280, window.innerWidth - ev.clientX))
+      frameTemplateSet(width)
+      localStorage.setItem('pc.chatWidth', String(width))
+    }
+    const onUp = (): void => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
 
   useEffect(() => {
     let disposed = false
@@ -439,6 +534,14 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   return React.createElement('div', { style: styles.root, 'data-testid': 'project-control-workspace' },
     React.createElement('style', null, LAYOUT_STYLE),
+    React.createElement('div', {
+      'data-testid': 'project-control-divider',
+      onPointerDown: onDividerDown,
+      style: {
+        position: 'absolute', top: 0, bottom: 0, right: -4, width: 8,
+        cursor: 'col-resize', zIndex: 20,
+      },
+    }),
     React.createElement('div', { style: styles.nav },
       React.createElement('span', { style: styles.title }, t('workspace.title')),
       tabs.map((entry) => React.createElement(
