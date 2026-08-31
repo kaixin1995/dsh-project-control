@@ -91,6 +91,11 @@
 - ctx.agents.create 子代理：meta.origin='subagent'，setup 注册 project_control_step_complete；usage 从子会话 assistant/message 事件聚合。
 - 客户端 details 槽面板默认轨道宽 0：WorkspaceFrame 挂载时调用 ctx.layout.openDetails()（inject 需声明 'layout'）打开轨道；无会话落地页轨道恒 0，原生英雄页不受影响。
 
+**客户端 CSS 注入铁律（2026-08-30 第三轮事故复盘）**
+- **禁止用类名子串 + `:has()` 做祖先匹配**：官方 CSS Modules 构建产物是 `hash_root` 短哈希，几十个组件的根类都叫 `root`；ConversationRoot 的子树里包含 StatsLine 的 `hash_sep` 分隔 span，任何祖先匹配都会把整个聊天容器钳成 `display:-webkit-box; overflow:hidden`——聊天滚动条消失、高度锁死（本次线上事故根因）。要改官方某组件样式，只能在运行时按唯一形状定位（如"居中排版 + 直属 `|` 分隔 span"）取其构建哈希类名精确注入，或挂 data 钩子。
+- 官方 `.frame` 网格有 `transition: grid-template-columns`；隐藏标签页（后台节流）里过渡冻结在起点，`getBoundingClientRect` 会读到 0 宽假象——自动化验证时先 `getAnimations().forEach(a => a.finish())` 或确认 `document.visible`，真实浏览器前台不受影响。
+- 覆盖官方内联网格模板必须写 `setProperty(..., 'important')`：样式表 `!important` 会压制非 important 内联（曾致聊天列宽记忆刷新后丢失）。
+
 **T8-L1 / T3.1 交付事实（2026-08-30）**
 - L1 逐提交轻析已实装：scanHistory 接 summaries 回调（api-route 以 resolveDeploymentRoute 解析 Fast 路由，maxSummarized=30，单条失败回落 subject 并 console.error）；真机验证 4 提交 → 真实 LLM 语义句、零失败、15s。
 - 部署路由解析 resolveDeploymentRoute(ctx, tier, cfg)：settings 等级覆盖 → **ctx.get('agentDefaultModel').currentSelection()**（ctx.get 是可选服务官方通道，属性代理读取会触发 inject 门禁）→ deepseek-v4 兜底。本机部署真实路由 = llm-pi-ai aitool/1M（settings.yaml llm-pi-ai.providers.aitool）。

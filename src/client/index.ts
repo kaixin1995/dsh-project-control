@@ -43,7 +43,6 @@ export function apply(ctx: any): void {
       // 无会话落地页轨道恒 0，天然保持原生英雄页布局。
       // 会话切换时官方会 closeDetails —— 延后一拍重新撑开（宏任务晚于父级 effect）。
       (props: any) => {
-        ;(window as any).__pcDbg = ((window as any).__pcDbg ?? []).concat({ sessionId: props.sessionId, hadLayout: !!layout, hadOpen: typeof layout?.openDetails })
         React.useEffect(() => {
           layout?.openDetails?.()
         }, [])

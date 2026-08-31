@@ -50,18 +50,41 @@ div[class*="handle"][data-side="details"] { display: none !important; }
 div[class*="frame"][style*="grid-template-columns"]:not([data-details-collapsed]) {
   grid-template-columns: auto minmax(0, 1fr) var(--pc-chat-w, 360px) !important;
 }
-div[class*="_root"]:has(span[class*="_sep"]) {
-  display: -webkit-box !important;
-  -webkit-line-clamp: 2 !important;
-  -webkit-box-orient: vertical !important;
-  overflow: hidden !important;
-  white-space: normal !important;
-  text-overflow: clip !important;
-  font-size: 11px !important;
-  line-height: 1.5 !important;
-  max-width: 100% !important;
+`
+
+/**
+ * 会话统计行的两行钳制（用户指定的样式）。不能走 CSS 选择器：
+ * 官方多个模块的根类都叫 `root`（构建后是 `hash_root`），其中
+ * ConversationRoot 的子树里就包含统计行的 `hash_sep` 分隔 span——
+ * 任何祖先匹配（含 :has()）都会把整个聊天容器钳成两行，杀死滚动。
+ * 因此在运行时按唯一形状定位：居中排版 + 直接子代含文本 "|" 的
+ * 分隔 span，命中后把官方类名原样写进样式表（精准到构建哈希）。
+ * @returns 注入的 style 元素；官方未渲染统计行时为 undefined。
+ */
+const applyStatsLineClamp = (): HTMLStyleElement | undefined => {
+  const sepSpan = Array.from(document.querySelectorAll<HTMLSpanElement>('div[class*="_root"] > span[class*="_sep"]'))
+    .find((span) => span.textContent === '|')
+  const rootDiv = sepSpan?.parentElement
+  const hashClass = rootDiv?.className.split(/\s+/).find((name) => name.endsWith('_root'))
+  if (rootDiv === undefined || rootDiv === null || hashClass === undefined || getComputedStyle(rootDiv).textAlign !== 'center') return undefined
+  const style = document.createElement('style')
+  style.id = 'pc-stats-clamp'
+  style.textContent = `
+div[class="${hashClass}"] {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+  text-overflow: clip;
+  font-size: 11px;
+  line-height: 1.5;
+  max-width: 100%;
 }
 `
+  document.head.appendChild(style)
+  return style
+}
 
 type TabKey = 'overview' | 'changes' | 'execution' | 'memory' | 'history'
 
@@ -332,22 +355,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   // 会话打开/切换时官方会 closeDetails 收起轨道；看门狗每 500ms 检查，
   // 只要当前有会话而工作台列宽 < 50px 就重新撑开（确定性，不依赖 effect 时序）。
+  // 同一拍维持统计行钳制：会话切换会换掉统计行 DOM，样式表缺失时按当前
+  // 构建哈希重注入（幂等，已存在则跳过）。
   const layoutFace = props.layout
   useEffect(() => {
-    const dbg = ((window as any).__pcWatch ??= [])
+    applyStatsLineClamp()
     const timer = setInterval(() => {
+      if (document.getElementById('pc-stats-clamp') === null) applyStatsLineClamp()
       const chat = document.querySelector('div[class*="centerCol"]')
       const width = chat ? Math.round(chat.getBoundingClientRect().width) : -1
-      dbg.push({ chatW: width, sessionId: props.sessionId, hasFace: !!layoutFace })
-      if (dbg.length > 30) dbg.shift()
-      if (width !== -1 && width < 50) {
-        try {
-          layoutFace?.openDetails?.()
-          dbg.push({ reopen: 'called' })
-        } catch (error) {
-          dbg.push({ reopenError: String(error) })
-        }
-      }
+      if (width !== -1 && width < 50) layoutFace?.openDetails?.()
     }, 500)
     return () => { clearInterval(timer) }
   }, [props.sessionId, layoutFace])
@@ -359,30 +376,22 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     document.querySelector('div[class*="frame"][style*="grid-template-columns"]')
       ?.style.setProperty('grid-template-columns', sidebarW + 'px minmax(0, 1fr) ' + chatPx + 'px', 'important')
   }
-  const chatWidthNow = (): number => {
-    const chat = document.querySelector('div[class*="centerCol"]')
-    return chat ? Math.round(chat.getBoundingClientRect().width) : 360
-  }
 
   // 聊天列宽记忆（官方 layout store 瞬态）：挂载恢复 + 拖拽直写内联模板。
-  // 模板用 auto 适配侧栏（内容定宽），1fr 给工作台，聊天列取记忆宽度。
-  const applyChatWidth = (chatPx: number): void => {
-    const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]') as HTMLElement | null
-    if (frame === null) return
-    frame.style.gridTemplateColumns = `auto minmax(0, 1fr) ${chatPx}px`
-  }
-
+  // 必须写 important——LAYOUT_STYLE 的模板规则也是 important，非 important
+  // 内联会被它压制（这就是此前"拖拽生效、刷新后记忆丢失"的原因）。
+  // 官方 React 重渲染会改写内联模板，MutationObserver 按当前值守卫重写
+  // （值相同不会触发新的 mutation，无回环）。
   useEffect(() => {
     const saved = Number(localStorage.getItem('pc.chatWidth') ?? '')
     const apply = (): void => {
-      const chatW = Number.isFinite(saved) && saved >= 280 ? saved : 360
       const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]') as HTMLElement | null
-      // 仅在当前内联模板与目标不同（或非 important）时写入，避免与 React 互相触发
-      if (frame !== null && frame.style.getPropertyPriority('grid-template-columns') !== 'important') {
-        const sidebar = document.querySelector('div[class*="sidebarCol"]')
-      const sidebarW = sidebar ? Math.max(56, Math.round(sidebar.getBoundingClientRect().width)) : 280
+      // 仅当内联模板不是我们的 important 声明时写入：官方 React 重渲染会把
+      // 内联改回非 important（此时样式表规则接管、聊天宽回落 360），观察器
+      // 随即重写夺回；我们自己的写入保持 important，不再触发下一轮。
+      if (frame === null || frame.style.getPropertyPriority('grid-template-columns') === 'important') return
+      const chatW = Number.isFinite(saved) && saved >= 280 ? saved : 360
       frameTemplateSet(chatW)
-      }
     }
     apply()
     const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]')
@@ -676,7 +685,6 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               )),
       ),
 
-      // ── 记忆与学习：记录表单 + 列表（含确认） + Review/验收/证据 ──
       // ── 记忆与学习：记录表单 + 列表（含确认） + 学习概念 + Review/验收/证据 ──
       tab === 'memory' && React.createElement(React.Fragment, null,
         React.createElement(Card, { title: t('action.recordMemory') },
