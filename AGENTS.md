@@ -97,6 +97,11 @@
 - 覆盖官方内联网格模板必须写 `setProperty(..., 'important')`：样式表 `!important` 会压制非 important 内联（曾致聊天列宽记忆刷新后丢失）。
 - **工作台按钮 API 必须携带 sessionId**：HTTP 路由没有工具执行上下文，服务端按 `ctx.sessions.get(sessionId).header.cwd` 反查会话工作目录作为项目根（ensureProject + 采纳），回落已采纳项目 → 最后持久化项目；否则全新实例上报 `no project root known`（2026-08-31 真机事故 + 修复）。
 
+**v2 提交核查台（2026-08-31 第三轮）**
+- 工作台围绕业主六问重构：改了什么/实现逻辑（/commit-detail LLM 解读，key=root|sha|diffHash 进程内 LRU 40）、影响范围（/impact-scope：git grep 引用 token 反查 2 跳 → ProjectGraph → ImpactEngine）、是否最优（/review 支持 sha + OPTIMALITY 结论行）、笔记（core 域 notes 表 + /notes CRUD，可绑定 sha）、提交列表（/commits：--numstat 与 %x1f/%x1e 分隔解析）。
+- 多仓库 = 记忆仓库列表（localStorage pc.repos）+ 切换即 /bootstrap {rootPath} 采纳；聚合视图未做。
+- **客户端深嵌套 UI 一律写 JSX**（esbuild .tsx 原生支持）：手写 React.createElement 长链的括号配对不可维护（本轮两次构建失败根源）。
+
 **T8-L1 / T3.1 交付事实（2026-08-30）**
 - L1 逐提交轻析已实装：scanHistory 接 summaries 回调（api-route 以 resolveDeploymentRoute 解析 Fast 路由，maxSummarized=30，单条失败回落 subject 并 console.error）；真机验证 4 提交 → 真实 LLM 语义句、零失败、15s。
 - 部署路由解析 resolveDeploymentRoute(ctx, tier, cfg)：settings 等级覆盖 → **ctx.get('agentDefaultModel').currentSelection()**（ctx.get 是可选服务官方通道，属性代理读取会触发 inject 门禁）→ deepseek-v4 兜底。本机部署真实路由 = llm-pi-ai aitool/1M（settings.yaml llm-pi-ai.providers.aitool）。
