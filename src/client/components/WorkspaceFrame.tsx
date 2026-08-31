@@ -1,16 +1,15 @@
 /**
- * Project Control 工作台（WorkspaceFrame）：
- * 遮蔽官方 `details` 槽（priority -10）后渲染在主框架的 details 列，
- * 并通过注入的样式表把官方网格做视觉换列——
- * 聊天列（centerCol）移到最右，工作台（detailsCol）占据中间 1fr。
- * 左侧导航与官方聊天本体（ConversationRoot 及其全部子槽）零改动。
+ * Project Control 工作台（WorkspaceFrame）v2：围绕"提交核查"组织。
  *
- * 无会话落地页（data-details-collapsed，details 轨道为 0）恢复原生列序，
- * 英雄页照常显示；工作台此时自然隐藏（0px 轨道）。
+ * 四个页签：
+ * 1. 提交核查（默认）：仓库栏（多仓库切换）+ 提交列表（含未提交改动）+
+ *    详情面板（AI 解读：改了什么/实现逻辑/风险；三级影响范围 SVG 图；最优性核查结论）。
+ * 2. 项目总览：项目档案 + 快捷操作 + 已确定约束 + 变更任务。
+ * 3. 执行中心：Run 进度与成本。
+ * 4. 笔记与记忆：核查笔记（可关联提交）+ 项目记忆（人工确认）+ 学习概念 + Review/验收记录。
  *
- * 数据来自宿主 /project-control/api/state（同源 fetch + 4s 轮询）；
- * 操作按钮（分析/评审/验收/建变更/记忆/影响/历史扫描）POST 宿主 API；
- * 全部文案经 locale 词典（zh/en）。
+ * 布局机制不变：遮蔽官方 details 槽 + 注入样式换列（聊天最右）+ 分隔条拖拽记忆；
+ * 统计行两行钳制由运行时按构建哈希精准注入（applyStatsLineClamp）。
  *
  * @module dsh-client-project-control/components/WorkspaceFrame
  */
@@ -36,10 +35,58 @@ export interface WorkspaceState {
   concepts?: Array<{ id: string; name: string; category: string; description: string; occurrences: number }>
 }
 
+/** GET /commits 的提交条目。 */
+interface CommitEntry {
+  sha: string
+  shortHash: string
+  author: string
+  date: number
+  subject: string
+  files: Array<{ path: string; adds: number; dels: number }>
+}
+
+interface CommitsPayload {
+  rootPath: string
+  branch: string | null
+  headSha: string | null
+  working: { fileCount: number; isClean: boolean; files: Array<{ path: string; status: string }> }
+  commits: CommitEntry[]
+}
+
+interface CommitDetailPayload {
+  sha: string
+  isWorking: boolean
+  files: Array<{ path: string; adds: number; dels: number }>
+  insertions: number
+  deletions: number
+  patchTruncated: boolean
+  patch: string
+  commit: { message: string; author: string; date: number } | null
+  analysis: { what: string; logic: string[]; risks: string[] }
+}
+
+interface ImpactScopePayload {
+  changedFiles: string[]
+  riskLevel: 'low' | 'medium' | 'high' | 'critical'
+  riskScore: number
+  levels: Array<{ level: string; depth: number; path: string; confidence: number; reason: string }>
+  direct: string[]
+  affectedTests: string[]
+}
+
+interface NoteEntry {
+  id: string
+  projectId: string
+  sha?: string
+  title: string
+  content: string
+  createdAt: number
+}
+
 /**
  * 视觉换列样式表：随本组件挂载/卸载（卸载即完全恢复原生布局）。
- * 选择器用 [class*=…] 子串匹配 CSS Modules 哈希类名；
- * [style*="grid-template-columns"] 唯一锚定 AppFrame 的框架 div。
+ * 注意：禁止用 :has() 做祖先匹配——官方构建产物几十个组件根类都叫 root，
+ * 祖先匹配会把整个聊天容器误钳制（历史事故）。此表只保留网格换列与拖拽柄隐藏。
  */
 const LAYOUT_STYLE = `
 div[class*="frame"][style*="grid-template-columns"] > div[class*="centerCol"] { order: 3; }
@@ -86,7 +133,7 @@ div[class="${hashClass}"] {
   return style
 }
 
-type TabKey = 'overview' | 'changes' | 'execution' | 'memory' | 'history'
+type TabKey = 'commits' | 'overview' | 'execution' | 'notes'
 
 export interface WorkspaceFrameProps {
   /** 官方 details 槽契约的 locale 注入（我们注册的 project-control 词典）。 */
@@ -98,152 +145,228 @@ export interface WorkspaceFrameProps {
 /** 工作台文案词典（zh / en）。 */
 export const WORKSPACE_DICT = {
   zh: {
-    'workspace.title': '项目工作台',
+    'workspace.title': '项目核查台',
+    'tab.commits': '提交核查',
     'tab.overview': '项目总览',
-    'tab.changes': '变更工作台',
     'tab.execution': '执行中心',
-    'tab.memory': '记忆与学习',
-    'tab.history': '历史',
+    'tab.notes': '笔记与记忆',
+    'error.load': '加载失败',
     'state.project': '当前项目',
     'state.noProject': '尚未初始化项目',
     'state.noProjectHint': '点击「初始化项目」扫描仓库结构、技术栈与符号索引。',
     'action.bootstrap': '初始化项目',
-    'action.bootstrapping': '正在初始化…',
     'action.rescan': '重新初始化 / 扫描',
     'action.analyze': '分析当前改动',
     'action.review': '评审当前改动',
     'action.verify': '验收当前改动',
     'action.createChange': '新建变更',
-    'action.recordMemory': '记录记忆',
-    'action.scanHistory': '扫描历史（含 LLM 轻析）',
     'action.running': '执行中…',
+    'action.refresh': '刷新',
     'form.changeTitle': '变更标题',
     'form.changeDesc': '需求与背景（选填）',
+    'result.panel': '操作结果',
+
+    'repo.add': '切换 / 添加仓库',
+    'repo.addHint': '输入本机仓库绝对路径后回车；历史仓库已自动记忆',
+    'repo.scanHistory': '重建历史',
+    'repo.commits': '提交',
+    'repo.branch': '分支',
+    'repo.working': '未提交改动',
+    'repo.workingClean': '工作区干净，无未提交改动',
+    'repo.empty': '暂无提交。',
+    'repo.loadFailed': '提交加载失败',
+
+    'detail.title': '核查详情',
+    'detail.pick': '← 从左侧选择一次提交（或未提交改动）开始核查',
+    'detail.what': '改了什么',
+    'detail.logic': '实现逻辑',
+    'detail.risk': '风险点',
+    'detail.files': '文件清单',
+    'detail.patch': '查看补丁原文',
+    'detail.aiLoading': 'AI 解读生成中…（约 10-30 秒）',
+    'detail.impact': '影响范围分析',
+    'detail.impactLoading': '影响扫描中…（引用检索 + 图谱传播）',
+    'detail.optimality': '最优性核查',
+    'detail.optimalityLoading': '评审中…（会产出问题清单与最优性结论）',
+
+    'impact.risk': '风险',
+    'impact.col.changed': '变更文件',
+    'impact.col.indirect': '间接影响（引用链）',
+    'impact.col.potential': '潜在影响',
+    'impact.none': '未发现仓库内引用者（改动看似独立）。',
+    'impact.tests': '关联测试',
+    'impact.legend.changed': '变更',
+    'impact.legend.indirect': '间接',
+    'impact.legend.potential': '潜在',
+
+    'review.verdict': '最优性结论',
+    'review.issues': '问题清单',
+    'review.clean': '未发现问题。',
+
+    'notes.title': '核查笔记',
+    'notes.formTitle': '笔记标题',
+    'notes.formContent': '笔记内容（结论、疑问、学习要点…）',
+    'notes.add': '添加笔记',
+    'notes.boundTo': '将关联到',
+    'notes.col.time': '时间',
+    'notes.col.title': '标题',
+    'notes.col.content': '内容',
+    'notes.col.sha': '关联提交',
+    'notes.remove': '删除',
+    'notes.empty': '还没有笔记。核查提交时随手记下结论与疑问，就是你的项目学习档案。',
+
+    'memory.record': '记录项目记忆',
     'form.memoryTitle': '记忆标题',
     'form.memoryContent': '记忆内容（什么与为什么）',
-    'result.panel': '操作结果',
-    'state.techStack': '技术栈',
-    'state.symbols': '已索引符号',
-    'state.manifests': '清单文件',
-    'state.evidence': '证据条目',
-    'state.noChanges': '暂无变更任务。在聊天中让 AI 创建 Change，或用上方「新建变更」。',
-    'state.noRuns': '暂无执行记录。',
-    'state.noMemories': '暂无项目记忆。',
-    'state.noEvidence': '暂无证据记录。',
-    'changes.col.title': '标题',
-    'changes.col.type': '类型',
-    'changes.col.status': '状态',
-    'changes.col.updated': '更新时间',
     'memory.col.title': '条目',
     'memory.col.type': '类型',
     'memory.col.truth': '真值',
     'memory.col.branch': '分支',
     'memory.confirm': '确认',
-    'exec.col.status': '状态',
-    'exec.col.change': '变更',
-    'exec.col.started': '开始',
-    'exec.attempts': '尝试次数',
-    'exec.hint': '执行（start_run）请在右侧聊天中发起：创建计划后对 AI 说「开始执行该 change」。本页查看进度与结果。',
-    'history.imported': 'Imported Change（Git 历史重建）',
-    'history.col.title': '标题',
-    'history.col.commits': '提交数',
-    'history.col.period': '时间',
-    'history.col.confidence': '置信度',
-    'history.col.status': '状态',
-    'history.noImported': '暂无历史重建记录。点击「扫描历史」从 git 历史聚类生成。',
-    'review.issues': 'Review 问题',
-    'review.noIssues': '暂无 Review 问题。',
-    'verify.records': '验收记录',
-    'verify.noRecords': '暂无验收记录。',
-    'evidence.recent': '最近证据',
-    'confirmed.title': '已确定事项（人工确认，AI 禁改自动拦截）',
-    'confirmed.add': '添加已确定',
-    'confirmed.text': '约束/需求内容',
-    'confirmed.paths': '禁改路径（逗号分隔，选填）',
-    'confirmed.remove': '移除',
-    'confirmed.none': '暂无已确定事项。添加后 AI 修改禁改路径将被自动拒绝。',
-    'exec.col.cost': '成本(估)',
-    'history.continue': '继续扫描（从上次进度）',
+    'memory.empty': '暂无项目记忆。可在聊天中让 AI 记录，或在上方手动添加。',
     'concepts.title': '学习概念',
-    'concepts.none': '暂无学习概念。对 change 调用 summarize_learning 后自动积累。',
+    'concepts.none': '暂无学习概念。对变更调用 summarize_learning 后自动积累。',
     'concepts.col.name': '概念',
     'concepts.col.category': '类别',
     'concepts.col.count': '次数',
-    'error.load': '加载失败',
+    'review.recordsTitle': 'Review 问题',
+    'verify.records': '验收记录',
+
+    'confirmed.title': '已确定约束（人工确认，AI 禁改自动拦截）',
+    'confirmed.add': '添加约束',
+    'confirmed.text': '约束/需求内容',
+    'confirmed.paths': '禁改路径（逗号分隔，选填）',
+    'confirmed.none': '暂无约束。添加后 AI 修改禁改路径将被自动拒绝。',
+
+    'changes.title': '变更任务',
+    'state.noChanges': '暂无变更任务。在聊天中让 AI 创建，或用上方「新建变更」。',
+    'changes.col.title': '标题',
+    'changes.col.type': '类型',
+    'changes.col.status': '状态',
+    'changes.col.updated': '更新时间',
+    'exec.col.status': '状态',
+    'exec.col.change': '变更',
+    'exec.col.started': '开始',
+    'exec.col.cost': '成本(估)',
+    'exec.attempts': '尝试次数',
+    'exec.hint': '执行（start_run）请在右侧聊天中发起：创建计划后对 AI 说「开始执行该 change」。本页查看进度与结果。',
+    'state.noRuns': '暂无执行记录。',
+    'state.techStack': '技术栈',
+    'state.symbols': '已索引符号',
+    'state.manifests': '清单文件',
+    'state.evidence': '证据条目',
   },
   en: {
-    'workspace.title': 'Project Workspace',
+    'workspace.title': 'Review Desk',
+    'tab.commits': 'Commit Review',
     'tab.overview': 'Overview',
-    'tab.changes': 'Changes',
     'tab.execution': 'Execution',
-    'tab.memory': 'Memory & Learning',
-    'tab.history': 'History',
+    'tab.notes': 'Notes & Memory',
+    'error.load': 'Failed to load',
     'state.project': 'Current project',
     'state.noProject': 'No project initialized',
     'state.noProjectHint': 'Run "Initialize project" to scan the repository structure, tech stack, and symbol index.',
     'action.bootstrap': 'Initialize project',
-    'action.bootstrapping': 'Initializing…',
     'action.rescan': 'Re-initialize / scan',
     'action.analyze': 'Analyze working diff',
     'action.review': 'Review working diff',
     'action.verify': 'Verify working diff',
     'action.createChange': 'Create change',
-    'action.recordMemory': 'Record memory',
-    'action.scanHistory': 'Scan history (with LLM notes)',
     'action.running': 'Running…',
+    'action.refresh': 'Refresh',
     'form.changeTitle': 'Change title',
     'form.changeDesc': 'Requirement and background (optional)',
+    'result.panel': 'Action result',
+
+    'repo.add': 'Switch / add repo',
+    'repo.addHint': 'Enter an absolute repo path and press Enter; previously used repos are remembered',
+    'repo.scanHistory': 'Rebuild history',
+    'repo.commits': 'commits',
+    'repo.branch': 'branch',
+    'repo.working': 'Uncommitted changes',
+    'repo.workingClean': 'Working tree is clean',
+    'repo.empty': 'No commits.',
+    'repo.loadFailed': 'Failed to load commits',
+
+    'detail.title': 'Review detail',
+    'detail.pick': '← Pick a commit (or the uncommitted changes) on the left to start reviewing',
+    'detail.what': 'What it does',
+    'detail.logic': 'Implementation logic',
+    'detail.risk': 'Risks',
+    'detail.files': 'Files',
+    'detail.patch': 'Show raw patch',
+    'detail.aiLoading': 'Generating AI explanation… (10-30s)',
+    'detail.impact': 'Impact scope',
+    'detail.impactLoading': 'Scanning impact… (reference search + graph walk)',
+    'detail.optimality': 'Optimality review',
+    'detail.optimalityLoading': 'Reviewing… (produces issue list and optimality verdict)',
+
+    'impact.risk': 'Risk',
+    'impact.col.changed': 'Changed files',
+    'impact.col.indirect': 'Indirect (reference chain)',
+    'impact.col.potential': 'Potential',
+    'impact.none': 'No in-repo referencers found (the change looks self-contained).',
+    'impact.tests': 'Related tests',
+    'impact.legend.changed': 'changed',
+    'impact.legend.indirect': 'indirect',
+    'impact.legend.potential': 'potential',
+
+    'review.verdict': 'Optimality verdict',
+    'review.issues': 'Issues',
+    'review.clean': 'No issues found.',
+
+    'notes.title': 'Review notes',
+    'notes.formTitle': 'Note title',
+    'notes.formContent': 'Note content (conclusions, questions, learnings…)',
+    'notes.add': 'Add note',
+    'notes.boundTo': 'Will be linked to',
+    'notes.col.time': 'Time',
+    'notes.col.title': 'Title',
+    'notes.col.content': 'Content',
+    'notes.col.sha': 'Commit',
+    'notes.remove': 'Delete',
+    'notes.empty': 'No notes yet. Note down conclusions and questions while reviewing commits — that is your project learning archive.',
+
+    'memory.record': 'Record project memory',
     'form.memoryTitle': 'Memory title',
     'form.memoryContent': 'Memory content (what and why)',
-    'result.panel': 'Action result',
-    'state.techStack': 'Tech stack',
-    'state.symbols': 'Indexed symbols',
-    'state.manifests': 'Manifests',
-    'state.evidence': 'Evidence entries',
-    'state.noChanges': 'No change tasks yet. Ask the AI in chat to create a Change, or use "Create change" above.',
-    'state.noRuns': 'No runs yet.',
-    'state.noMemories': 'No project memories yet.',
-    'state.noEvidence': 'No evidence recorded yet.',
-    'changes.col.title': 'Title',
-    'changes.col.type': 'Type',
-    'changes.col.status': 'Status',
-    'changes.col.updated': 'Updated',
     'memory.col.title': 'Item',
     'memory.col.type': 'Type',
     'memory.col.truth': 'Truth',
     'memory.col.branch': 'Branch',
     'memory.confirm': 'Confirm',
-    'exec.col.status': 'Status',
-    'exec.col.change': 'Change',
-    'exec.col.started': 'Started',
-    'exec.attempts': 'Attempts',
-    'exec.hint': 'Runs (start_run) are started from chat: after a plan exists, tell the AI to "start run for the change". This tab shows progress and results.',
-    'history.imported': 'Imported Change (rebuilt from git history)',
-    'history.col.title': 'Title',
-    'history.col.commits': 'Commits',
-    'history.col.period': 'Period',
-    'history.col.confidence': 'Confidence',
-    'history.col.status': 'Status',
-    'history.noImported': 'No imported changes yet. Click "Scan history" to cluster them from git history.',
-    'review.issues': 'Review issues',
-    'review.noIssues': 'No review issues.',
-    'verify.records': 'Verification records',
-    'verify.noRecords': 'No verification records yet.',
-    'evidence.recent': 'Recent evidence',
-    'confirmed.title': 'Confirmed items (human-confirmed; AI edits to forbidden paths are auto-denied)',
-    'confirmed.add': 'Add confirmed item',
-    'confirmed.text': 'Requirement / constraint text',
-    'confirmed.paths': 'Forbidden paths (comma separated, optional)',
-    'confirmed.remove': 'Remove',
-    'confirmed.none': 'No confirmed items yet. AI edits to forbidden paths will be auto-denied once added.',
-    'exec.col.cost': 'Cost (est)',
-    'history.continue': 'Continue scan (from last cursor)',
+    'memory.empty': 'No project memories yet. Ask the AI in chat to record one, or add above.',
     'concepts.title': 'Learning concepts',
     'concepts.none': 'No learning concepts yet. Run summarize_learning on a change to accumulate.',
     'concepts.col.name': 'Concept',
     'concepts.col.category': 'Category',
     'concepts.col.count': 'Count',
-    'error.load': 'Failed to load',
+    'review.recordsTitle': 'Review issues',
+    'verify.records': 'Verification records',
+
+    'confirmed.title': 'Confirmed constraints (human-confirmed; AI edits to forbidden paths are auto-denied)',
+    'confirmed.add': 'Add constraint',
+    'confirmed.text': 'Requirement / constraint text',
+    'confirmed.paths': 'Forbidden paths (comma separated, optional)',
+    'confirmed.none': 'No constraints yet. AI edits to forbidden paths will be auto-denied once added.',
+
+    'changes.title': 'Change tasks',
+    'state.noChanges': 'No change tasks yet. Ask the AI in chat to create one, or use "Create change" above.',
+    'changes.col.title': 'Title',
+    'changes.col.type': 'Type',
+    'changes.col.status': 'Status',
+    'changes.col.updated': 'Updated',
+    'exec.col.status': 'Status',
+    'exec.col.change': 'Change',
+    'exec.col.started': 'Started',
+    'exec.col.cost': 'Cost (est)',
+    'exec.attempts': 'Attempts',
+    'exec.hint': 'Runs (start_run) are started from chat: after a plan exists, tell the AI to "start run for the change". This tab shows progress and results.',
+    'state.noRuns': 'No runs yet.',
+    'state.techStack': 'Tech stack',
+    'state.symbols': 'Indexed symbols',
+    'state.manifests': 'Manifests',
+    'state.evidence': 'Evidence entries',
   },
 } as const
 
@@ -321,6 +444,103 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'inline-block', padding: '1px 8px', borderRadius: '4px', fontSize: '11px',
     background: `${color}22`, color,
   }),
+  sectionTitle: { fontWeight: 600, fontSize: '12px', marginBottom: '8px' },
+  what: { fontSize: '12px', lineHeight: 1.7, margin: '4px 0 8px' },
+  logicStep: { fontSize: '12px', lineHeight: 1.8, display: 'flex', gap: '6px' },
+  riskItem: { fontSize: '12px', lineHeight: 1.7, color: '#9a6700', margin: '2px 0' },
+  commitRow: (active: boolean): React.CSSProperties => ({
+    padding: '8px 10px',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    border: active ? '1px solid var(--dsw-alias-brand-primary, #2563eb)' : '1px solid transparent',
+    background: active ? 'rgba(37,99,235,0.06)' : 'transparent',
+    marginBottom: '4px',
+  }),
+  commitSubject: { fontSize: '12px', fontWeight: 600, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  commitMeta: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '2px', display: 'flex', gap: '8px' },
+  patch: {
+    fontFamily: 'monospace', fontSize: '11px', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+    background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
+    borderRadius: '6px', padding: '10px', maxHeight: '320px', overflowY: 'auto',
+  },
+  chip: (active: boolean): React.CSSProperties => ({
+    padding: '2px 10px', borderRadius: '999px', fontSize: '11px', cursor: 'pointer',
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
+    background: active ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'transparent',
+    color: active ? '#fff' : 'inherit',
+  }),
+}
+
+/** 风险等级 → 徽章颜色。 */
+const RISK_COLOR: Record<string, string> = { low: '#4ec9b0', medium: '#dcdcaa', high: '#ce9178', critical: '#f14c4c' }
+
+/**
+ * 影响范围 SVG 流程图：三列分层（变更 → 间接引用链 → 潜在），
+ * 依据 /impact-scope 返回的 levels（含传播链 reason）绘制连线。
+ */
+function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => string }) {
+  const { data } = props
+  const indirect = data.levels.filter((item) => item.level === 'indirect')
+  const potential = data.levels.filter((item) => item.level === 'potential')
+  const col0 = data.changedFiles.slice(0, 6)
+  const col1 = Array.from(new Set(indirect.map((item) => item.path))).slice(0, 8)
+  const col2 = Array.from(new Set(potential.map((item) => item.path))).filter((p) => !col1.includes(p)).slice(0, 6)
+  const nodeH = 24
+  const gap = 8
+  const colX = [12, 252, 492]
+  const colW = 216
+  const rows = Math.max(col0.length, col1.length, col2.length, 1)
+  const height = rows * (nodeH + gap) + 46
+  const yOf = (col: number, index: number): number => 34 + index * (nodeH + gap)
+
+  const columnName = [props.t('impact.col.changed'), props.t('impact.col.indirect'), props.t('impact.col.potential')]
+
+  const chainStart = (reason: string): string => {
+    const match = reason.match(/path: (.+)$/)
+    if (match === null) return data.changedFiles[0] ?? ''
+    return match[1]!.split(' -> ')[0] ?? data.changedFiles[0] ?? ''
+  }
+  const findPos = (path: string): { col: number; index: number } | undefined => {
+    if (col0.includes(path)) return { col: 0, index: col0.indexOf(path) }
+    if (col1.includes(path)) return { col: 1, index: col1.indexOf(path) }
+    if (col2.includes(path)) return { col: 2, index: col2.indexOf(path) }
+    return undefined
+  }
+  const renderCol = (col: number, items: string[], color: string): React.ReactNode[] => items.map((path, index) => React.createElement(
+    'g',
+    { key: `${col}-${path}` },
+    React.createElement('rect', { x: colX[col], y: yOf(col, index), width: colW, height: nodeH, rx: 5, fill: `${color}1a`, stroke: color, strokeWidth: 1 }),
+    React.createElement('text', { x: colX[col] + 8, y: yOf(col, index) + 16, fontSize: 10, fill: 'var(--dsw-alias-label-primary, #1f2328)' },
+      path.split('/').pop()?.slice(0, 26)),
+    React.createElement('title', null, path),
+  ))
+
+  return React.createElement('div', null,
+    React.createElement('svg', { width: '100%', viewBox: `0 0 724 ${height}`, style: { maxHeight: 340 } },
+      columnName.map((name, col) => React.createElement('text', { key: `h${col}`, x: colX[col], y: 18, fontSize: 11, fontWeight: 600, fill: 'var(--dsw-alias-label-secondary, #6b7280)' }, name)),
+      renderCol(0, col0, '#2563eb'),
+      renderCol(1, col1, '#d97706'),
+      renderCol(2, col2, '#8b8b8b'),
+      indirect.slice(0, 16).map((item, i) => {
+        const from = findPos(chainStart(item.reason))
+        const to = findPos(item.path)
+        if (from === undefined || to === undefined || from.col === to.col) return null
+        const x1 = colX[from.col] + colW
+        const y1 = yOf(from.col, from.index) + nodeH / 2
+        const x2 = colX[to.col]
+        const y2 = yOf(to.col, to.index) + nodeH / 2
+        return React.createElement('path', {
+          key: `e${i}`, d: `M ${x1} ${y1} C ${x1 + 20} ${y1}, ${x2 - 20} ${y2}, ${x2} ${y2}`,
+          fill: 'none', stroke: '#d97706', strokeWidth: 1.2, opacity: 0.55,
+        })
+      }),
+    ),
+    React.createElement('div', { style: { display: 'flex', gap: '14px', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '4px' } },
+      React.createElement('span', null, '■ ', props.t('impact.legend.changed')),
+      React.createElement('span', { style: { color: '#d97706' } }, '■ ', props.t('impact.legend.indirect')),
+      React.createElement('span', { style: { color: '#8b8b8b' } }, '■ ', props.t('impact.legend.potential')),
+    ),
+  )
 }
 
 function formatTime(value: number | null | undefined): string {
@@ -331,16 +551,16 @@ function formatTime(value: number | null | undefined): string {
 /** 骨架小卡片。 */
 function Card(props: { title?: string; children?: React.ReactNode }) {
   return React.createElement('div', { style: styles.card },
-    props.title === undefined ? null : React.createElement('div', { style: { fontWeight: 600, fontSize: '12px', marginBottom: '8px' } }, props.title),
+    props.title === undefined ? null : React.createElement('div', { style: styles.sectionTitle }, props.title),
     props.children)
 }
 
 /**
- * 工作台主组件：tab 导航 + 数据面板（轮询宿主 API）+ 按钮化操作。
+ * 工作台主组件：四页签（提交核查为默认）+ 轮询宿主 API + 按钮化操作。
  */
 export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const t = props.t ?? fallbackT
-  const [tab, setTab] = useState<TabKey>('overview')
+  const [tab, setTab] = useState<TabKey>('commits')
   const [state, setState] = useState<WorkspaceState | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [bootstrapping, setBootstrapping] = useState(false)
@@ -353,11 +573,142 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [confirmedText, setConfirmedText] = useState('')
   const [confirmedPaths, setConfirmedPaths] = useState('')
 
+  // ── 提交核查状态 ──
+  const [commitsData, setCommitsData] = useState<CommitsPayload | null>(null)
+  const [commitsError, setCommitsError] = useState<string | null>(null)
+  const [selectedTarget, setSelectedTarget] = useState<string | null>(null)
+  const [detail, setDetail] = useState<CommitDetailPayload | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [impact, setImpact] = useState<ImpactScopePayload | null>(null)
+  const [impactLoading, setImpactLoading] = useState(false)
+  const [review, setReview] = useState<{ issuesFound: number; issues: string; verdict: string } | null>(null)
+  const [reviewLoading, setReviewLoading] = useState(false)
+  const [showPatch, setShowPatch] = useState(false)
+  const [repoInput, setRepoInput] = useState('')
+  const [knownRepos, setKnownRepos] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('pc.repos') ?? '[]') as string[]
+    } catch {
+      return []
+    }
+  })
+
+  // ── 笔记状态 ──
+  const [notes, setNotes] = useState<NoteEntry[]>([])
+  const [noteTitle, setNoteTitle] = useState('')
+  const [noteContent, setNoteContent] = useState('')
+
+  const post = async (path: string, body: Record<string, unknown>): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...body, sessionId: props.sessionId }),
+    })
+    const data: unknown = await response.json()
+    return { ok: response.ok, data: (data ?? {}) as Record<string, unknown> }
+  }
+
+  const loadCommits = async (): Promise<void> => {
+    try {
+      const response = await fetch(`/project-control/api/commits?sessionId=${encodeURIComponent(props.sessionId ?? '')}&limit=60`)
+      const data: unknown = await response.json()
+      if (!response.ok) throw new Error((data as { error?: string }).error ?? `HTTP ${response.status}`)
+      setCommitsData(data as CommitsPayload)
+      setCommitsError(null)
+    } catch (error: unknown) {
+      setCommitsError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const loadNotes = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/notes')
+      const data: unknown = await response.json()
+      if (response.ok) setNotes((data as { notes: NoteEntry[] }).notes ?? [])
+    } catch {
+      // 笔记加载失败不打断页面：列表保持原样。
+    }
+  }
+
+  const selectTarget = async (target: string): Promise<void> => {
+    setSelectedTarget(target)
+    setImpact(null)
+    setReview(null)
+    setShowPatch(false)
+    setDetailLoading(true)
+    try {
+      const { data } = await post('/project-control/api/commit-detail', { sha: target })
+      setDetail(data as unknown as CommitDetailPayload)
+    } catch (error: unknown) {
+      setDetail(null)
+      setLoadError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  const loadImpact = async (): Promise<void> => {
+    if (selectedTarget === null) return
+    setImpactLoading(true)
+    try {
+      const { ok, data } = await post('/project-control/api/impact-scope', { sha: selectedTarget })
+      setImpact(ok ? (data as unknown as ImpactScopePayload) : null)
+    } finally {
+      setImpactLoading(false)
+    }
+  }
+
+  const loadReview = async (): Promise<void> => {
+    if (selectedTarget === null) return
+    setReviewLoading(true)
+    try {
+      const { data } = await post('/project-control/api/review', { sha: selectedTarget })
+      setReview(data as unknown as { issuesFound: number; issues: string; verdict: string })
+    } finally {
+      setReviewLoading(false)
+    }
+  }
+
+  const switchRepo = async (rootPath: string): Promise<void> => {
+    setBusy('switchRepo')
+    try {
+      await post('/project-control/api/bootstrap', { rootPath })
+      const next = Array.from(new Set([rootPath, ...knownRepos])).slice(0, 8)
+      setKnownRepos(next)
+      localStorage.setItem('pc.repos', JSON.stringify(next))
+      setRepoInput('')
+      await loadCommits()
+      const refreshed = await fetch('/project-control/api/state')
+      if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const addNote = async (): Promise<void> => {
+    if (noteTitle.trim() === '' || noteContent.trim() === '') return
+    const { ok } = await post('/project-control/api/notes', {
+      title: noteTitle.trim(),
+      content: noteContent.trim(),
+      sha: selectedTarget === null ? undefined : selectedTarget,
+    })
+    if (ok) {
+      setNoteTitle('')
+      setNoteContent('')
+      await loadNotes()
+    }
+  }
+
+  const removeNote = async (id: string): Promise<void> => {
+    await post('/project-control/api/notes/delete', { id })
+    await loadNotes()
+  }
+
   // 会话打开/切换时官方会 closeDetails 收起轨道；看门狗每 500ms 检查，
   // 只要当前有会话而工作台列宽 < 50px 就重新撑开（确定性，不依赖 effect 时序）。
   // 同一拍维持统计行钳制：会话切换会换掉统计行 DOM，样式表缺失时按当前
   // 构建哈希重注入（幂等，已存在则跳过）。
-  const layoutFace = props.layout
+  const layoutFace = (props as unknown as { layout?: { openDetails?: () => void } }).layout
   useEffect(() => {
     applyStatsLineClamp()
     const timer = setInterval(() => {
@@ -439,6 +790,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }, [])
 
+  // 进入提交/笔记页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
+  useEffect(() => {
+    if (tab === 'commits') void loadCommits()
+    if (tab === 'notes') void loadNotes()
+  }, [tab, props.sessionId])
+
   const refreshState = async (): Promise<void> => {
     const refreshed = await fetch('/project-control/api/state', { headers: { accept: 'application/json' } })
     if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
@@ -449,15 +806,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setBusy(name)
     setActionResult(null)
     try {
-      const response = await fetch(path, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...body, sessionId: props.sessionId }),
-      })
-      const data: unknown = await response.json()
-      if (!response.ok) {
-        const message = (data as { error?: string }).error ?? `HTTP ${response.status}`
-        setActionResult(`✗ ${message}`)
+      const { ok, data } = await post(path, body)
+      if (!ok) {
+        setActionResult(`✗ ${String(data['error'] ?? 'error')}`)
         return
       }
       setActionResult(JSON.stringify(data, null, 2))
@@ -469,21 +820,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
-  const removeConfirmed = async (id: string): Promise<void> => {
-    await runAction('removeConfirmed', '/project-control/api/confirmed/remove', { id })
-  }
-
   const runBootstrap = async (): Promise<void> => {
     setBootstrapping(true)
     try {
-      const response = await fetch('/project-control/api/bootstrap', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: props.sessionId }),
-      })
-      const data: unknown = await response.json()
-      if (!response.ok) {
-        setLoadError((data as { error?: string }).error ?? `HTTP ${response.status}`)
+      const { ok, data } = await post('/project-control/api/bootstrap', {})
+      if (!ok) {
+        setLoadError(String(data['error'] ?? 'error'))
         return
       }
       await refreshState()
@@ -495,23 +837,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   }
 
   const confirmMemory = async (memoryId: string): Promise<void> => {
-    try {
-      const response = await fetch('/project-control/api/memory/confirm', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ memoryId }),
-      })
-      if (!response.ok) {
-        const data: unknown = await response.json()
-        setLoadError((data as { error?: string }).error ?? `HTTP ${response.status}`)
-        return
-      }
+    const { ok } = await post('/project-control/api/memory/confirm', { memoryId })
+    if (ok) {
       setState((previous) => previous === null ? previous : {
         ...previous,
         memories: previous.memories?.map((memory) => memory.id === memoryId ? { ...memory, isHumanConfirmed: true, truthLevel: 'fact' } : memory),
       })
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -520,287 +851,501 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const changes = state?.changes ?? []
   const runs = state?.runs ?? []
   const memories = state?.memories ?? []
-  const importedChanges = state?.importedChanges ?? []
   const issues = state?.issues ?? []
   const verifications = state?.verifications ?? []
-  const recentEvidence = state?.recentEvidence ?? []
   const confirmed = state?.confirmed ?? []
   const concepts = state?.concepts ?? []
 
   const tabs: Array<{ key: TabKey; label: string }> = [
+    { key: 'commits', label: t('tab.commits') },
     { key: 'overview', label: t('tab.overview') },
-    { key: 'changes', label: t('tab.changes') },
     { key: 'execution', label: t('tab.execution') },
-    { key: 'memory', label: t('tab.memory') },
-    { key: 'history', label: t('tab.history') },
+    { key: 'notes', label: t('tab.notes') },
   ]
 
-  /** 操作结果面板（所有页签共用）。 */
+  /** 操作结果面板（总览页签的快捷动作共用）。 */
   const resultPanel = actionResult !== null
     ? React.createElement(Card, { title: t('result.panel') },
         React.createElement('div', { style: styles.result }, actionResult))
     : null
 
-  return React.createElement('div', { style: styles.root, 'data-testid': 'project-control-workspace' },
-    React.createElement('style', null, LAYOUT_STYLE),
-    React.createElement('div', {
-      'data-testid': 'project-control-divider',
-      onPointerDown: onDividerDown,
-      style: {
-        position: 'absolute', top: 0, bottom: 0, right: -4, width: 8,
-        cursor: 'col-resize', zIndex: 20,
-      },
-    }),
-    React.createElement('div', { style: styles.nav },
-      React.createElement('span', { style: styles.title }, t('workspace.title')),
-      tabs.map((entry) => React.createElement(
-        'button',
-        { key: entry.key, style: styles.tab(tab === entry.key), onClick: () => { setTab(entry.key) } },
-        entry.label,
-      )),
-    ),
-    React.createElement('div', { style: styles.body },
-      loadError !== null && React.createElement('div', { style: styles.empty }, `${t('error.load')}: ${loadError}`),
-      state?.ready === false && React.createElement('div', { style: styles.empty }, state.reason ?? ''),
+  // ── 提交核查页签 ──
+  const commitList: Array<{ key: string; subject: string; meta: string; sha: string | null }> = []
+  if (commitsData !== null) {
+    commitList.push(commitsData.working.isClean
+      ? { key: 'working', subject: t('repo.workingClean'), meta: '', sha: null }
+      : {
+          key: 'working',
+          subject: `● ${t('repo.working')}（${commitsData.working.fileCount}）`,
+          meta: commitsData.working.files.slice(0, 3).map((file) => file.path.split('/').pop()).join(', '),
+          sha: 'working',
+        })
+    for (const commit of commitsData.commits) {
+      const adds = commit.files.reduce((sum, file) => sum + file.adds, 0)
+      const dels = commit.files.reduce((sum, file) => sum + file.dels, 0)
+      commitList.push({
+        key: commit.sha,
+        subject: commit.subject,
+        meta: `${commit.shortHash} · ${commit.author} · ${new Date(commit.date).toLocaleString()} · +${adds}/-${dels}`,
+        sha: commit.sha,
+      })
+    }
+  }
 
-      // ── 项目总览：操作栏 + 项目卡 ──
-      tab === 'overview' && React.createElement(React.Fragment, null,
-        React.createElement(Card, null,
-          React.createElement('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
-            React.createElement('button', {
-              style: styles.button, disabled: bootstrapping,
-              onClick: () => { void runBootstrap() },
-            }, bootstrapping ? t('action.running') : t('action.rescan')),
-            React.createElement('button', {
-              style: styles.secondary, disabled: busy !== null,
-              onClick: () => { void runAction('analyze', '/project-control/api/analyze', {}) },
-            }, busy === 'analyze' ? t('action.running') : t('action.analyze')),
-            React.createElement('button', {
-              style: styles.secondary, disabled: busy !== null,
-              onClick: () => { void runAction('review', '/project-control/api/review', {}) },
-            }, busy === 'review' ? t('action.running') : t('action.review')),
-            React.createElement('button', {
-              style: styles.secondary, disabled: busy !== null,
-              onClick: () => { void runAction('verify', '/project-control/api/verify', {}) },
-            }, busy === 'verify' ? t('action.running') : t('action.verify')),
-          ),
-        ),
-        resultPanel,
-        project === null
-          ? React.createElement(Card, null,
-              React.createElement('div', { style: { fontWeight: 600, fontSize: '13px', marginBottom: '6px' } }, t('state.noProject')),
-              React.createElement('div', { style: styles.empty }, t('state.noProjectHint')),
-            )
-          : React.createElement(Card, { title: `${t('state.project')}：${project.name}` },
-              React.createElement('div', { style: styles.row },
-                React.createElement('span', null, React.createElement('span', { style: styles.label }, 'Root'), project.rootPath),
-              ),
-              bootstrap !== null && React.createElement(React.Fragment, null,
-                React.createElement('div', { style: styles.row },
-                  React.createElement('span', null, React.createElement('span', { style: styles.label }, t('state.techStack')),
-                    bootstrap.techStack.map((tech) => React.createElement('span', { key: tech, style: styles.badge('#4ec9b0') }, tech))),
-                ),
-                React.createElement('div', { style: styles.row },
-                  React.createElement('span', null, React.createElement('span', { style: styles.label }, t('state.symbols')), String(bootstrap.symbolsCount)),
-                  React.createElement('span', null, React.createElement('span', { style: styles.label }, t('state.manifests')), String(bootstrap.manifestFiles.length)),
-                  React.createElement('span', null, React.createElement('span', { style: styles.label }, t('state.evidence')), String(state?.evidenceCount ?? 0)),
-                ),
-                React.createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '8px' } }, bootstrap.summary),
-              ),
-            ),
-        React.createElement(Card, { title: t('confirmed.title') },
-          React.createElement('div', { style: styles.formRow },
-            React.createElement('input', { style: styles.input, placeholder: t('confirmed.text'), value: confirmedText, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setConfirmedText(e.target.value) } }),
-            React.createElement('input', { style: styles.input, placeholder: t('confirmed.paths'), value: confirmedPaths, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setConfirmedPaths(e.target.value) } }),
-            React.createElement('button', {
-              style: styles.button, disabled: busy !== null || confirmedText === '',
-              onClick: () => { void runAction('addConfirmed', '/project-control/api/confirmed', { type: 'constraint', text: confirmedText, forbiddenPaths: confirmedPaths.split(',').map((path) => path.trim()).filter((path) => path !== '') }).then(() => { setConfirmedText(''); setConfirmedPaths('') }) },
-            }, busy === 'addConfirmed' ? t('action.running') : t('confirmed.add')),
-          ),
-          confirmed.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('confirmed.none'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('tbody', null, confirmed.map((item) => React.createElement('tr', { key: item.id },
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge('#c586c0') }, item.type)),
-                  React.createElement('td', { style: styles.td }, item.text),
-                  React.createElement('td', { style: styles.td }, item.forbiddenPaths.join(', ') || '—'),
-                  React.createElement('td', { style: styles.td }, React.createElement('button', {
-                    style: { ...styles.secondary, padding: '2px 8px', fontSize: '11px' },
-                    onClick: () => { void removeConfirmed(item.id) },
-                  }, t('confirmed.remove'))),
-                ))),
-              )),
-        ),
+  const detailHeader = detail === null ? null : detail.isWorking
+    ? `● ${t('repo.working')}`
+    : `${detail.commit?.message ?? detail.sha}（${detail.sha.slice(0, 8)}）`
 
-      // ── 变更工作台：新建表单 + 列表 ──
-      tab === 'changes' && React.createElement(React.Fragment, null,
-        React.createElement(Card, { title: t('action.createChange') },
-          React.createElement('div', { style: styles.formRow },
-            React.createElement('input', { style: styles.input, placeholder: t('form.changeTitle'), value: changeTitle, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setChangeTitle(e.target.value) } }),
-            React.createElement('input', { style: styles.input, placeholder: t('form.changeDesc'), value: changeDesc, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setChangeDesc(e.target.value) } }),
-            React.createElement('button', {
-              style: styles.button, disabled: busy !== null || changeTitle === '',
-              onClick: () => { void runAction('createChange', '/project-control/api/changes', { title: changeTitle, description: changeDesc }).then(() => { setChangeTitle(''); setChangeDesc('') }) },
-            }, busy === 'createChange' ? t('action.running') : t('action.createChange')),
-          ),
-        ),
-        resultPanel,
-        React.createElement(Card, null,
-          changes.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('state.noChanges'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('thead', null, React.createElement('tr', null,
-                  ['changes.col.title', 'changes.col.type', 'changes.col.status', 'changes.col.updated'].map((key) =>
-                    React.createElement('th', { key, style: styles.th }, t(key)))),
-                ),
-                React.createElement('tbody', null, changes.map((change) => React.createElement('tr', { key: change.id },
-                  React.createElement('td', { style: styles.td }, change.title),
-                  React.createElement('td', { style: styles.td }, change.type),
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(change.status === 'completed' ? '#4ec9b0' : '#569cd6') }, change.status)),
-                  React.createElement('td', { style: styles.td }, formatTime(change.updatedAt)),
-                ))),
-              )),
-      ),
+  const commitsTab = (
+    <>
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: knownRepos.length > 0 ? '8px' : '0' }}>
+          <span style={styles.badge('#2563eb')}>{commitsData?.branch ?? '—'}</span>
+          <span style={{ fontSize: '12px' }}>{commitsData?.rootPath ?? project?.rootPath ?? '—'}</span>
+          <span style={{ flex: 1 }} />
+          <button style={styles.secondary} onClick={() => { void loadCommits() }}>{t('action.refresh')}</button>
+          <button
+            style={styles.secondary}
+            disabled={busy !== null}
+            onClick={() => { void runAction('scanHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30 }) }}
+          >{busy === 'scanHistory' ? t('action.running') : t('repo.scanHistory')}</button>
+        </div>
+        {knownRepos.length > 0 && (
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+            {knownRepos.map((repo) => (
+              <span
+                key={repo}
+                style={styles.chip(repo === (commitsData?.rootPath ?? ''))}
+                onClick={() => { void switchRepo(repo) }}
+                title={repo}
+              >{repo.split(/[\\/]/).filter(Boolean).pop() ?? repo}</span>
+            ))}
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+          <input
+            style={styles.input}
+            placeholder={t('repo.addHint')}
+            value={repoInput}
+            onChange={(e) => { setRepoInput(e.target.value) }}
+            onKeyDown={(e) => { if (e.key === 'Enter' && repoInput.trim() !== '') void switchRepo(repoInput.trim()) }}
+          />
+          <button style={styles.button} disabled={busy !== null || repoInput.trim() === ''} onClick={() => { void switchRepo(repoInput.trim()) }}>
+            {busy === 'switchRepo' ? t('action.running') : t('repo.add')}
+          </button>
+        </div>
+      </Card>
+      {commitsError !== null && <Card><div style={styles.empty}>{t('repo.loadFailed')}: {commitsError}</div></Card>}
+      <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+        <div style={{ width: '38%', flexShrink: 0 }}>
+          <Card title={`${t('repo.commits')}（${commitList.length}）`}>
+            {commitList.map((entry) => (
+              <div
+                key={entry.key}
+                style={styles.commitRow(selectedTarget === entry.key)}
+                onClick={() => { if (entry.sha !== null) void selectTarget(entry.sha) }}
+              >
+                <div style={styles.commitSubject}>{entry.subject}</div>
+                {entry.meta !== '' && <div style={styles.commitMeta}>{entry.meta}</div>}
+              </div>
+            ))}
+          </Card>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {selectedTarget === null && <Card><div style={styles.empty}>{t('detail.pick')}</div></Card>}
+          {selectedTarget !== null && detailLoading && <Card><div style={styles.empty}>{t('detail.aiLoading')}</div></Card>}
+          {selectedTarget !== null && !detailLoading && detail !== null && (
+            <>
+              <Card title={detailHeader ?? t('detail.title')}>
+                {detail.commit !== null && <div style={styles.commitMeta}>{detail.commit.author} · {new Date(detail.commit.date).toLocaleString()}</div>}
+                <div style={{ ...styles.badge('#2563eb'), margin: '6px 0' }}>
+                  {detail.files.length} {t('detail.files')} · +{detail.insertions}/-{detail.deletions}{detail.patchTruncated ? ' (truncated)' : ''}
+                </div>
+                {detail.analysis.what !== '' && (
+                  <>
+                    <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('detail.what')}</div>
+                    <div style={styles.what}>{detail.analysis.what}</div>
+                  </>
+                )}
+                {detail.analysis.logic.length > 0 && (
+                  <>
+                    <div style={styles.sectionTitle}>{t('detail.logic')}</div>
+                    {detail.analysis.logic.map((step, i) => (
+                      <div key={i} style={styles.logicStep}>
+                        <span style={{ color: 'var(--dsw-alias-brand-primary, #2563eb)', fontWeight: 600 }}>{i + 1}.</span>{step}
+                      </div>
+                    ))}
+                  </>
+                )}
+                {detail.analysis.risks.length > 0 && (
+                  <>
+                    <div style={{ ...styles.sectionTitle, marginTop: '6px' }}>{t('detail.risk')}</div>
+                    {detail.analysis.risks.map((risk, i) => <div key={i} style={styles.riskItem}>⚠ {risk}</div>)}
+                  </>
+                )}
+              </Card>
+              <Card title={t('detail.impact')}>
+                <button style={styles.button} disabled={impactLoading} onClick={() => { void loadImpact() }}>
+                  {impactLoading ? t('detail.impactLoading') : t('detail.impact')}
+                </button>
+                {impact !== null && (
+                  <>
+                    <div style={{ margin: '8px 0' }}>
+                      <span style={styles.badge(RISK_COLOR[impact.riskLevel] ?? '#8b8b8b')}>
+                        {t('impact.risk')}: {impact.riskLevel} ({impact.riskScore})
+                      </span>
+                    </div>
+                    <ImpactGraph data={impact} t={t} />
+                    {impact.levels.length === 0 && <div style={styles.empty}>{t('impact.none')}</div>}
+                    {impact.affectedTests.length > 0 && (
+                      <div style={styles.row}>
+                        <span><span style={styles.label}>{t('impact.tests')}</span>{impact.affectedTests.join(', ')}</span>
+                      </div>
+                    )}
+                  </>
+                )}
+              </Card>
+              <Card title={t('detail.optimality')}>
+                <button style={styles.button} disabled={reviewLoading} onClick={() => { void loadReview() }}>
+                  {reviewLoading ? t('detail.optimalityLoading') : t('detail.optimality')}
+                </button>
+                {review !== null && (
+                  <>
+                    {review.verdict !== '' && (
+                      <>
+                        <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('review.verdict')}</div>
+                        <div style={{ ...styles.what, background: 'rgba(37,99,235,0.05)', border: '1px solid rgba(37,99,235,0.2)', borderRadius: '6px', padding: '8px 10px' }}>{review.verdict}</div>
+                      </>
+                    )}
+                    <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('review.issues')}（{review.issuesFound}）</div>
+                    {review.issuesFound === 0
+                      ? <div style={styles.empty}>{t('review.clean')}</div>
+                      : <div style={styles.result}>{review.issues}</div>}
+                  </>
+                )}
+              </Card>
+              <Card title={t('detail.files')}>
+                <table style={styles.table}>
+                  <tbody>
+                    {detail.files.map((file) => (
+                      <tr key={file.path}>
+                        <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{file.path}</td>
+                        <td style={{ ...styles.td, color: '#2da44e', whiteSpace: 'nowrap' }}>+{file.adds}</td>
+                        <td style={{ ...styles.td, color: '#cf222e', whiteSpace: 'nowrap' }}>-{file.dels}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {detail.patch !== '' && (
+                  <div style={{ marginTop: '8px' }}>
+                    <button style={styles.secondary} onClick={() => { setShowPatch(!showPatch) }}>{t('detail.patch')}</button>
+                    {showPatch && <div style={{ ...styles.patch, marginTop: '8px' }}>{detail.patch}</div>}
+                  </div>
+                )}
+              </Card>
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  )
 
-      // ── 执行中心：提示 + 汇总 ──
-      tab === 'execution' && React.createElement(React.Fragment, null,
-        React.createElement(Card, null,
-          React.createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, t('exec.hint'))),
-        React.createElement(Card, null,
-          React.createElement('div', { style: styles.row },
-            React.createElement('span', null, React.createElement('span', { style: styles.label }, t('exec.attempts')), String(state?.attemptsCount ?? 0))),
-          runs.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('state.noRuns'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('thead', null, React.createElement('tr', null,
-                  ['exec.col.change', 'exec.col.status', 'exec.col.started', 'exec.col.cost'].map((key) =>
-                    React.createElement('th', { key, style: styles.th }, t(key)))),
-                ),
-                React.createElement('tbody', null, runs.map((run) => React.createElement('tr', { key: run.id },
-                  React.createElement('td', { style: styles.td }, run.changeId),
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(run.status === 'completed' ? '#4ec9b0' : '#dcdcaa') }, run.status)),
-                  React.createElement('td', { style: styles.td }, formatTime(run.startedAt)),
-                  React.createElement('td', { style: styles.td }, run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'),
-                ))),
-              )),
-      ),
+  // ── 项目总览页签 ──
+  const overviewTab = (
+    <>
+      <Card>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button style={styles.button} disabled={bootstrapping} onClick={() => { void runBootstrap() }}>
+            {bootstrapping ? t('action.running') : t('action.rescan')}
+          </button>
+          <button style={styles.secondary} disabled={busy !== null} onClick={() => { void runAction('analyze', '/project-control/api/analyze', {}) }}>
+            {busy === 'analyze' ? t('action.running') : t('action.analyze')}
+          </button>
+          <button style={styles.secondary} disabled={busy !== null} onClick={() => { void runAction('verify', '/project-control/api/verify', {}) }}>
+            {busy === 'verify' ? t('action.running') : t('action.verify')}
+          </button>
+        </div>
+      </Card>
+      {resultPanel}
+      {project === null ? (
+        <Card>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '6px' }}>{t('state.noProject')}</div>
+          <div style={styles.empty}>{t('state.noProjectHint')}</div>
+        </Card>
+      ) : (
+        <Card title={`${t('state.project')}：${project.name}`}>
+          <div style={styles.row}>
+            <span><span style={styles.label}>Root</span>{project.rootPath}</span>
+          </div>
+          {bootstrap !== null && (
+            <>
+              <div style={styles.row}>
+                <span><span style={styles.label}>{t('state.techStack')}</span>
+                  {bootstrap.techStack.map((tech) => <span key={tech} style={styles.badge('#4ec9b0')}>{tech}</span>)}
+                </span>
+              </div>
+              <div style={styles.row}>
+                <span><span style={styles.label}>{t('state.symbols')}</span>{String(bootstrap.symbolsCount)}</span>
+                <span><span style={styles.label}>{t('state.manifests')}</span>{String(bootstrap.manifestFiles.length)}</span>
+                <span><span style={styles.label}>{t('state.evidence')}</span>{String(state?.evidenceCount ?? 0)}</span>
+              </div>
+              <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '8px' }}>{bootstrap.summary}</div>
+            </>
+          )}
+        </Card>
+      )}
+      <Card title={t('confirmed.title')}>
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('confirmed.text')} value={confirmedText} onChange={(e) => { setConfirmedText(e.target.value) }} />
+          <input style={styles.input} placeholder={t('confirmed.paths')} value={confirmedPaths} onChange={(e) => { setConfirmedPaths(e.target.value) }} />
+          <button
+            style={styles.button}
+            disabled={busy !== null || confirmedText === ''}
+            onClick={() => { void runAction('addConfirmed', '/project-control/api/confirmed', { type: 'constraint', text: confirmedText, forbiddenPaths: confirmedPaths.split(',').map((path) => path.trim()).filter((path) => path !== '') }).then(() => { setConfirmedText(''); setConfirmedPaths('') }) }}
+          >{busy === 'addConfirmed' ? t('action.running') : t('confirmed.add')}</button>
+        </div>
+        {confirmed.length === 0 ? (
+          <div style={styles.empty}>{t('confirmed.none')}</div>
+        ) : (
+          <table style={styles.table}>
+            <tbody>
+              {confirmed.map((item) => (
+                <tr key={item.id}>
+                  <td style={styles.td}><span style={styles.badge('#c586c0')}>{item.type}</span></td>
+                  <td style={styles.td}>{item.text}</td>
+                  <td style={styles.td}>{item.forbiddenPaths.join(', ') || '—'}</td>
+                  <td style={styles.td}>
+                    <button
+                      style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                      onClick={() => { void runAction('removeConfirmed', '/project-control/api/confirmed/remove', { id: item.id }) }}
+                    >✕</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+      <Card title={t('action.createChange')}>
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('form.changeTitle')} value={changeTitle} onChange={(e) => { setChangeTitle(e.target.value) }} />
+          <input style={styles.input} placeholder={t('form.changeDesc')} value={changeDesc} onChange={(e) => { setChangeDesc(e.target.value) }} />
+          <button
+            style={styles.button}
+            disabled={busy !== null || changeTitle === ''}
+            onClick={() => { void runAction('createChange', '/project-control/api/changes', { title: changeTitle, description: changeDesc }).then(() => { setChangeTitle(''); setChangeDesc('') }) }}
+          >{busy === 'createChange' ? t('action.running') : t('action.createChange')}</button>
+        </div>
+        {changes.length === 0 ? (
+          <div style={styles.empty}>{t('state.noChanges')}</div>
+        ) : (
+          <table style={styles.table}>
+            <thead>
+              <tr>{['changes.col.title', 'changes.col.type', 'changes.col.status', 'changes.col.updated'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {changes.map((change) => (
+                <tr key={change.id}>
+                  <td style={styles.td}>{change.title}</td>
+                  <td style={styles.td}>{change.type}</td>
+                  <td style={styles.td}><span style={styles.badge(change.status === 'completed' ? '#4ec9b0' : '#569cd6')}>{change.status}</span></td>
+                  <td style={styles.td}>{formatTime(change.updatedAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </>
+  )
 
-      // ── 记忆与学习：记录表单 + 列表（含确认） + 学习概念 + Review/验收/证据 ──
-      tab === 'memory' && React.createElement(React.Fragment, null,
-        React.createElement(Card, { title: t('action.recordMemory') },
-          React.createElement('div', { style: styles.formRow },
-            React.createElement('input', { style: styles.input, placeholder: t('form.memoryTitle'), value: memoryTitle, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setMemoryTitle(e.target.value) } }),
-            React.createElement('input', { style: styles.input, placeholder: t('form.memoryContent'), value: memoryContent, onChange: (e: React.ChangeEvent<HTMLInputElement>) => { setMemoryContent(e.target.value) } }),
-            React.createElement('button', {
-              style: styles.button, disabled: busy !== null || memoryTitle === '' || memoryContent === '',
-              onClick: () => { void runAction('recordMemory', '/project-control/api/memory', { memoryType: 'project_log', title: memoryTitle, content: memoryContent }).then(() => { setMemoryTitle(''); setMemoryContent('') }) },
-            }, busy === 'recordMemory' ? t('action.running') : t('action.recordMemory')),
-          ),
-        ),
-        resultPanel,
-        React.createElement(Card, null,
-          memories.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('state.noMemories'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('thead', null, React.createElement('tr', null,
-                  ['memory.col.title', 'memory.col.type', 'memory.col.truth', 'memory.col.branch', 'memory.confirm'].map((key) =>
-                    React.createElement('th', { key, style: styles.th }, t(key)))),
-                ),
-                React.createElement('tbody', null, memories.map((memory) => React.createElement('tr', { key: memory.id },
-                  React.createElement('td', { style: styles.td }, memory.title),
-                  React.createElement('td', { style: styles.td }, memory.type),
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(memory.isHumanConfirmed ? '#4ec9b0' : '#dcdcaa') }, memory.isHumanConfirmed ? 'confirmed' : memory.truthLevel)),
-                  React.createElement('td', { style: styles.td }, memory.gitBranch ?? '—'),
-                  React.createElement('td', { style: styles.td }, memory.isHumanConfirmed
-                    ? React.createElement('span', { style: styles.badge('#4ec9b0') }, '✓')
-                    : React.createElement('button', {
-                        style: { ...styles.button, padding: '2px 8px', fontSize: '11px' },
-                        onClick: () => { void confirmMemory(memory.id) },
-                      }, t('memory.confirm'))),
-                ))),
-              )),
-        React.createElement(Card, { title: t('concepts.title') },
-          concepts.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('concepts.none'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('thead', null, React.createElement('tr', null,
-                  ['concepts.col.name', 'concepts.col.category', 'concepts.col.count'].map((key) =>
-                    React.createElement('th', { key, style: styles.th }, t(key)))),
-                ),
-                React.createElement('tbody', null, concepts.map((concept) => React.createElement('tr', { key: concept.id },
-                  React.createElement('td', { style: styles.td }, concept.name),
-                  React.createElement('td', { style: styles.td }, concept.category),
-                  React.createElement('td', { style: styles.td }, String(concept.occurrences)),
-                ))),
-              )),
-        React.createElement(Card, { title: t('review.issues') },
-          issues.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('review.noIssues'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('thead', null, React.createElement('tr', null,
-                  ['review.col.severity', 'review.col.title', 'review.col.status'].map((key) =>
-                    React.createElement('th', { key, style: styles.th }, t(key)))),
-                ),
-                React.createElement('tbody', null, issues.map((issue) => React.createElement('tr', { key: issue.id },
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(issue.severity === 'critical' || issue.severity === 'high' ? '#ce9178' : '#569cd6') }, issue.severity)),
-                  React.createElement('td', { style: styles.td }, issue.title),
-                  React.createElement('td', { style: styles.td }, issue.status),
-                ))),
-              )),
-        React.createElement(Card, { title: t('verify.records') },
-          verifications.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('verify.noRecords'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('tbody', null, verifications.map((record) => React.createElement('tr', { key: record.id },
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(record.status === 'passed' ? '#4ec9b0' : '#dcdcaa') }, record.status)),
-                  React.createElement('td', { style: styles.td }, record.name),
-                  React.createElement('td', { style: styles.td }, formatTime(record.createdAt)),
-                ))),
-              )),
-        React.createElement(Card, { title: t('evidence.recent') },
-          recentEvidence.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('state.noEvidence'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('tbody', null, recentEvidence.map((item) => React.createElement('tr', { key: item.id },
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge('#569cd6') }, item.source)),
-                  React.createElement('td', { style: styles.td }, item.locator),
-                  React.createElement('td', { style: styles.td }, formatTime(item.createdAt)),
-                ))),
-              )),
-      ),
+  // ── 执行中心页签 ──
+  const executionTab = (
+    <>
+      <Card>
+        <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('exec.hint')}</div>
+      </Card>
+      <Card>
+        <div style={styles.row}>
+          <span><span style={styles.label}>{t('exec.attempts')}</span>{String(state?.attemptsCount ?? 0)}</span>
+        </div>
+        {runs.length === 0 ? (
+          <div style={styles.empty}>{t('state.noRuns')}</div>
+        ) : (
+          <table style={styles.table}>
+            <thead>
+              <tr>{['exec.col.change', 'exec.col.status', 'exec.col.started', 'exec.col.cost'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {runs.map((run) => (
+                <tr key={run.id}>
+                  <td style={styles.td}>{run.changeId}</td>
+                  <td style={styles.td}><span style={styles.badge(run.status === 'completed' ? '#4ec9b0' : '#dcdcaa')}>{run.status}</span></td>
+                  <td style={styles.td}>{formatTime(run.startedAt)}</td>
+                  <td style={styles.td}>{run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </>
+  )
 
-      // ── 历史：扫描/续跑按钮 + Imported Change 列表 ──
-      tab === 'history' && React.createElement(React.Fragment, null,
-        React.createElement(Card, null,
-          React.createElement('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
-            React.createElement('button', {
-              style: styles.button, disabled: busy !== null,
-              onClick: () => { void runAction('scanHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30 }) },
-            }, busy === 'scanHistory' ? t('action.running') : t('action.scanHistory')),
-            React.createElement('button', {
-              style: styles.secondary, disabled: busy !== null,
-              onClick: () => { void runAction('continueHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30, resume: true }) },
-            }, busy === 'continueHistory' ? t('action.running') : t('history.continue')),
-          ),
-        ),
-        resultPanel,
-        React.createElement(Card, { title: t('history.imported') },
-          importedChanges.length === 0
-            ? React.createElement('div', { style: styles.empty }, t('history.noImported'))
-            : React.createElement('table', { style: styles.table },
-                React.createElement('thead', null, React.createElement('tr', null,
-                  ['history.col.title', 'history.col.commits', 'history.col.period', 'history.col.confidence', 'history.col.status'].map((key) =>
-                    React.createElement('th', { key, style: styles.th }, t(key)))),
-                ),
-                React.createElement('tbody', null, importedChanges.map((item) => React.createElement('tr', { key: item.id },
-                  React.createElement('td', { style: styles.td }, item.title),
-                  React.createElement('td', { style: styles.td }, String(item.commitCount)),
-                  React.createElement('td', { style: styles.td }, formatTime(item.firstCommitAt)),
-                  React.createElement('td', { style: styles.td }, String(item.confidence)),
-                  React.createElement('td', { style: styles.td }, React.createElement('span', { style: styles.badge(item.status === 'confirmed' ? '#4ec9b0' : '#dcdcaa') }, item.status)),
-                ))),
-              )),
-      ),
-    ),
+  // ── 笔记与记忆页签 ──
+  const notesTab = (
+    <>
+      <Card title={t('notes.title')}>
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('notes.formTitle')} value={noteTitle} onChange={(e) => { setNoteTitle(e.target.value) }} />
+          <input style={styles.input} placeholder={t('notes.formContent')} value={noteContent} onChange={(e) => { setNoteContent(e.target.value) }} />
+          {selectedTarget !== null && (
+            <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+              {t('notes.boundTo')}: {selectedTarget === 'working' ? t('repo.working') : selectedTarget.slice(0, 8)}
+            </div>
+          )}
+          <button style={styles.button} disabled={noteTitle.trim() === '' || noteContent.trim() === ''} onClick={() => { void addNote() }}>{t('notes.add')}</button>
+        </div>
+        {notes.length === 0 ? (
+          <div style={styles.empty}>{t('notes.empty')}</div>
+        ) : (
+          <table style={styles.table}>
+            <thead>
+              <tr>{['notes.col.time', 'notes.col.title', 'notes.col.content', 'notes.col.sha', ''].map((key, i) => <th key={i} style={styles.th}>{key === '' ? '' : t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {notes.map((note) => (
+                <tr key={note.id}>
+                  <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>{new Date(note.createdAt).toLocaleString()}</td>
+                  <td style={styles.td}>{note.title}</td>
+                  <td style={styles.td}>{note.content}</td>
+                  <td style={styles.td}>{note.sha === undefined ? '—' : note.sha === 'working' ? t('repo.working') : note.sha.slice(0, 8)}</td>
+                  <td style={styles.td}>
+                    <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void removeNote(note.id) }}>✕</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+      <Card title={t('memory.record')}>
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('form.memoryTitle')} value={memoryTitle} onChange={(e) => { setMemoryTitle(e.target.value) }} />
+          <input style={styles.input} placeholder={t('form.memoryContent')} value={memoryContent} onChange={(e) => { setMemoryContent(e.target.value) }} />
+          <button
+            style={styles.button}
+            disabled={busy !== null || memoryTitle === '' || memoryContent === ''}
+            onClick={() => { void runAction('recordMemory', '/project-control/api/memory', { memoryType: 'project_log', title: memoryTitle, content: memoryContent }).then(() => { setMemoryTitle(''); setMemoryContent('') }) }}
+          >{busy === 'recordMemory' ? t('action.running') : t('memory.record')}</button>
+        </div>
+        {memories.length === 0 ? (
+          <div style={styles.empty}>{t('memory.empty')}</div>
+        ) : (
+          <table style={styles.table}>
+            <thead>
+              <tr>{['memory.col.title', 'memory.col.type', 'memory.col.truth', 'memory.col.branch', 'memory.confirm'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {memories.map((memory) => (
+                <tr key={memory.id}>
+                  <td style={styles.td}>{memory.title}</td>
+                  <td style={styles.td}>{memory.type}</td>
+                  <td style={styles.td}><span style={styles.badge(memory.isHumanConfirmed ? '#4ec9b0' : '#dcdcaa')}>{memory.isHumanConfirmed ? 'confirmed' : memory.truthLevel}</span></td>
+                  <td style={styles.td}>{memory.gitBranch ?? '—'}</td>
+                  <td style={styles.td}>
+                    {memory.isHumanConfirmed
+                      ? <span style={styles.badge('#4ec9b0')}>✓</span>
+                      : <button style={{ ...styles.button, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void confirmMemory(memory.id) }}>{t('memory.confirm')}</button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+      <Card title={t('concepts.title')}>
+        {concepts.length === 0 ? (
+          <div style={styles.empty}>{t('concepts.none')}</div>
+        ) : (
+          <table style={styles.table}>
+            <thead>
+              <tr>{['concepts.col.name', 'concepts.col.category', 'concepts.col.count'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {concepts.map((concept) => (
+                <tr key={concept.id}>
+                  <td style={styles.td}>{concept.name}</td>
+                  <td style={styles.td}>{concept.category}</td>
+                  <td style={styles.td}>{String(concept.occurrences)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+      <Card title={t('review.recordsTitle')}>
+        {issues.length === 0 ? (
+          <div style={styles.empty}>—</div>
+        ) : (
+          <table style={styles.table}>
+            <tbody>
+              {issues.slice(0, 20).map((issue) => (
+                <tr key={issue.id}>
+                  <td style={styles.td}><span style={styles.badge(issue.severity === 'critical' || issue.severity === 'high' ? '#ce9178' : '#569cd6')}>{issue.severity}</span></td>
+                  <td style={styles.td}>{issue.title}</td>
+                  <td style={styles.td}>{issue.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+      <Card title={t('verify.records')}>
+        {verifications.length === 0 ? (
+          <div style={styles.empty}>—</div>
+        ) : (
+          <table style={styles.table}>
+            <tbody>
+              {verifications.slice(0, 20).map((record) => (
+                <tr key={record.id}>
+                  <td style={styles.td}><span style={styles.badge(record.status === 'passed' ? '#4ec9b0' : '#dcdcaa')}>{record.status}</span></td>
+                  <td style={styles.td}>{record.name}</td>
+                  <td style={styles.td}>{formatTime(record.createdAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </>
+  )
+
+  return (
+    <div style={styles.root} data-testid="project-control-workspace">
+      <style>{LAYOUT_STYLE}</style>
+      <div
+        data-testid="project-control-divider"
+        onPointerDown={onDividerDown}
+        style={{
+          position: 'absolute', top: 0, bottom: 0, right: -4, width: 8,
+          cursor: 'col-resize', zIndex: 20,
+        }}
+      />
+      <div style={styles.nav}>
+        <span style={styles.title}>{t('workspace.title')}</span>
+        {tabs.map((entry) => (
+          <button key={entry.key} style={styles.tab(tab === entry.key)} onClick={() => { setTab(entry.key) }}>{entry.label}</button>
+        ))}
+      </div>
+      <div style={styles.body}>
+        {loadError !== null && <div style={styles.empty}>{t('error.load')}: {loadError}</div>}
+        {state?.ready === false && <div style={styles.empty}>{state.reason ?? ''}</div>}
+        {tab === 'commits' && commitsTab}
+        {tab === 'overview' && overviewTab}
+        {tab === 'execution' && executionTab}
+        {tab === 'notes' && notesTab}
+      </div>
+    </div>
   )
 }

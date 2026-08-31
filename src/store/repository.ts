@@ -123,10 +123,44 @@ export function createInMemoryStore(): ProjectControlStore {
     attempts: new DomainRepository<AttemptRecord, AttemptId>(createMemoryKvTable<AttemptRecord>()),
     checkpoints: new DomainRepository<ProjectBootstrapCheckpoint, string>(createMemoryKvTable<ProjectBootstrapCheckpoint>()),
     importedChanges: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
+    historyCursor: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
+    confirmed: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     evidence: new DomainRepository<EvidenceRecord, EvidenceId>(createMemoryKvTable<EvidenceRecord>()),
     issues: new DomainRepository<ReviewIssueRecord, IssueId>(createMemoryKvTable<ReviewIssueRecord>()),
     verifications: new DomainRepository<VerificationRecord, VerificationId>(createMemoryKvTable<VerificationRecord>()),
     memories: new DomainRepository<MemoryRecord, MemoryId>(createMemoryKvTable<MemoryRecord>()),
     concepts: new DomainRepository<any, any>(createMemoryKvTable<any>()),
+    notes: new DomainRepository<ProjectNoteRecord, string>(createMemoryKvTable<ProjectNoteRecord>()),
   }
+}
+
+/** 用户/代理批注的一条笔记（可关联某次提交或工作区改动）。 */
+export interface ProjectNoteRecord {
+  id: string
+  projectId: string
+  /** 关联的提交 SHA；'working' 表示未提交改动；undefined 表示纯项目级笔记。 */
+  sha?: string
+  title: string
+  content: string
+  createdAt: number
+}
+
+/** Project Control 系统的完整存储仓储聚合接口。 */
+export interface ProjectControlStore {
+  projects: DomainRepository<ProjectRecord, ProjectId>
+  changes: DomainRepository<ChangeRecord, ChangeId>
+  plans: DomainRepository<PlanRecord, PlanId>
+  runs: DomainRepository<RunRecord, RunId>
+  steps: DomainRepository<StepRecord, StepId>
+  attempts: DomainRepository<AttemptRecord, AttemptId>
+  checkpoints: DomainRepository<ProjectBootstrapCheckpoint, string>
+  importedChanges: DomainRepository<Record<string, unknown>, string>
+  historyCursor: DomainRepository<Record<string, unknown>, string>
+  confirmed: DomainRepository<Record<string, unknown>, string>
+  evidence: DomainRepository<EvidenceRecord, EvidenceId>
+  issues: DomainRepository<ReviewIssueRecord, IssueId>
+  verifications: DomainRepository<VerificationRecord, VerificationId>
+  memories: DomainRepository<MemoryRecord, MemoryId>
+  concepts: DomainRepository<any, any>
+  notes: DomainRepository<ProjectNoteRecord, string>
 }

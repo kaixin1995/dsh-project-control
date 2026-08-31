@@ -86,9 +86,72 @@ function trustFence(req: IncomingMessage, res: ServerResponse): number | undefin
   return undefined
 }
 
+/** 统一路径分隔符为 POSIX 风格（git 输出在 Windows 上已是 /，防御性归一）。 */
+function normalizePath(path: string): string {
+  return path.trim().replace(/\\/g, '/')
+}
+
+/** 解析 `git diff --numstat` 输出为逐文件增删行数（二进制文件计 0）。 */
+function parseNumstat(raw: string): Array<{ path: string; adds: number; dels: number }> {
+  const files: Array<{ path: string; adds: number; dels: number }> = []
+  for (const line of raw.split('\n')) {
+    const parts = line.split('\t').map((part) => part.trim())
+    if (parts.length < 3 || parts[0] === undefined || parts[1] === undefined || parts[2] === undefined) continue
+    if (!/^\d+$|^-$/.test(parts[0]) || !/^\d+$|^-$/.test(parts[1])) continue
+    files.push({
+      path: parts[2],
+      adds: parts[0] === '-' ? 0 : Number(parts[0]),
+      dels: parts[1] === '-' ? 0 : Number(parts[1]),
+    })
+  }
+  return files
+}
+
+/**
+ * 变更文件的引用检索 token：取去扩展名的文件基名（foo.tsx → foo）。
+ * 过短（<3 字符）或纯数字的 token 无法可靠 grep，返回 undefined 跳过。
+ */
+function importTokenOf(filePath: string): string | undefined {
+  const base = filePath.split('/').pop() ?? filePath
+  const stem = base.replace(/\.[^.]+$/, '')
+  return stem.length >= 3 && /\D/.test(stem) ? stem : undefined
+}
+
+/** /commit-detail 的 LLM 解读结果。 */
+export interface CommitAnalysis {
+  what: string
+  logic: string[]
+  risks: string[]
+}
+
+/** 宽松解析 LLM 的 WHAT/LOGIC/RISK 结构化输出；缺段时降级为原文。 */
+function parseCommitAnalysis(text: string): CommitAnalysis {
+  const whatMatch = text.match(/WHAT[:：]\s*(.+)/)
+  const riskMatch = text.match(/RISK[:：]\s*([\s\S]*)/)
+  const logicBlock = text.slice(
+    text.search(/LOGIC[:：]/) === -1 ? 0 : text.search(/LOGIC[:：]/) + 6,
+    riskMatch !== null ? riskMatch.index : text.length,
+  )
+  const logic = logicBlock
+    .split('\n')
+    .map((line) => line.replace(/^\s*\d+[.、)]\s*/, '').trim())
+    .filter((line) => line !== '' && !/^(WHAT|LOGIC|RISK)[:：]/.test(line))
+  const risks = (riskMatch?.[1] ?? '')
+    .split(/[；;\n]/)
+    .map((part) => part.replace(/^RISK[:：]\s*/, '').trim())
+    .filter((part) => part !== '' && part !== '无')
+  return {
+    what: whatMatch?.[1]?.trim() ?? text.trim().slice(0, 500),
+    logic: logic.slice(0, 10),
+    risks: risks.slice(0, 5),
+  }
+}
+
+/** /commit-detail 解读缓存：key = root|sha|diffHash，LRU 上限 40 条（进程内）。 */
+const commitAnalysisCache = new Map<string, CommitAnalysis>()
+
 /** 读取请求体（JSON，≤1 MiB）。 */
-function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {  return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer) => {
@@ -588,10 +651,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
-            const diff = await service.git.getDiff(cwd)
+            const reviewSha = typeof body['sha'] === 'string' && body['sha'] !== '' && body['sha'] !== 'working'
+              ? body['sha'] : undefined
+            const diff = reviewSha !== undefined
+              ? await service.git.getDiff(cwd, { from: `${reviewSha}^`, to: reviewSha, maxBytes: 200 * 1024 })
+              : await service.git.getDiff(cwd)
             if (diff.filesChanged === 0) {
               res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ issuesFound: 0, issues: '工作区无改动，无可评审内容。' }))
+              res.end(JSON.stringify({ issuesFound: 0, issues: reviewSha !== undefined ? '该提交无差异内容。' : '工作区无改动，无可评审内容。', verdict: '' }))
               return
             }
             const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
@@ -601,6 +668,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 'You are an independent code reviewer. Review the diff below for correctness, error handling, concurrency, resource leaks, security, and over-reach.',
                 'Answer with one issue per line in the exact format: SEVERITY | category | title | evidence location | suggested fix',
                 'SEVERITY is one of critical/high/medium/low/info. If the diff is clean, answer exactly: CLEAN',
+                'After the issues (or CLEAN), always append one final line:',
+                'OPTIMALITY: <用中文 1-3 句评价：该改动是否侵入式最小、是否最优实现；若有明显更优方案请指出>',
                 '',
                 'Diff:',
                 diff.patch,
@@ -611,7 +680,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               timeoutMs: service.liveConfig.analysisTimeoutMs,
               purpose: 'project-control-review',
             })
-            const lines = analysis.text.split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
+            const verdictMatch = analysis.text.match(/OPTIMALITY[:：]\s*([\s\S]*)/)
+            const verdict = verdictMatch?.[1]?.trim() ?? ''
+            const lines = analysis.text.slice(0, verdictMatch?.index ?? analysis.text.length)
+              .split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
             if (changeId !== undefined && changeId !== '') {
               const change = service.store.changes.get(changeId as never)
               if (change !== undefined) {
@@ -632,7 +704,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               }
             }
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ issuesFound: lines.length, issues: analysis.text }))
+            res.end(JSON.stringify({ issuesFound: lines.length, issues: analysis.text, verdict }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -775,6 +847,292 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 affectedTests: impact.affectedTests.slice(0, 20),
               },
             }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 提交列表（含未提交工作区改动）——提交核查台主数据源。
+        if (req.method === 'GET' && routePath === '/commits') {
+          try {
+            const query: Record<string, unknown> = {}
+            for (const [key, value] of url.searchParams.entries()) query[key] = value
+            const project = await adoptProject(service, query)
+            const cwd = project?.identity?.rootPath
+            if (cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const limitRaw = Number(query['limit'] ?? 50)
+            const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.trunc(limitRaw))) : 50
+            const status = await service.git.getStatus(cwd)
+            const raw = await service.git.runGit(
+              ['log', '-n', String(limit), '--date-order', '--format=%H%x1f%h%x1f%an%x1f%at%x1f%s%x1e', '--numstat'],
+              cwd,
+            )
+            const commits: Array<Record<string, unknown>> = []
+            let current: Record<string, unknown> | undefined
+            for (const line of raw.split('\n')) {
+              if (line.includes('\x1f')) {
+                const [hash, shortHash, authorName, dateStr, subject] = line.split('\x1e')[0]!.split('\x1f')
+                current = {
+                  sha: hash?.trim() ?? '',
+                  shortHash: shortHash?.trim() ?? '',
+                  author: authorName?.trim() ?? '',
+                  date: Number(dateStr ?? 0) * 1000,
+                  subject: subject?.trim() ?? '',
+                  files: [] as Array<{ path: string; adds: number; dels: number }>,
+                }
+                commits.push(current)
+                continue
+              }
+              const numstat = line.split('\t').map((part) => part.trim())
+              if (current !== undefined && numstat.length >= 3 && numstat[0] !== undefined && numstat[1] !== undefined && numstat[2] !== undefined) {
+                current.files.push({
+                  path: numstat[2],
+                  adds: numstat[0] === '-' ? 0 : Number(numstat[0]),
+                  dels: numstat[1] === '-' ? 0 : Number(numstat[1]),
+                })
+              }
+            }
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              rootPath: cwd,
+              branch: status.branch ?? null,
+              headSha: status.headSha ?? null,
+              working: {
+                fileCount: status.entries.length,
+                isClean: status.isClean,
+                files: status.entries.slice(0, 40).map((entry) => ({ path: entry.path, status: entry.status })),
+              },
+              commits,
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 单次提交/未提交改动的核查详情：文件清单 + 补丁 + LLM 解读（改了什么/实现逻辑/风险）。
+        if (req.method === 'POST' && routePath === '/commit-detail') {
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const cwd = project?.identity?.rootPath
+            if (cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const sha = typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : 'working'
+            const isWorking = sha === 'working'
+            const rangeArgs = isWorking ? ['HEAD'] : [`${sha}^..${sha}`]
+            let numstatRaw: string
+            try {
+              numstatRaw = await service.git.runGit(['diff', '--no-color', '--numstat', ...rangeArgs], cwd)
+            } catch {
+              // 根提交没有父提交：与空树比对。
+              numstatRaw = await service.git.runGit(
+                ['diff', '--no-color', '--numstat', isWorking ? 'HEAD' : `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${sha}`],
+                cwd,
+              )
+            }
+            const files = parseNumstat(numstatRaw)
+            const insertions = files.reduce((sum, file) => sum + file.adds, 0)
+            const deletions = files.reduce((sum, file) => sum + file.dels, 0)
+            const diff = isWorking
+              ? await service.git.getDiff(cwd, { from: 'HEAD', maxBytes: 200 * 1024 })
+              : await service.git.getDiff(cwd, { from: `${sha}^`, to: sha, maxBytes: 200 * 1024 })
+            let commitMeta: { message: string; author: string; date: number } | undefined
+            if (!isWorking) {
+              const show = await service.git.runGit(['show', '-s', '--format=%an%x1f%at%x1f%s', sha], cwd).catch(() => '')
+              const [author, dateStr, subject] = show.trim().split('\x1f')
+              commitMeta = { author: author ?? '', date: Number(dateStr ?? 0) * 1000, message: subject ?? '' }
+            }
+
+            const cacheKey = `${cwd}|${sha}|${diff.diffHash}`
+            const cached = commitAnalysisCache.get(cacheKey)
+            let analysis: CommitAnalysis
+            if (cached !== undefined) {
+              analysis = cached
+            } else {
+              const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+              const llm = await runLlmAnalysis(ctx, {
+                prompt: [
+                  'You are explaining a git change to a senior developer who must review AI-written code.',
+                  'Answer in Chinese, STRICTLY in this format (no extra text):',
+                  'WHAT: <2-3 句话说明这次改动做了什么>',
+                  'LOGIC:',
+                  '1. <实现逻辑步骤>',
+                  '2. <实现逻辑步骤>',
+                  'RISK: <最多 3 条潜在风险/注意点，用「；」分隔；没有就写「无»',
+                  '',
+                  `Changed files: ${files.map((file) => file.path).join(', ')}`,
+                  '',
+                  'Diff:',
+                  diff.patch.slice(0, 60_000),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-commit-detail',
+              })
+              analysis = parseCommitAnalysis(llm.text)
+              commitAnalysisCache.set(cacheKey, analysis)
+              if (commitAnalysisCache.size > 40) {
+                commitAnalysisCache.delete(commitAnalysisCache.keys().next().value as string)
+              }
+            }
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              sha, isWorking, files, insertions, deletions,
+              patchTruncated: diff.isTruncated,
+              patch: diff.patch,
+              commit: commitMeta ?? null,
+              analysis,
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 变更级三级影响范围（直接/间接/潜在 + 风险等级），供工作台影响图渲染。
+        if (req.method === 'POST' && routePath === '/impact-scope') {
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const cwd = project?.identity?.rootPath
+            if (cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const sha = typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : 'working'
+            const isWorking = sha === 'working'
+            const rangeArgs = isWorking ? ['HEAD'] : [`${sha}^..${sha}`]
+            let numstatRaw: string
+            try {
+              numstatRaw = await service.git.runGit(['diff', '--no-color', '--numstat', ...rangeArgs], cwd)
+            } catch {
+              numstatRaw = await service.git.runGit(
+                ['diff', '--no-color', '--numstat', isWorking ? 'HEAD' : `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${sha}`],
+                cwd,
+              )
+            }
+            const changedFiles = parseNumstat(numstatRaw).map((file) => normalizePath(file.path))
+            const graph = new ProjectGraph()
+            for (const file of changedFiles.slice(0, 20)) {
+              graph.addNode({ id: file, type: 'file', label: file, filePath: file })
+            }
+            // 反向引用扫描：谁引用了变更文件（1 跳）与引用者的引用者（2 跳，供间接层）。
+            const scanned = new Set<string>()
+            let hops: string[][] = [changedFiles.slice(0, 20)]
+            for (let depth = 0; depth < 2; depth += 1) {
+              const nextHop: string[] = []
+              for (const target of hops[depth] ?? []) {
+                if (scanned.has(target) || scanned.size > 40) continue
+                scanned.add(target)
+                const token = importTokenOf(target)
+                if (token === undefined) continue
+                const matches = await service.git.runGit(['grep', '-l', '-F', token, '--', '.'], cwd)
+                  .then((out) => out.split('\n').map(normalizePath).filter((p) => p !== '' && !changedFiles.includes(p)).slice(0, 60))
+                  .catch(() => [] as string[])
+                for (const importer of matches) {
+                  if (importer === target) continue
+                  graph.addNode({ id: importer, type: 'file', label: importer, filePath: importer })
+                  graph.addEdge({ source: importer, target, type: 'references', evidenceId: undefined })
+                  if (!nextHop.includes(importer)) nextHop.push(importer)
+                }
+              }
+              hops.push(nextHop.slice(0, 12))
+            }
+            const impact = new ImpactEngine().computeImpact(changedFiles, graph)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              changedFiles,
+              riskLevel: impact.riskLevel,
+              riskScore: impact.riskScore,
+              levels: impact.impactedItems
+                .filter((item) => item.level !== 'direct')
+                .map((item) => ({
+                  level: item.level,
+                  depth: item.depth,
+                  path: item.node.filePath ?? item.node.id,
+                  confidence: Number(item.confidence.toFixed(2)),
+                  reason: item.reason,
+                }))
+                .slice(0, 80),
+              direct: impact.impactedItems.filter((item) => item.level === 'direct').map((item) => item.node.filePath ?? item.node.id),
+              affectedTests: impact.affectedTests.slice(0, 20),
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 笔记：人工/AI 的核查批注，可关联提交。
+        if (req.method === 'GET' && routePath === '/notes') {
+          const notes = (service.store?.notes?.list() ?? [])
+            .sort((left, right) => right.createdAt - left.createdAt)
+            .slice(0, 200)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ notes }))
+          return
+        }
+        if (req.method === 'POST' && routePath === '/notes') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const title = typeof body['title'] === 'string' ? body['title'].trim() : ''
+            const content = typeof body['content'] === 'string' ? body['content'].trim() : ''
+            if (title === '' || content === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'title and content are required' }))
+              return
+            }
+            const note = {
+              id: `note_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+              projectId: project?.id ?? 'prj_ad_hoc',
+              sha: typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : undefined,
+              title,
+              content,
+              createdAt: Date.now(),
+            }
+            await service.store.notes.save(note)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, id: note.id }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'POST' && routePath === '/notes/delete') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const removed = id === '' ? false : await service.store.notes.delete(id)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: removed }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))

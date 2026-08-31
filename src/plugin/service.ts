@@ -7,7 +7,7 @@
 
 import z from '@deepseek-ai/schemastery'
 import { coreDomainSpec, analysisDomainSpec, historyDomainSpec } from '../store/domains.ts'
-import { DomainRepository, createInMemoryStore, type ProjectControlStore } from '../store/repository.ts'
+import { DomainRepository, createInMemoryStore, type ProjectControlStore, type ProjectNoteRecord } from '../store/repository.ts'
 import type {
   ProjectRecord,
   ChangeRecord,
@@ -100,6 +100,7 @@ export class ProjectControlService {
       importedChanges: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('imported_changes')),
       historyCursor: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('history_cursor')),
       confirmed: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('confirmed')),
+      notes: new DomainRepository<ProjectNoteRecord>(this.coreDomainHandle.table('notes')),
       evidence: new DomainRepository<EvidenceRecord>(this.analysisDomainHandle.table('evidence')),
       issues: new DomainRepository<ReviewIssueRecord>(this.historyDomainHandle.table('issues')),
       verifications: new DomainRepository<VerificationRecord>(this.historyDomainHandle.table('verifications')),
