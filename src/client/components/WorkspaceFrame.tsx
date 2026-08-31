@@ -67,11 +67,22 @@ interface CommitDetailPayload {
 
 interface ImpactScopePayload {
   changedFiles: string[]
+  shas?: string[]
   riskLevel: 'low' | 'medium' | 'high' | 'critical'
   riskScore: number
+  riskFactors?: Array<{ text: string; points: number }>
+  keyChangePoints?: string[]
+  memories?: Array<{ title: string; type: string }>
   levels: Array<{ level: string; depth: number; path: string; confidence: number; reason: string }>
   direct: string[]
   affectedTests: string[]
+}
+
+export interface ReviewPayload {
+  issuesFound: number
+  issues: string
+  verdict: string
+  issueList?: Array<{ severity: string; category: string; title: string; evidence: string; fix: string }>
 }
 
 interface NoteEntry {
@@ -175,6 +186,30 @@ export const WORKSPACE_DICT = {
     'repo.workingClean': '工作区干净，无未提交改动',
     'repo.empty': '暂无提交。',
     'repo.loadFailed': '提交加载失败',
+    'picker.title': '选择要核查的提交（可多选）',
+    'picker.placeholder': '点击选择提交（可多选，含未提交改动）',
+    'picker.selected': '已选',
+    'picker.filter': '按标题/哈希/作者过滤…',
+    'picker.clear': '清空',
+    'picker.noMatch': '无匹配提交。',
+    'picker.hint': '勾选提交后自动生成 AI 解读；下方可再跑影响范围与最优性核查。',
+    'impact.factors': '风险构成（为什么是这个等级）',
+    'impact.points': '影响点明细',
+    'impact.keyPoints': '关键组件',
+    'impact.memory': '结合项目记忆核查',
+    'impact.col.level': '层级',
+    'impact.col.path': '文件',
+    'impact.col.depth': '深度',
+    'impact.col.conf': '置信度',
+    'impact.col.chain': '引用链',
+    'review.col.severity': '级别',
+    'review.col.category': '类别',
+    'review.col.title': '问题',
+    'review.col.evidence': '位置',
+    'review.col.fix': '建议修复',
+    'review.hint': '点击上方按钮开始核查，产出最优性结论与问题清单。',
+    'diff.show': '对比',
+    'diff.hide': '收起差异',
 
     'detail.title': '核查详情',
     'detail.pick': '← 从左侧选择一次提交（或未提交改动）开始核查',
@@ -287,6 +322,30 @@ export const WORKSPACE_DICT = {
     'repo.workingClean': 'Working tree is clean',
     'repo.empty': 'No commits.',
     'repo.loadFailed': 'Failed to load commits',
+    'picker.title': 'Pick commits to review (multi-select)',
+    'picker.placeholder': 'Click to pick commits (multi-select, includes uncommitted)',
+    'picker.selected': 'Selected',
+    'picker.filter': 'Filter by title/hash/author…',
+    'picker.clear': 'Clear',
+    'picker.noMatch': 'No matching commit.',
+    'picker.hint': 'Checking a commit generates its AI explanation; run impact and optimality below.',
+    'impact.factors': 'Risk factors (why this level)',
+    'impact.points': 'Impacted points',
+    'impact.keyPoints': 'Key components',
+    'impact.memory': 'Cross-check with project memory',
+    'impact.col.level': 'Level',
+    'impact.col.path': 'File',
+    'impact.col.depth': 'Depth',
+    'impact.col.conf': 'Conf.',
+    'impact.col.chain': 'Reference chain',
+    'review.col.severity': 'Severity',
+    'review.col.category': 'Category',
+    'review.col.title': 'Issue',
+    'review.col.evidence': 'Location',
+    'review.col.fix': 'Suggested fix',
+    'review.hint': 'Click the button above to produce the optimality verdict and issue list.',
+    'diff.show': 'Diff',
+    'diff.hide': 'Hide diff',
 
     'detail.title': 'Review detail',
     'detail.pick': '← Pick a commit (or the uncommitted changes) on the left to start reviewing',
@@ -479,70 +538,131 @@ const RISK_COLOR: Record<string, string> = { low: '#4ec9b0', medium: '#dcdcaa', 
 /**
  * 影响范围 SVG 流程图：三列分层（变更 → 间接引用链 → 潜在），
  * 依据 /impact-scope 返回的 levels（含传播链 reason）绘制连线。
+ * 全宽画布（viewBox 1000），节点带目录提示，深度越深颜色越浅。
  */
 function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => string }) {
   const { data } = props
   const indirect = data.levels.filter((item) => item.level === 'indirect')
   const potential = data.levels.filter((item) => item.level === 'potential')
-  const col0 = data.changedFiles.slice(0, 6)
-  const col1 = Array.from(new Set(indirect.map((item) => item.path))).slice(0, 8)
-  const col2 = Array.from(new Set(potential.map((item) => item.path))).filter((p) => !col1.includes(p)).slice(0, 6)
-  const nodeH = 24
-  const gap = 8
-  const colX = [12, 252, 492]
-  const colW = 216
+  const col0 = data.changedFiles.slice(0, 7)
+  const col1 = Array.from(new Set(indirect.map((item) => item.path))).slice(0, 9)
+  const col2 = Array.from(new Set(potential.map((item) => item.path))).filter((p) => !col1.includes(p)).slice(0, 8)
+  const nodeH = 30
+  const gap = 10
+  const colX = [30, 380, 720]
+  const colW = 280
   const rows = Math.max(col0.length, col1.length, col2.length, 1)
-  const height = rows * (nodeH + gap) + 46
-  const yOf = (col: number, index: number): number => 34 + index * (nodeH + gap)
+  const height = rows * (nodeH + gap) + 60
 
-  const columnName = [props.t('impact.col.changed'), props.t('impact.col.indirect'), props.t('impact.col.potential')]
+  const depthOf = (path: string): number => {
+    const item = indirect.find((entry) => entry.path === path) ?? potential.find((entry) => entry.path === path)
+    return item?.depth ?? 0
+  }
+
+  const renderCol = (col: number, items: string[], color: string): React.ReactNode[] => items.map((path, index) => {
+    const y = 44 + index * (nodeH + gap)
+    const dim = col > 0 ? Math.min(0.55, 0.18 + depthOf(path) * 0.12) : 0.1
+    const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
+    return React.createElement('g', { key: `${col}-${path}` },
+      React.createElement('rect', { x: colX[col], y, width: colW, height: nodeH, rx: 6, fill: `${color}${Math.round((1 - dim) * 255).toString(16).padStart(2, '0')}`, stroke: color, strokeWidth: 1.4 }),
+      React.createElement('text', { x: colX[col] + 10, y: y + 14, fontSize: 11, fontWeight: 600, fill: 'var(--dsw-alias-label-primary, #1f2328)' },
+        (path.split('/').pop() ?? path).slice(0, 30)),
+      React.createElement('text', { x: colX[col] + 10, y: y + 26, fontSize: 9, fill: 'var(--dsw-alias-label-tertiary, #8b8b8b)' },
+        dir.slice(0, 38)),
+      React.createElement('title', null, path),
+    )
+  })
 
   const chainStart = (reason: string): string => {
     const match = reason.match(/path: (.+)$/)
     if (match === null) return data.changedFiles[0] ?? ''
     return match[1]!.split(' -> ')[0] ?? data.changedFiles[0] ?? ''
   }
-  const findPos = (path: string): { col: number; index: number } | undefined => {
-    if (col0.includes(path)) return { col: 0, index: col0.indexOf(path) }
-    if (col1.includes(path)) return { col: 1, index: col1.indexOf(path) }
-    if (col2.includes(path)) return { col: 2, index: col2.indexOf(path) }
-    return undefined
+  const indexIn = (items: string[], path: string): number => items.indexOf(path)
+  const colOf = (path: string): number => {
+    if (col0.includes(path)) return 0
+    if (col1.includes(path)) return 1
+    if (col2.includes(path)) return 2
+    return -1
   }
-  const renderCol = (col: number, items: string[], color: string): React.ReactNode[] => items.map((path, index) => React.createElement(
-    'g',
-    { key: `${col}-${path}` },
-    React.createElement('rect', { x: colX[col], y: yOf(col, index), width: colW, height: nodeH, rx: 5, fill: `${color}1a`, stroke: color, strokeWidth: 1 }),
-    React.createElement('text', { x: colX[col] + 8, y: yOf(col, index) + 16, fontSize: 10, fill: 'var(--dsw-alias-label-primary, #1f2328)' },
-      path.split('/').pop()?.slice(0, 26)),
-    React.createElement('title', null, path),
-  ))
+
+  const edges: React.ReactNode[] = []
+  const pushEdge = (fromPath: string, toPath: string, color: string, key: string): void => {
+    const fromCol = colOf(fromPath)
+    const toCol = colOf(toPath)
+    if (fromCol === -1 || toCol === -1 || toCol <= fromCol) return
+    const x1 = colX[fromCol] + colW
+    const y1 = 44 + indexIn([col0, col1, col2][fromCol] ?? [], fromPath) * (nodeH + gap) + nodeH / 2
+    const x2 = colX[toCol]
+    const y2 = 44 + indexIn([col0, col1, col2][toCol] ?? [], toPath) * (nodeH + gap) + nodeH / 2
+    edges.push(React.createElement('path', {
+      key, d: `M ${x1} ${y1} C ${x1 + 30} ${y1}, ${x2 - 30} ${y2}, ${x2} ${y2}`,
+      fill: 'none', stroke: color, strokeWidth: 1.6, opacity: 0.6,
+    }))
+  }
+  for (const item of indirect.slice(0, 20)) pushEdge(chainStart(item.reason), item.path, '#d97706', `ei-${item.path}`)
+  for (const item of potential.slice(0, 16)) pushEdge(chainStart(item.reason), item.path, '#8b8b8b', `ep-${item.path}`)
 
   return React.createElement('div', null,
-    React.createElement('svg', { width: '100%', viewBox: `0 0 724 ${height}`, style: { maxHeight: 340 } },
-      columnName.map((name, col) => React.createElement('text', { key: `h${col}`, x: colX[col], y: 18, fontSize: 11, fontWeight: 600, fill: 'var(--dsw-alias-label-secondary, #6b7280)' }, name)),
+    React.createElement('svg', { width: '100%', viewBox: `0 0 1024 ${height}`, style: { maxHeight: 480 } },
+      [['变更文件', 0], ['间接影响（谁引用了它）', 1], ['潜在影响（二级传播）', 2]].map(([name, col]) =>
+        React.createElement('text', { key: String(col), x: colX[col as number], y: 24, fontSize: 12, fontWeight: 600, fill: 'var(--dsw-alias-label-secondary, #6b7280)' }, name as string)),
       renderCol(0, col0, '#2563eb'),
       renderCol(1, col1, '#d97706'),
       renderCol(2, col2, '#8b8b8b'),
-      indirect.slice(0, 16).map((item, i) => {
-        const from = findPos(chainStart(item.reason))
-        const to = findPos(item.path)
-        if (from === undefined || to === undefined || from.col === to.col) return null
-        const x1 = colX[from.col] + colW
-        const y1 = yOf(from.col, from.index) + nodeH / 2
-        const x2 = colX[to.col]
-        const y2 = yOf(to.col, to.index) + nodeH / 2
-        return React.createElement('path', {
-          key: `e${i}`, d: `M ${x1} ${y1} C ${x1 + 20} ${y1}, ${x2 - 20} ${y2}, ${x2} ${y2}`,
-          fill: 'none', stroke: '#d97706', strokeWidth: 1.2, opacity: 0.55,
-        })
-      }),
-    ),
-    React.createElement('div', { style: { display: 'flex', gap: '14px', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '4px' } },
-      React.createElement('span', null, '■ ', props.t('impact.legend.changed')),
-      React.createElement('span', { style: { color: '#d97706' } }, '■ ', props.t('impact.legend.indirect')),
-      React.createElement('span', { style: { color: '#8b8b8b' } }, '■ ', props.t('impact.legend.potential')),
+      edges,
     ),
   )
+}
+
+const DIFF_KEYWORDS = /\b(public|private|protected|internal|static|void|class|struct|interface|enum|new|return|if|else|for|foreach|while|switch|case|break|continue|try|catch|finally|throw|using|namespace|import|export|from|const|let|var|async|await|function|this|base|super|null|true|false|override|virtual|abstract|sealed|readonly|params|out|ref|yield|typeof|instanceof|in|of|default|string|int|long|double|float|bool|char|decimal|object|record|partial|get|set|require|module|type|implements|extends)\b/g
+
+/** 单行代码高亮：注释 > 字符串 > 关键字/数字 三层着色（轻量正则，够核查用）。 */
+function highlightCodeLine(line: string, keyPrefix: string): React.ReactNode[] {
+  const trimmed = line.trimStart()
+  if (trimmed.startsWith('//') || trimmed.startsWith('///') || trimmed.startsWith('*') || trimmed.startsWith('/*') || trimmed.startsWith('#')) {
+    return [React.createElement('span', { key: `${keyPrefix}-c`, style: { color: '#6a9955' } }, line)]
+  }
+  const parts = line.split(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g)
+  return parts.map((part, i) => {
+    if (i % 2 === 1) return React.createElement('span', { key: `${keyPrefix}-s${i}`, style: { color: '#ce9178' } }, part)
+    const sub: React.ReactNode[] = []
+    let last = 0
+    for (const match of part.matchAll(DIFF_KEYWORDS)) {
+      if (match.index! > last) sub.push(part.slice(last, match.index))
+      sub.push(React.createElement('span', { key: `${keyPrefix}-k${i}-${match.index}`, style: { color: '#569cd6' } }, match[0]))
+      last = match.index! + match[0].length
+    }
+    if (last < part.length) sub.push(part.slice(last))
+    return React.createElement(React.Fragment, { key: `${keyPrefix}-p${i}` }, sub)
+  })
+}
+
+/** 高亮差异视图：解析 unified diff，按 增/删/块头/上下文 着色。 */
+function DiffView(props: { patch: string }) {
+  const lines = props.patch.split('\n').filter((line, i) => !(line === '' && i === props.patch.split('\n').length - 1))
+  return React.createElement('div', {
+    style: {
+      fontFamily: 'Consolas, monospace', fontSize: '11px', lineHeight: 1.55,
+      background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
+      borderRadius: '6px', padding: '8px 0', maxHeight: 420, overflowY: 'auto', marginTop: '6px',
+    },
+  }, lines.map((line, i) => {
+    const kind = line.startsWith('+++') || line.startsWith('---') ? 'meta'
+      : line.startsWith('@@') ? 'hunk'
+        : line.startsWith('+') ? 'add'
+          : line.startsWith('-') ? 'del' : 'ctx'
+    const bg = kind === 'add' ? 'rgba(46,160,67,0.14)' : kind === 'del' ? 'rgba(248,81,73,0.13)' : kind === 'hunk' ? 'rgba(56,139,253,0.1)' : 'transparent'
+    const content = kind === 'meta' || kind === 'hunk'
+      ? React.createElement('span', { style: { color: '#388bfd', fontWeight: 600 } }, line)
+      : kind === 'add' || kind === 'del'
+        ? React.createElement('span', { style: { color: kind === 'add' ? '#1a7f37' : '#cf222e', fontWeight: 600 } }, line[0])
+        : null
+    return React.createElement('div', { key: i, style: { padding: '0 10px', background: bg, whiteSpace: 'pre-wrap', wordBreak: 'break-all' } },
+      content,
+      kind === 'add' || kind === 'del' ? highlightCodeLine(line.slice(1), `l${i}`) : highlightCodeLine(line, `l${i}`),
+    )
+  }))
 }
 
 function formatTime(value: number | null | undefined): string {
@@ -578,14 +698,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // ── 提交核查状态 ──
   const [commitsData, setCommitsData] = useState<CommitsPayload | null>(null)
   const [commitsError, setCommitsError] = useState<string | null>(null)
-  const [selectedTarget, setSelectedTarget] = useState<string | null>(null)
-  const [detail, setDetail] = useState<CommitDetailPayload | null>(null)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [pickerFilter, setPickerFilter] = useState('')
+  const [selectedTargets, setSelectedTargets] = useState<string[]>([])
+  const [details, setDetails] = useState<Record<string, CommitDetailPayload>>({})
   const [detailLoading, setDetailLoading] = useState(false)
   const [impact, setImpact] = useState<ImpactScopePayload | null>(null)
   const [impactLoading, setImpactLoading] = useState(false)
-  const [review, setReview] = useState<{ issuesFound: number; issues: string; verdict: string } | null>(null)
+  const [reviews, setReviews] = useState<Record<string, ReviewPayload>>({})
   const [reviewLoading, setReviewLoading] = useState(false)
-  const [showPatch, setShowPatch] = useState(false)
+  const [fileDiffs, setFileDiffs] = useState<Record<string, string>>({})
   const [repoInput, setRepoInput] = useState('')
   const [knownRepos, setKnownRepos] = useState<string[]>(() => {
     try {
@@ -632,43 +754,63 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
-  const selectTarget = async (target: string): Promise<void> => {
-    setSelectedTarget(target)
+  /** 勾选/取消一次提交：重算选中集合，并按需补齐每条提交的 AI 解读（服务端有缓存）。 */
+  const toggleTarget = async (target: string): Promise<void> => {
+    setSelectedTargets((previous) => {
+      if (previous.includes(target)) return previous.filter((item) => item !== target)
+      return [...previous, target]
+    })
     setImpact(null)
-    setReview(null)
-    setShowPatch(false)
-    setDetailLoading(true)
-    try {
-      const { data } = await post('/project-control/api/commit-detail', { sha: target })
-      setDetail(data as unknown as CommitDetailPayload)
-    } catch (error: unknown) {
-      setDetail(null)
-      setLoadError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setDetailLoading(false)
+    setReviews({})
+    if (!selectedTargets.includes(target)) {
+      setDetailLoading(true)
+      try {
+        const { data } = await post('/project-control/api/commit-detail', { sha: target })
+        setDetails((previous) => ({ ...previous, [target]: data as unknown as CommitDetailPayload }))
+      } catch (error: unknown) {
+        setLoadError(error instanceof Error ? error.message : String(error))
+      } finally {
+        setDetailLoading(false)
+      }
     }
   }
 
   const loadImpact = async (): Promise<void> => {
-    if (selectedTarget === null) return
+    if (selectedTargets.length === 0) return
     setImpactLoading(true)
     try {
-      const { ok, data } = await post('/project-control/api/impact-scope', { sha: selectedTarget })
+      const { ok, data } = await post('/project-control/api/impact-scope', { shas: selectedTargets })
       setImpact(ok ? (data as unknown as ImpactScopePayload) : null)
     } finally {
       setImpactLoading(false)
     }
   }
 
-  const loadReview = async (): Promise<void> => {
-    if (selectedTarget === null) return
+  const loadReviews = async (): Promise<void> => {
+    if (selectedTargets.length === 0) return
     setReviewLoading(true)
     try {
-      const { data } = await post('/project-control/api/review', { sha: selectedTarget })
-      setReview(data as unknown as { issuesFound: number; issues: string; verdict: string })
+      for (const target of selectedTargets) {
+        const { data } = await post('/project-control/api/review', { sha: target })
+        setReviews((previous) => ({ ...previous, [target]: data as unknown as ReviewPayload }))
+      }
     } finally {
       setReviewLoading(false)
     }
+  }
+
+  const loadFileDiff = async (sha: string, path: string): Promise<void> => {
+    const key = `${sha}|${path}`
+    if (fileDiffs[key] !== undefined) {
+      setFileDiffs((previous) => {
+        const next = { ...previous }
+        delete next[key]
+        return next
+      })
+      return
+    }
+    const { data } = await post('/project-control/api/file-diff', { sha, path })
+    setFileDiffs((previous) => ({ ...previous, [key]: String(data['patch'] ?? '') }))
   }
 
   const switchRepo = async (rootPath: string): Promise<void> => {
@@ -692,7 +834,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     const { ok } = await post('/project-control/api/notes', {
       title: noteTitle.trim(),
       content: noteContent.trim(),
-      sha: selectedTarget === null ? undefined : selectedTarget,
+      sha: selectedTargets.length === 0 ? undefined : selectedTargets[0],
     })
     if (ok) {
       setNoteTitle('')
@@ -870,38 +1012,45 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     ? React.createElement(Card, { title: t('result.panel') },
         React.createElement('div', { style: styles.result }, actionResult))
     : null
-
   // ── 提交核查页签 ──
-  const commitList: Array<{ key: string; subject: string; meta: string; sha: string | null }> = []
+  // 顶部：仓库栏 + 提交多选下拉（约 1/5 高度）；下方板块占全宽。
+  const allTargets: Array<{ key: string; label: string; meta: string; sha: string }> = []
   if (commitsData !== null) {
-    commitList.push(commitsData.working.isClean
-      ? { key: 'working', subject: t('repo.workingClean'), meta: '', sha: null }
-      : {
-          key: 'working',
-          subject: `● ${t('repo.working')}（${commitsData.working.fileCount}）`,
-          meta: commitsData.working.files.slice(0, 3).map((file) => file.path.split('/').pop()).join(', '),
-          sha: 'working',
-        })
+    if (!commitsData.working.isClean) {
+      allTargets.push({
+        key: 'working',
+        label: `● ${t('repo.working')}（${commitsData.working.fileCount}）`,
+        meta: commitsData.working.files.slice(0, 3).map((file) => file.path.split('/').pop()).join(', '),
+        sha: 'working',
+      })
+    }
     for (const commit of commitsData.commits) {
       const adds = commit.files.reduce((sum, file) => sum + file.adds, 0)
       const dels = commit.files.reduce((sum, file) => sum + file.dels, 0)
-      commitList.push({
+      allTargets.push({
         key: commit.sha,
-        subject: commit.subject,
+        label: commit.subject,
         meta: `${commit.shortHash} · ${commit.author} · ${new Date(commit.date).toLocaleString()} · +${adds}/-${dels}`,
         sha: commit.sha,
       })
     }
   }
+  const shortLabel = (sha: string): string => {
+    if (sha === 'working') return t('repo.working')
+    const target = allTargets.find((entry) => entry.sha === sha)
+    return `${(target?.meta.split(' · ')[0]) ?? sha.slice(0, 7)} ${target?.label.slice(0, 18) ?? ''}`.trim()
+  }
+  const filteredTargets = pickerFilter.trim() === ''
+    ? allTargets
+    : allTargets.filter((entry) => (entry.label + entry.meta).toLowerCase().includes(pickerFilter.trim().toLowerCase()))
 
-  const detailHeader = detail === null ? null : detail.isWorking
-    ? `● ${t('repo.working')}`
-    : `${detail.commit?.message ?? detail.sha}（${detail.sha.slice(0, 8)}）`
+  const impactRiskColor = impact === null ? '#8b8b8b' : (RISK_COLOR[impact.riskLevel] ?? '#8b8b8b')
 
   const commitsTab = (
     <>
+      {/* 仓库栏 */}
       <Card>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: knownRepos.length > 0 ? '8px' : '0' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
           <span style={styles.badge('#2563eb')}>{commitsData?.branch ?? '—'}</span>
           <span style={{ fontSize: '12px' }}>{commitsData?.rootPath ?? project?.rootPath ?? '—'}</span>
           <span style={{ flex: 1 }} />
@@ -913,7 +1062,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           >{busy === 'scanHistory' ? t('action.running') : t('repo.scanHistory')}</button>
         </div>
         {knownRepos.length > 0 && (
-          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' }}>
             {knownRepos.map((repo) => (
               <span
                 key={repo}
@@ -924,7 +1073,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             ))}
           </div>
         )}
-        <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+        <div style={{ display: 'flex', gap: '6px' }}>
           <input
             style={styles.input}
             placeholder={t('repo.addHint')}
@@ -937,118 +1086,256 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           </button>
         </div>
       </Card>
-      {commitsError !== null && <Card><div style={styles.empty}>{t('repo.loadFailed')}: {commitsError}</div></Card>}
-      <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-        <div style={{ width: '38%', flexShrink: 0 }}>
-          <Card title={`${t('repo.commits')}（${commitList.length}）`}>
-            {commitList.map((entry) => (
-              <div
-                key={entry.key}
-                style={styles.commitRow(selectedTarget === entry.key)}
-                onClick={() => { if (entry.sha !== null) void selectTarget(entry.sha) }}
-              >
-                <div style={styles.commitSubject}>{entry.subject}</div>
-                {entry.meta !== '' && <div style={styles.commitMeta}>{entry.meta}</div>}
-              </div>
-            ))}
-          </Card>
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {selectedTarget === null && <Card><div style={styles.empty}>{t('detail.pick')}</div></Card>}
-          {selectedTarget !== null && detailLoading && <Card><div style={styles.empty}>{t('detail.aiLoading')}</div></Card>}
-          {selectedTarget !== null && !detailLoading && detail !== null && (
+
+      {/* 提交多选下拉（紧凑，约 1/5 高度以内） */}
+      <Card title={t('picker.title')}>
+        <div style={{ position: 'relative' }}>
+          <button style={{ ...styles.secondary, width: '100%', textAlign: 'left', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }} onClick={() => { setPickerOpen(!pickerOpen) }}>
+            <span>{selectedTargets.length === 0
+              ? t('picker.placeholder')
+              : `${t('picker.selected')} ${selectedTargets.length}：${selectedTargets.map(shortLabel).join('；').slice(0, 80)}`}</span>
+            <span style={{ marginLeft: '8px' }}>▾</span>
+          </button>
+          {pickerOpen && (
             <>
-              <Card title={detailHeader ?? t('detail.title')}>
-                {detail.commit !== null && <div style={styles.commitMeta}>{detail.commit.author} · {new Date(detail.commit.date).toLocaleString()}</div>}
-                <div style={{ ...styles.badge('#2563eb'), margin: '6px 0' }}>
-                  {detail.files.length} {t('detail.files')} · +{detail.insertions}/-{detail.deletions}{detail.patchTruncated ? ' (truncated)' : ''}
+              <div style={{ position: 'fixed', inset: 0, zIndex: 29 }} onClick={() => { setPickerOpen(false) }} />
+              <div style={{
+                position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0, zIndex: 30,
+                background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
+                borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,0.12)', overflow: 'hidden',
+              }}>
+                <div style={{ padding: '8px', borderBottom: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))', display: 'flex', gap: '6px' }}>
+                  <input
+                    style={styles.input}
+                    placeholder={t('picker.filter')}
+                    value={pickerFilter}
+                    onChange={(e) => { setPickerFilter(e.target.value) }}
+                  />
+                  <button style={styles.secondary} onClick={() => { setSelectedTargets([]) }}>{t('picker.clear')}</button>
                 </div>
-                {detail.analysis.what !== '' && (
+                <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+                  {allTargets.map((entry) => (
+                    <div
+                      key={entry.key}
+                      style={{
+                        padding: '7px 12px', cursor: 'pointer', display: 'flex', gap: '8px', alignItems: 'center',
+                        background: selectedTargets.includes(entry.sha) ? 'rgba(37,99,235,0.07)' : 'transparent',
+                      }}
+                      onClick={() => { void toggleTarget(entry.sha) }}
+                    >
+                      <span style={{ width: '14px', color: 'var(--dsw-alias-brand-primary, #2563eb)', fontWeight: 700 }}>
+                        {selectedTargets.includes(entry.sha) ? '✓' : ''}
+                      </span>
+                      <span style={{ minWidth: 0 }}>
+                        <span style={{ display: 'block', fontSize: '12px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.label}</span>
+                        <span style={{ display: 'block', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{entry.meta}</span>
+                      </span>
+                    </div>
+                  ))}
+                  {filteredTargets.length === 0 && <div style={styles.empty}>{t('picker.noMatch')}</div>}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px', alignItems: 'center' }}>
+          <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('picker.hint')}</span>
+          {detailLoading && <span style={styles.badge('#dcdcaa')}>{t('detail.aiLoading')}</span>}
+        </div>
+      </Card>
+
+      {commitsError !== null && <Card><div style={styles.empty}>{t('repo.loadFailed')}: {commitsError}</div></Card>}
+      {selectedTargets.length === 0 && <Card><div style={styles.empty}>{t('detail.pick')}</div></Card>}
+
+      {/* 每条选中提交的 AI 解读 */}
+      {selectedTargets.map((target) => {
+        const d = details[target]
+        const label = target === 'working' ? t('repo.working') : (d?.commit?.message ?? target.slice(0, 8))
+        return (
+          <Card key={`d-${target}`} title={`🔍 ${label}${target !== 'working' ? `（${target.slice(0, 8)}）` : ''}`}>
+            {d === undefined ? (
+              <div style={styles.empty}>{t('detail.aiLoading')}</div>
+            ) : (
+              <>
+                {d.commit !== null && <div style={styles.commitMeta}>{d.commit.author} · {new Date(d.commit.date).toLocaleString()} · {d.files.length} {t('detail.files')} · +{d.insertions}/-{d.deletions}</div>}
+                {d.analysis.what !== '' && (
                   <>
                     <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('detail.what')}</div>
-                    <div style={styles.what}>{detail.analysis.what}</div>
+                    <div style={styles.what}>{d.analysis.what}</div>
                   </>
                 )}
-                {detail.analysis.logic.length > 0 && (
+                {d.analysis.logic.length > 0 && (
                   <>
                     <div style={styles.sectionTitle}>{t('detail.logic')}</div>
-                    {detail.analysis.logic.map((step, i) => (
+                    {d.analysis.logic.map((step, i) => (
                       <div key={i} style={styles.logicStep}>
                         <span style={{ color: 'var(--dsw-alias-brand-primary, #2563eb)', fontWeight: 600 }}>{i + 1}.</span>{step}
                       </div>
                     ))}
                   </>
                 )}
-                {detail.analysis.risks.length > 0 && (
+                {d.analysis.risks.length > 0 && (
                   <>
                     <div style={{ ...styles.sectionTitle, marginTop: '6px' }}>{t('detail.risk')}</div>
-                    {detail.analysis.risks.map((risk, i) => <div key={i} style={styles.riskItem}>⚠ {risk}</div>)}
+                    {d.analysis.risks.map((risk, i) => <div key={i} style={styles.riskItem}>⚠ {risk}</div>)}
                   </>
                 )}
-              </Card>
-              <Card title={t('detail.impact')}>
-                <button style={styles.button} disabled={impactLoading} onClick={() => { void loadImpact() }}>
-                  {impactLoading ? t('detail.impactLoading') : t('detail.impact')}
-                </button>
-                {impact !== null && (
-                  <>
-                    <div style={{ margin: '8px 0' }}>
-                      <span style={styles.badge(RISK_COLOR[impact.riskLevel] ?? '#8b8b8b')}>
-                        {t('impact.risk')}: {impact.riskLevel} ({impact.riskScore})
-                      </span>
-                    </div>
-                    <ImpactGraph data={impact} t={t} />
-                    {impact.levels.length === 0 && <div style={styles.empty}>{t('impact.none')}</div>}
-                    {impact.affectedTests.length > 0 && (
-                      <div style={styles.row}>
-                        <span><span style={styles.label}>{t('impact.tests')}</span>{impact.affectedTests.join(', ')}</span>
-                      </div>
-                    )}
-                  </>
-                )}
-              </Card>
-              <Card title={t('detail.optimality')}>
-                <button style={styles.button} disabled={reviewLoading} onClick={() => { void loadReview() }}>
-                  {reviewLoading ? t('detail.optimalityLoading') : t('detail.optimality')}
-                </button>
-                {review !== null && (
-                  <>
-                    {review.verdict !== '' && (
-                      <>
-                        <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('review.verdict')}</div>
-                        <div style={{ ...styles.what, background: 'rgba(37,99,235,0.05)', border: '1px solid rgba(37,99,235,0.2)', borderRadius: '6px', padding: '8px 10px' }}>{review.verdict}</div>
-                      </>
-                    )}
-                    <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('review.issues')}（{review.issuesFound}）</div>
-                    {review.issuesFound === 0
-                      ? <div style={styles.empty}>{t('review.clean')}</div>
-                      : <div style={styles.result}>{review.issues}</div>}
-                  </>
-                )}
-              </Card>
-              <Card title={t('detail.files')}>
+                {/* 文件清单 + 逐文件高亮对比 */}
+                <div style={{ ...styles.sectionTitle, marginTop: '10px' }}>{t('detail.files')}</div>
                 <table style={styles.table}>
                   <tbody>
-                    {detail.files.map((file) => (
-                      <tr key={file.path}>
-                        <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{file.path}</td>
-                        <td style={{ ...styles.td, color: '#2da44e', whiteSpace: 'nowrap' }}>+{file.adds}</td>
-                        <td style={{ ...styles.td, color: '#cf222e', whiteSpace: 'nowrap' }}>-{file.dels}</td>
-                      </tr>
-                    ))}
+                    {d.files.map((file) => {
+                      const key = `${target}|${file.path}`
+                      const patch = fileDiffs[key]
+                      return (
+                        <>
+                          <tr key={key}>
+                            <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{file.path}</td>
+                            <td style={{ ...styles.td, color: '#2da44e', whiteSpace: 'nowrap' }}>+{file.adds}</td>
+                            <td style={{ ...styles.td, color: '#cf222e', whiteSpace: 'nowrap' }}>-{file.dels}</td>
+                            <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>
+                              <button style={styles.secondary} onClick={() => { void loadFileDiff(target, file.path) }}>
+                                {patch === undefined ? t('diff.show') : t('diff.hide')}
+                              </button>
+                            </td>
+                          </tr>
+                          {patch !== undefined && (
+                            <tr key={`${key}-diff`}>
+                              <td colSpan={4} style={{ ...styles.td, padding: 0 }}>
+                                <DiffView patch={patch} />
+                              </td>
+                            </tr>
+                          )}
+                        </>
+                      )
+                    })}
                   </tbody>
                 </table>
-                {detail.patch !== '' && (
-                  <div style={{ marginTop: '8px' }}>
-                    <button style={styles.secondary} onClick={() => { setShowPatch(!showPatch) }}>{t('detail.patch')}</button>
-                    {showPatch && <div style={{ ...styles.patch, marginTop: '8px' }}>{detail.patch}</div>}
-                  </div>
+              </>
+            )}
+          </Card>
+        )
+      })}
+
+      {/* 影响范围：按钮 + 风险构成 + 大图 + 影响点明细 + 记忆联动 */}
+      {selectedTargets.length > 0 && (
+        <Card title={t('detail.impact')}>
+          <button style={styles.button} disabled={impactLoading} onClick={() => { void loadImpact() }}>
+            {impactLoading ? t('detail.impactLoading') : t('detail.impact')}
+          </button>
+          {impact !== null && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', margin: '10px 0 4px', flexWrap: 'wrap' }}>
+                <span style={{ ...styles.badge(impactRiskColor), fontSize: '13px', padding: '3px 10px' }}>
+                  {t('impact.risk')}: {impact.riskLevel}（{impact.riskScore}）
+                </span>
+                {impact.keyChangePoints !== undefined && impact.keyChangePoints.length > 0 && (
+                  <span style={{ fontSize: '11px', color: '#9a6700' }}>⚠ {t('impact.keyPoints')}: {impact.keyChangePoints.map((file) => file.split('/').pop()).join('、')}</span>
                 )}
-              </Card>
+              </div>
+              {impact.riskFactors !== undefined && impact.riskFactors.length > 0 && (
+                <>
+                  <div style={styles.sectionTitle}>{t('impact.factors')}</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', marginBottom: '10px' }}>
+                    {impact.riskFactors.map((factor, i) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', padding: '3px 8px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', borderRadius: '4px' }}>
+                        <span>{factor.text}</span>
+                        <span style={{ color: impactRiskColor, fontWeight: 600 }}>+{factor.points}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+              <ImpactGraph data={impact} t={t} />
+              {impact.levels.length > 0 && (
+                <>
+                  <div style={{ ...styles.sectionTitle, marginTop: '10px' }}>{t('impact.points')}</div>
+                  <table style={styles.table}>
+                    <thead>
+                      <tr>{['impact.col.level', 'impact.col.path', 'impact.col.depth', 'impact.col.conf', 'impact.col.chain'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {impact.levels.map((item, i) => (
+                        <tr key={i}>
+                          <td style={styles.td}>
+                            <span style={styles.badge(item.level === 'indirect' ? '#d97706' : '#8b8b8b')}>{item.level === 'indirect' ? t('impact.legend.indirect') : t('impact.legend.potential')}</span>
+                          </td>
+                          <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{item.path}</td>
+                          <td style={styles.td}>{item.depth}</td>
+                          <td style={styles.td}>{item.confidence}</td>
+                          <td style={{ ...styles.td, fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{item.reason.replace(/^Indirectly affected via /, '').replace(/ path: /, ' ← ')}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              )}
+              {impact.levels.length === 0 && <div style={styles.empty}>{t('impact.none')}</div>}
+              {impact.affectedTests.length > 0 && (
+                <div style={styles.row}>
+                  <span><span style={styles.label}>{t('impact.tests')}</span>{impact.affectedTests.join(', ')}</span>
+                </div>
+              )}
+              {impact.memories !== undefined && impact.memories.length > 0 && (
+                <div style={{ marginTop: '10px', padding: '8px 10px', border: '1px dashed rgba(37,99,235,0.35)', borderRadius: '6px' }}>
+                  <div style={{ ...styles.sectionTitle, color: 'var(--dsw-alias-brand-primary, #2563eb)' }}>{t('impact.memory')}</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                    {impact.memories.map((memory, i) => (
+                      <span key={i} style={styles.badge('#2563eb')}>{memory.title}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </>
           )}
-        </div>
-      </div>
+        </Card>
+      )}
+
+      {/* 最优性核查：结论 + 结构化问题清单 */}
+      {selectedTargets.length > 0 && (
+        <Card title={t('detail.optimality')}>
+          <button style={styles.button} disabled={reviewLoading} onClick={() => { void loadReviews() }}>
+            {reviewLoading ? t('detail.optimalityLoading') : t('detail.optimality')}
+          </button>
+          {selectedTargets.map((target) => {
+            const r = reviews[target]
+            if (r === undefined) return null
+            const label = target === 'working' ? t('repo.working') : target.slice(0, 8)
+            return (
+              <div key={`r-${target}`} style={{ marginTop: '10px' }}>
+                <div style={{ ...styles.sectionTitle }}>{label}</div>
+                {r.verdict !== '' && (
+                  <div style={{ ...styles.what, background: 'rgba(37,99,235,0.05)', border: '1px solid rgba(37,99,235,0.2)', borderRadius: '6px', padding: '8px 10px' }}>{r.verdict}</div>
+                )}
+                {r.issueList !== undefined && r.issueList.length > 0 ? (
+                  <table style={styles.table}>
+                    <thead>
+                      <tr>{['review.col.severity', 'review.col.category', 'review.col.title', 'review.col.evidence', 'review.col.fix'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {r.issueList.map((issue, i) => (
+                        <tr key={i}>
+                          <td style={styles.td}><span style={styles.badge(issue.severity === 'critical' ? '#f14c4c' : issue.severity === 'high' ? '#ce9178' : issue.severity === 'medium' ? '#dcdcaa' : '#569cd6')}>{issue.severity}</span></td>
+                          <td style={styles.td}>{issue.category}</td>
+                          <td style={styles.td}>{issue.title}</td>
+                          <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{issue.evidence}</td>
+                          <td style={styles.td}>{issue.fix}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <div style={styles.empty}>{t('review.clean')}</div>
+                )}
+              </div>
+            )
+          })}
+          {reviewLoading && <div style={styles.empty}>{t('detail.optimalityLoading')}</div>}
+          {!reviewLoading && selectedTargets.every((target) => reviews[target] === undefined) && (
+            <div style={styles.empty}>{t('review.hint')}</div>
+          )}
+        </Card>
+      )}
     </>
   )
 
@@ -1201,9 +1488,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         <div style={styles.formRow}>
           <input style={styles.input} placeholder={t('notes.formTitle')} value={noteTitle} onChange={(e) => { setNoteTitle(e.target.value) }} />
           <input style={styles.input} placeholder={t('notes.formContent')} value={noteContent} onChange={(e) => { setNoteContent(e.target.value) }} />
-          {selectedTarget !== null && (
+          {selectedTargets.length > 0 && (
             <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
-              {t('notes.boundTo')}: {selectedTarget === 'working' ? t('repo.working') : selectedTarget.slice(0, 8)}
+              {t('notes.boundTo')}: {selectedTargets[0] === 'working' ? t('repo.working') : selectedTargets[0].slice(0, 8)}
             </div>
           )}
           <button style={styles.button} disabled={noteTitle.trim() === '' || noteContent.trim() === ''} onClick={() => { void addNote() }}>{t('notes.add')}</button>

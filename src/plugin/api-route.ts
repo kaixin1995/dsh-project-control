@@ -668,6 +668,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 'You are an independent code reviewer. Review the diff below for correctness, error handling, concurrency, resource leaks, security, and over-reach.',
                 'Answer with one issue per line in the exact format: SEVERITY | category | title | evidence location | suggested fix',
                 'SEVERITY is one of critical/high/medium/low/info. If the diff is clean, answer exactly: CLEAN',
+                'Write category, title, evidence location and suggested fix in Chinese (keep the SEVERITY keyword in English).',
                 'After the issues (or CLEAN), always append one final line:',
                 'OPTIMALITY: <用中文 1-3 句评价：该改动是否侵入式最小、是否最优实现；若有明显更优方案请指出>',
                 '',
@@ -684,6 +685,16 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const verdict = verdictMatch?.[1]?.trim() ?? ''
             const lines = analysis.text.slice(0, verdictMatch?.index ?? analysis.text.length)
               .split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
+            const issueList = lines.map((line) => {
+              const parts = line.split('|').map((part) => part.trim())
+              return {
+                severity: parts[0] ?? 'medium',
+                category: parts[1] ?? '',
+                title: parts[2] ?? line,
+                evidence: parts[3] ?? '',
+                fix: parts[4] ?? '',
+              }
+            })
             if (changeId !== undefined && changeId !== '') {
               const change = service.store.changes.get(changeId as never)
               if (change !== undefined) {
@@ -704,7 +715,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               }
             }
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ issuesFound: lines.length, issues: analysis.text, verdict }))
+            res.end(JSON.stringify({ issuesFound: lines.length, issues: analysis.text, verdict, issueList }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -1003,7 +1014,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           return
         }
 
-        // 变更级三级影响范围（直接/间接/潜在 + 风险等级），供工作台影响图渲染。
+        // 变更级三级影响范围（直接/间接/潜在 + 风险构成 + 记忆联动），供工作台影响图渲染。
+        // body.shas 支持多提交联合（取变更文件并集）。
         if (req.method === 'POST' && routePath === '/impact-scope') {
           try {
             const body = await readJsonBody(req)
@@ -1014,26 +1026,34 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
-            const sha = typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : 'working'
-            const isWorking = sha === 'working'
-            const rangeArgs = isWorking ? ['HEAD'] : [`${sha}^..${sha}`]
-            let numstatRaw: string
-            try {
-              numstatRaw = await service.git.runGit(['diff', '--no-color', '--numstat', ...rangeArgs], cwd)
-            } catch {
-              numstatRaw = await service.git.runGit(
-                ['diff', '--no-color', '--numstat', isWorking ? 'HEAD' : `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${sha}`],
-                cwd,
-              )
+            const shas: string[] = Array.isArray(body['shas']) && body['shas'].length > 0
+              ? (body['shas'] as unknown[]).filter((item): item is string => typeof item === 'string' && item !== '')
+              : [typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : 'working']
+            const changedFiles = new Set<string>()
+            for (const target of shas) {
+              const isWorking = target === 'working'
+              const rangeArgs = isWorking ? ['HEAD'] : [`${target}^..${target}`]
+              let numstatRaw: string
+              try {
+                numstatRaw = await service.git.runGit(['diff', '--no-color', '--numstat', ...rangeArgs], cwd)
+              } catch {
+                numstatRaw = await service.git.runGit(
+                  ['diff', '--no-color', '--numstat', isWorking ? 'HEAD' : `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${target}`],
+                  cwd,
+                )
+              }
+              for (const file of parseNumstat(numstatRaw)) changedFiles.add(normalizePath(file.path))
             }
-            const changedFiles = parseNumstat(numstatRaw).map((file) => normalizePath(file.path))
+            const changedList = Array.from(changedFiles)
             const graph = new ProjectGraph()
-            for (const file of changedFiles.slice(0, 20)) {
+            for (const file of changedList.slice(0, 20)) {
               graph.addNode({ id: file, type: 'file', label: file, filePath: file })
             }
             // 反向引用扫描：谁引用了变更文件（1 跳）与引用者的引用者（2 跳，供间接层）。
+            // 文档/配置类文件不是代码引用关系，从引用者中剔除。
+            const NOISE = /\.(md|txt|json|ya?ml|xml|html?|css|scss|lock|csproj|sln|props|targets)$/i
             const scanned = new Set<string>()
-            let hops: string[][] = [changedFiles.slice(0, 20)]
+            const hops: string[][] = [changedList.slice(0, 20)]
             for (let depth = 0; depth < 2; depth += 1) {
               const nextHop: string[] = []
               for (const target of hops[depth] ?? []) {
@@ -1042,7 +1062,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 const token = importTokenOf(target)
                 if (token === undefined) continue
                 const matches = await service.git.runGit(['grep', '-l', '-F', token, '--', '.'], cwd)
-                  .then((out) => out.split('\n').map(normalizePath).filter((p) => p !== '' && !changedFiles.includes(p)).slice(0, 60))
+                  .then((out) => out.split('\n').map(normalizePath)
+                    .filter((p) => p !== '' && !changedFiles.has(p) && !NOISE.test(p))
+                    .slice(0, 60))
                   .catch(() => [] as string[])
                 for (const importer of matches) {
                   if (importer === target) continue
@@ -1053,12 +1075,42 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               }
               hops.push(nextHop.slice(0, 12))
             }
-            const impact = new ImpactEngine().computeImpact(changedFiles, graph)
+            const impact = new ImpactEngine().computeImpact(changedList, graph)
+            const indirectItems = impact.impactedItems.filter((item) => item.level === 'indirect')
+            // 风险构成：把评分拆成可见的因子，说明"风险在哪"。
+            const keyPoints = changedList.filter((file) => /controller|service|repository|manager|gateway|middleware|host|program|startup/i.test(file))
+            const testFiles = impact.impactedItems
+              .map((item) => item.node.filePath ?? item.node.id)
+              .filter((path) => /test|spec/i.test(path))
+            const riskFactors: Array<{ text: string; points: number }> = [
+              { text: `变更文件 ${changedList.length} 个（每项 +5）`, points: changedList.length * 5 },
+              ...(indirectItems.length > 0
+                ? [{ text: `${indirectItems.length} 个引用方受传播影响（每项 +3）`, points: indirectItems.length * 3 }]
+                : []),
+              ...(keyPoints.length > 0
+                ? [{ text: `涉及关键组件：${keyPoints.map((file) => file.split('/').pop()).slice(0, 4).join('、')}`, points: keyPoints.length * 10 }]
+                : []),
+              ...(testFiles.length > 0
+                ? [{ text: `${testFiles.length} 个测试文件可能受影响`, points: testFiles.length * 2 }]
+                : changedList.length > 3
+                  ? [{ text: '多文件变更但未发现关联测试（+20）', points: 20 }]
+                  : []),
+            ]
+            // 结合项目记忆：已确认记忆按新近度带出，供核查时对照。
+            const memories = (service.store?.memories?.list() ?? [])
+              .filter((memory) => memory.isHumanConfirmed)
+              .sort((left, right) => right.createdAt - left.createdAt)
+              .slice(0, 6)
+              .map((memory) => ({ title: memory.title, type: memory.type }))
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
-              changedFiles,
+              changedFiles: changedList,
+              shas,
               riskLevel: impact.riskLevel,
               riskScore: impact.riskScore,
+              riskFactors,
+              keyChangePoints: keyPoints.slice(0, 10),
+              memories,
               levels: impact.impactedItems
                 .filter((item) => item.level !== 'direct')
                 .map((item) => ({
@@ -1070,8 +1122,41 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 }))
                 .slice(0, 80),
               direct: impact.impactedItems.filter((item) => item.level === 'direct').map((item) => item.node.filePath ?? item.node.id),
-              affectedTests: impact.affectedTests.slice(0, 20),
+              affectedTests: testFiles.slice(0, 20),
             }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 单文件差异（提交内或工作区），供工作台代码高亮对比视图。
+        if (req.method === 'POST' && routePath === '/file-diff') {
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const cwd = project?.identity?.rootPath
+            const path = typeof body['path'] === 'string' ? body['path'] : ''
+            if (cwd === undefined || path === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'path and an initialized project are required' }))
+              return
+            }
+            const sha = typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : 'working'
+            const isWorking = sha === 'working'
+            const rangeArgs = isWorking ? ['HEAD'] : [`${sha}^..${sha}`]
+            let patch = ''
+            try {
+              patch = await service.git.runGit(['diff', '--no-color', ...rangeArgs, '--', path], cwd)
+            } catch {
+              patch = await service.git.runGit(
+                ['diff', '--no-color', isWorking ? 'HEAD' : `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${sha}`, '--', path],
+                cwd,
+              )
+            }
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ path, patch: patch.slice(0, 120 * 1024) }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
