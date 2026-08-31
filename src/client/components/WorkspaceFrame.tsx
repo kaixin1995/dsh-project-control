@@ -73,7 +73,14 @@ interface ImpactScopePayload {
   riskFactors?: Array<{ text: string; points: number }>
   keyChangePoints?: string[]
   memories?: Array<{ title: string; type: string }>
-  functionImpact?: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }>
+  functionImpact?: Array<{
+    symbol: string
+    definedIn: string
+    role?: string
+    change?: string
+    impact?: string
+    callers: Array<{ file: string; line: string; snippet: string }>
+  }>
   levels: Array<{ level: string; depth: number; path: string; confidence: number; reason: string }>
   direct: string[]
 }
@@ -198,6 +205,9 @@ export const WORKSPACE_DICT = {
     'impact.keyPoints': '关键组件',
     'impact.memory': '结合项目记忆核查',
     'impact.functions': '受影响函数（谁调用了被改的代码）',
+    'impact.funcRole': '函数功能',
+    'impact.funcChange': '本次变化',
+    'impact.funcCallers': '对调用方的影响',
     'impact.functionsNone': '未识别出函数级调用变化（可能是样式/静态资源/纯配置改动）。',
     'review.col.severity': '级别',
     'review.col.category': '类别',
@@ -331,6 +341,9 @@ export const WORKSPACE_DICT = {
     'impact.keyPoints': 'Key components',
     'impact.memory': 'Cross-check with project memory',
     'impact.functions': 'Impacted functions (who calls the changed code)',
+    'impact.funcRole': 'Function role',
+    'impact.funcChange': 'Changed by this commit',
+    'impact.funcCallers': 'Impact on callers',
     'impact.functionsNone': 'No function-level call impact detected (style/asset/config-only change).',
     'review.col.severity': 'Severity',
     'review.col.category': 'Category',
@@ -555,14 +568,13 @@ function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => stri
 
   const renderCol = (col: number, items: string[], color: string): React.ReactNode[] => items.map((path, index) => {
     const y = 44 + index * (nodeH + gap)
-    const dim = col > 0 ? Math.min(0.55, 0.18 + depthOf(path) * 0.12) : 0.1
     const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
     return React.createElement('g', { key: `${col}-${path}` },
-      React.createElement('rect', { x: colX[col], y, width: colW, height: nodeH, rx: 6, fill: `${color}${Math.round((1 - dim) * 255).toString(16).padStart(2, '0')}`, stroke: color, strokeWidth: 1.4 }),
-      React.createElement('text', { x: colX[col] + 10, y: y + 14, fontSize: 11, fontWeight: 600, fill: 'var(--dsw-alias-label-primary, #1f2328)' },
+      React.createElement('rect', { x: colX[col], y, width: colW, height: nodeH, rx: 6, fill: color, stroke: 'rgba(0,0,0,0.3)', strokeWidth: 1 }),
+      React.createElement('text', { x: colX[col] + 10, y: y + 14, fontSize: 12, fontWeight: 700, fill: '#ffffff' },
         (path.split('/').pop() ?? path).slice(0, 30)),
-      React.createElement('text', { x: colX[col] + 10, y: y + 26, fontSize: 9, fill: 'var(--dsw-alias-label-tertiary, #8b8b8b)' },
-        dir.slice(0, 38)),
+      React.createElement('text', { x: colX[col] + 10, y: y + 26, fontSize: 10, fill: 'rgba(255,255,255,0.92)' },
+        dir.slice(0, 40)),
       React.createElement('title', null, path),
     )
   })
@@ -600,7 +612,7 @@ function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => stri
   return React.createElement('div', null,
     React.createElement('svg', { width: '100%', viewBox: `0 0 1024 ${height}`, style: { maxHeight: 480 } },
       [['变更文件', 0], ['间接影响（谁引用了它）', 1], ['潜在影响（二级传播）', 2]].map(([name, col]) =>
-        React.createElement('text', { key: String(col), x: colX[col as number], y: 24, fontSize: 12, fontWeight: 600, fill: 'var(--dsw-alias-label-secondary, #6b7280)' }, name as string)),
+        React.createElement('text', { key: String(col), x: colX[col as number], y: 24, fontSize: 12, fontWeight: 700, fill: 'var(--dsw-alias-label-primary, #1f2328)' }, name as string)),
       renderCol(0, col0, '#2563eb'),
       renderCol(1, col1, '#d97706'),
       renderCol(2, col2, '#8b8b8b'),
@@ -1258,6 +1270,24 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                           <span style={styles.badge('#d97706')}>{entry.symbol}</span>
                           <span style={{ ...styles.label, marginLeft: '8px' }}>{entry.definedIn}</span>
                         </div>
+                        {entry.role !== undefined && entry.role !== '' && (
+                          <div style={{ ...styles.what, marginTop: '6px' }}>
+                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: 'var(--dsw-alias-brand-primary, #2563eb)' }}>{t('impact.funcRole')}</span>
+                            {entry.role}
+                          </div>
+                        )}
+                        {entry.change !== undefined && entry.change !== '' && (
+                          <div style={{ ...styles.what }}>
+                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: '#9a6700' }}>{t('impact.funcChange')}</span>
+                            {entry.change}
+                          </div>
+                        )}
+                        {entry.impact !== undefined && entry.impact !== '' && (
+                          <div style={{ ...styles.what, marginBottom: '6px' }}>
+                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: '#ce9178' }}>{t('impact.funcCallers')}</span>
+                            {entry.impact}
+                          </div>
+                        )}
                         {entry.callers.map((caller, i) => (
                           <div key={i} style={{ ...styles.logicStep, marginTop: '3px' }}>
                             <span style={{ color: '#d97706' }}>↳</span>

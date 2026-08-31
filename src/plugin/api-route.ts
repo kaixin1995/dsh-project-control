@@ -178,6 +178,30 @@ function extractChangedSymbols(patch: string): string[] {
     .slice(0, 12)
 }
 
+/** 解析 FUNC/ROLE/CHANGE/CALLER_IMPACT 批量输出为按符号索引的说明表。 */
+function parseFunctionExplanations(text: string): Record<string, { role: string; change: string; impact: string }> {
+  const result: Record<string, { role: string; change: string; impact: string }> = {}
+  let current: string | null = null
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    const funcMatch = line.match(/^FUNC[:：]\s*(\w+)/)
+    if (funcMatch !== null) {
+      current = funcMatch[1]!
+      result[current] = { role: '', change: '', impact: '' }
+      continue
+    }
+    if (current === null) continue
+    const entry = result[current]!
+    const role = line.match(/^ROLE[:：]\s*(.*)/)
+    if (role !== null) { entry.role = role[1]!.trim(); continue }
+    const change = line.match(/^CHANGE[:：]\s*(.*)/)
+    if (change !== null) { entry.change = change[1]!.trim(); continue }
+    const callerImpact = line.match(/^CALLER_IMPACT[:：]\s*(.*)/)
+    if (callerImpact !== null) { entry.impact = callerImpact[1]!.trim(); continue }
+  }
+  return result
+}
+
 /** 读取请求体（JSON，≤1 MiB）。 */
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {  return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -1144,6 +1168,55 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 functionImpact.push({ symbol, definedIn, callers })
               }
               if (functionImpact.length >= 10) break
+            }
+            // LLM 解读每个被波及函数的功能与受影响方式（单次调用，批量产出）。
+            if (functionImpact.length > 0) {
+              const explainRoute = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
+              const callerDigest = functionImpact
+                .map((fi) => `FUNC: ${fi.symbol}（定义于 ${fi.definedIn}）\n` +
+                  fi.callers.map((caller) => `  调用点 ${caller.file}:${caller.line} \`${caller.snippet}\``).join('\n'))
+                .join('\n')
+              const cacheKey = `fi|${cwd}|${shas.join(',')}|${combinedPatch.length}`
+              const cachedExplain = commitAnalysisCache.get(cacheKey)
+              let explanations: Record<string, { role: string; change: string; impact: string }>
+              if (cachedExplain !== undefined) {
+                explanations = cachedExplain as unknown as Record<string, { role: string; change: string; impact: string }>
+              } else {
+                const llm = await runLlmAnalysis(ctx, {
+                  prompt: [
+                    '以下是本次提交修改的函数（含补丁）与全仓库调用点。请说明每个函数的功能、本次修改改变了它的什么行为、以及对调用方代码的影响。',
+                    '严格按以下格式输出（每个函数一组，符号名保持原样，全部用中文）：',
+                    'FUNC: <符号名>',
+                    'ROLE: <该函数的功能，一句话>',
+                    'CHANGE: <本次修改改变了它的什么（行为/返回值/异常/性能）>',
+                    'CALLER_IMPACT: <对调用该函数的代码的具体影响，一句话>',
+                    '',
+                    '补丁：',
+                    combinedPatch.slice(0, 40_000),
+                    '',
+                    '符号与调用点：',
+                    callerDigest.slice(0, 12_000),
+                  ].join('\n'),
+                  provider: explainRoute.provider,
+                  model: explainRoute.model,
+                  maxTokens: service.liveConfig.analysisMaxTokens,
+                  timeoutMs: service.liveConfig.analysisTimeoutMs,
+                  purpose: 'project-control-function-impact',
+                })
+                explanations = parseFunctionExplanations(llm.text)
+                commitAnalysisCache.set(cacheKey, explanations as unknown as CommitAnalysis)
+                if (commitAnalysisCache.size > 40) {
+                  commitAnalysisCache.delete(commitAnalysisCache.keys().next().value as string)
+                }
+              }
+              for (const fi of functionImpact) {
+                const explain = explanations[fi.symbol]
+                if (explain !== undefined) {
+                  fi.role = explain.role
+                  fi.change = explain.change
+                  fi.impact = explain.impact
+                }
+              }
             }
             const indirectItems = impact.impactedItems.filter((item) => item.level === 'indirect')
             // 风险构成：把评分拆成可见的因子，说明"风险在哪"。
