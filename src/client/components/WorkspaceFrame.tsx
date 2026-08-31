@@ -73,9 +73,9 @@ interface ImpactScopePayload {
   riskFactors?: Array<{ text: string; points: number }>
   keyChangePoints?: string[]
   memories?: Array<{ title: string; type: string }>
+  functionImpact?: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }>
   levels: Array<{ level: string; depth: number; path: string; confidence: number; reason: string }>
   direct: string[]
-  affectedTests: string[]
 }
 
 export interface ReviewPayload {
@@ -197,11 +197,8 @@ export const WORKSPACE_DICT = {
     'impact.points': '影响点明细',
     'impact.keyPoints': '关键组件',
     'impact.memory': '结合项目记忆核查',
-    'impact.col.level': '层级',
-    'impact.col.path': '文件',
-    'impact.col.depth': '深度',
-    'impact.col.conf': '置信度',
-    'impact.col.chain': '引用链',
+    'impact.functions': '受影响函数（谁调用了被改的代码）',
+    'impact.functionsNone': '未识别出函数级调用变化（可能是样式/静态资源/纯配置改动）。',
     'review.col.severity': '级别',
     'review.col.category': '类别',
     'review.col.title': '问题',
@@ -333,11 +330,8 @@ export const WORKSPACE_DICT = {
     'impact.points': 'Impacted points',
     'impact.keyPoints': 'Key components',
     'impact.memory': 'Cross-check with project memory',
-    'impact.col.level': 'Level',
-    'impact.col.path': 'File',
-    'impact.col.depth': 'Depth',
-    'impact.col.conf': 'Conf.',
-    'impact.col.chain': 'Reference chain',
+    'impact.functions': 'Impacted functions (who calls the changed code)',
+    'impact.functionsNone': 'No function-level call impact detected (style/asset/config-only change).',
     'review.col.severity': 'Severity',
     'review.col.category': 'Category',
     'review.col.title': 'Issue',
@@ -1247,34 +1241,34 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 </>
               )}
               <ImpactGraph data={impact} t={t} />
-              {impact.levels.length > 0 && (
+              {impact.levels.length === 0 && <div style={styles.empty}>{t('impact.none')}</div>}
+              {/* 函数级影响：本次修改了哪些函数、波及了谁的哪些函数、调用点在哪 */}
+              {impact.functionImpact !== undefined && impact.functionImpact.length > 0 && (
                 <>
-                  <div style={{ ...styles.sectionTitle, marginTop: '10px' }}>{t('impact.points')}</div>
-                  <table style={styles.table}>
-                    <thead>
-                      <tr>{['impact.col.level', 'impact.col.path', 'impact.col.depth', 'impact.col.conf', 'impact.col.chain'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
-                    </thead>
-                    <tbody>
-                      {impact.levels.map((item, i) => (
-                        <tr key={i}>
-                          <td style={styles.td}>
-                            <span style={styles.badge(item.level === 'indirect' ? '#d97706' : '#8b8b8b')}>{item.level === 'indirect' ? t('impact.legend.indirect') : t('impact.legend.potential')}</span>
-                          </td>
-                          <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{item.path}</td>
-                          <td style={styles.td}>{item.depth}</td>
-                          <td style={styles.td}>{item.confidence}</td>
-                          <td style={{ ...styles.td, fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{item.reason.replace(/^Indirectly affected via /, '').replace(/ path: /, ' ← ')}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  <div style={{ ...styles.sectionTitle, marginTop: '12px' }}>{t('impact.functions')}</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {impact.functionImpact.map((entry) => (
+                      <div key={entry.symbol} style={{ border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))', borderRadius: '6px', padding: '8px 10px', background: 'var(--dsw-alias-bg-base, #fff)' }}>
+                        <div style={{ fontSize: '12px' }}>
+                          <span style={styles.badge('#d97706')}>{entry.symbol}</span>
+                          <span style={{ ...styles.label, marginLeft: '8px' }}>{entry.definedIn}</span>
+                        </div>
+                        {entry.callers.map((caller, i) => (
+                          <div key={i} style={{ ...styles.logicStep, marginTop: '3px' }}>
+                            <span style={{ color: '#d97706' }}>↳</span>
+                            <span style={{ fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>
+                              {caller.file}:{caller.line}
+                            </span>
+                            <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>— {caller.snippet.slice(0, 80)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
                 </>
               )}
-              {impact.levels.length === 0 && <div style={styles.empty}>{t('impact.none')}</div>}
-              {impact.affectedTests.length > 0 && (
-                <div style={styles.row}>
-                  <span><span style={styles.label}>{t('impact.tests')}</span>{impact.affectedTests.join(', ')}</span>
-                </div>
+              {impact.functionImpact !== undefined && impact.functionImpact.length === 0 && (
+                <div style={styles.empty}>{t('impact.functionsNone')}</div>
               )}
               {impact.memories !== undefined && impact.memories.length > 0 && (
                 <div style={{ marginTop: '10px', padding: '8px 10px', border: '1px dashed rgba(37,99,235,0.35)', borderRadius: '6px' }}>

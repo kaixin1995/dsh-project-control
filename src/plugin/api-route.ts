@@ -150,6 +150,34 @@ function parseCommitAnalysis(text: string): CommitAnalysis {
 /** /commit-detail 解读缓存：key = root|sha|diffHash，LRU 上限 40 条（进程内）。 */
 const commitAnalysisCache = new Map<string, CommitAnalysis>()
 
+/**
+ * 从补丁的新增行提取本次修改/新增的符号名（方法、类、函数），
+ * 供函数级影响反查。过滤 get/set/if 等无意义短名。
+ */
+function extractChangedSymbols(patch: string): string[] {
+  const symbols = new Set<string>()
+  for (const line of patch.split('\n')) {
+    if (!line.startsWith('+') || line.startsWith('+++')) continue
+    const content = line.slice(1)
+    for (const match of content.matchAll(/\b(?:public|private|protected|internal)\s+(?:[\w<>\[\],\.\?]+\s+)*?(\w+)\s*\(/g)) {
+      if (match[1] !== undefined) symbols.add(match[1])
+    }
+    for (const match of content.matchAll(/\bclass\s+(\w+)/g)) {
+      if (match[1] !== undefined) symbols.add(match[1])
+    }
+    for (const match of content.matchAll(/\bfunction\s+(\w+)/g)) {
+      if (match[1] !== undefined) symbols.add(match[1])
+    }
+    for (const match of content.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(/g)) {
+      if (match[1] !== undefined) symbols.add(match[1])
+    }
+  }
+  const generic = new Set(['main', 'get', 'set', 'toString', 'constructor', 'then', 'catch'])
+  return Array.from(symbols)
+    .filter((symbol) => symbol.length >= 4 && !generic.has(symbol))
+    .slice(0, 12)
+}
+
 /** 读取请求体（JSON，≤1 MiB）。 */
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {  return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -1063,7 +1091,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 if (token === undefined) continue
                 const matches = await service.git.runGit(['grep', '-l', '-F', token, '--', '.'], cwd)
                   .then((out) => out.split('\n').map(normalizePath)
-                    .filter((p) => p !== '' && !changedFiles.has(p) && !NOISE.test(p))
+                    .filter((p) => p !== '' && !changedFiles.has(p) && !NOISE.test(p) && !/test|spec/i.test(p))
                     .slice(0, 60))
                   .catch(() => [] as string[])
                 for (const importer of matches) {
@@ -1076,12 +1104,50 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               hops.push(nextHop.slice(0, 12))
             }
             const impact = new ImpactEngine().computeImpact(changedList, graph)
+            // 函数级影响：从每个选中提交自己的补丁提取修改过的符号（方法/类），
+            // 反查全仓库调用点（文件:行号:代码），直接回答"哪些函数被波及"。
+            let combinedPatch = ''
+            for (const target of shas) {
+              const isWorking = target === 'working'
+              const rangeArgs = isWorking ? ['HEAD'] : [`${target}^..${target}`]
+              try {
+                combinedPatch += '\n' + await service.git.runGit(['diff', '--no-color', ...rangeArgs], cwd)
+              } catch {
+                combinedPatch += '\n' + await service.git.runGit(
+                  ['diff', '--no-color', isWorking ? 'HEAD' : `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${target}`],
+                  cwd,
+                ).catch(() => '')
+              }
+              if (combinedPatch.length > 400 * 1024) break
+            }
+            const changedSymbols = extractChangedSymbols(combinedPatch)
+            const functionImpact: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }> = []
+            for (const symbol of changedSymbols) {
+              const grep = await service.git.runGit(['grep', '-n', '-F', symbol, '--', '.'], cwd).catch(() => '')
+              const callers: Array<{ file: string; line: string; snippet: string }> = []
+              for (const line of grep.split('\n')) {
+                const first = line.indexOf(':')
+                if (first === -1) continue
+                const file = normalizePath(line.slice(0, first))
+                if (file === '' || NOISE.test(file) || /test|spec/i.test(file)) continue
+                const rest = line.slice(first + 1)
+                const lineNo = rest.split(':')[0] ?? ''
+                const content = rest.slice(rest.indexOf(':') + 1).trim()
+                if (content.length < 5) continue
+                // 定义行本身不算调用方
+                if (new RegExp(`\\b${symbol}\\s*\\(`).test(content) && /\b(public|private|protected|internal|function)\b/.test(content)) continue
+                callers.push({ file, line: lineNo, snippet: content.slice(0, 140) })
+                if (callers.length >= 8) break
+              }
+              if (callers.length > 0) {
+                const definedIn = changedList.find((file) => file.includes(symbol)) ?? changedList[0] ?? ''
+                functionImpact.push({ symbol, definedIn, callers })
+              }
+              if (functionImpact.length >= 10) break
+            }
             const indirectItems = impact.impactedItems.filter((item) => item.level === 'indirect')
             // 风险构成：把评分拆成可见的因子，说明"风险在哪"。
             const keyPoints = changedList.filter((file) => /controller|service|repository|manager|gateway|middleware|host|program|startup/i.test(file))
-            const testFiles = impact.impactedItems
-              .map((item) => item.node.filePath ?? item.node.id)
-              .filter((path) => /test|spec/i.test(path))
             const riskFactors: Array<{ text: string; points: number }> = [
               { text: `变更文件 ${changedList.length} 个（每项 +5）`, points: changedList.length * 5 },
               ...(indirectItems.length > 0
@@ -1090,11 +1156,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               ...(keyPoints.length > 0
                 ? [{ text: `涉及关键组件：${keyPoints.map((file) => file.split('/').pop()).slice(0, 4).join('、')}`, points: keyPoints.length * 10 }]
                 : []),
-              ...(testFiles.length > 0
-                ? [{ text: `${testFiles.length} 个测试文件可能受影响`, points: testFiles.length * 2 }]
-                : changedList.length > 3
-                  ? [{ text: '多文件变更但未发现关联测试（+20）', points: 20 }]
-                  : []),
+              ...(changedSymbols.length === 0
+                ? []
+                : [{ text: `${changedSymbols.length} 个函数/类被修改（每项 +4）`, points: changedSymbols.length * 4 }]),
             ]
             // 结合项目记忆：已确认记忆按新近度带出，供核查时对照。
             const memories = (service.store?.memories?.list() ?? [])
@@ -1111,6 +1175,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               riskFactors,
               keyChangePoints: keyPoints.slice(0, 10),
               memories,
+              functionImpact,
               levels: impact.impactedItems
                 .filter((item) => item.level !== 'direct')
                 .map((item) => ({
@@ -1122,7 +1187,6 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 }))
                 .slice(0, 80),
               direct: impact.impactedItems.filter((item) => item.level === 'direct').map((item) => item.node.filePath ?? item.node.id),
-              affectedTests: testFiles.slice(0, 20),
             }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
