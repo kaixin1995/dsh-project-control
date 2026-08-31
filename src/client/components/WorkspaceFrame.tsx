@@ -166,7 +166,7 @@ export const WORKSPACE_DICT = {
     'form.changeDesc': '需求与背景（选填）',
     'result.panel': '操作结果',
 
-    'repo.add': '切换 / 添加仓库',
+    'repo.add': '添加仓库',
     'repo.addHint': '输入本机仓库绝对路径后回车；历史仓库已自动记忆',
     'repo.scanHistory': '重建历史',
     'repo.commits': '提交',
@@ -278,7 +278,7 @@ export const WORKSPACE_DICT = {
     'form.changeDesc': 'Requirement and background (optional)',
     'result.panel': 'Action result',
 
-    'repo.add': 'Switch / add repo',
+    'repo.add': 'Add repo',
     'repo.addHint': 'Enter an absolute repo path and press Enter; previously used repos are remembered',
     'repo.scanHistory': 'Rebuild history',
     'repo.commits': 'commits',
@@ -421,12 +421,14 @@ const styles: Record<string, React.CSSProperties> = {
   empty: { color: 'var(--dsw-alias-label-secondary, #6b7280)', fontSize: '12px', padding: '10px 4px' },
   button: {
     padding: '5px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer',
-    fontSize: '12px', background: 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
+    fontSize: '11px', background: 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
+    whiteSpace: 'nowrap',
   },
   secondary: {
-    padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px',
+    padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '11px',
     border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
     background: 'var(--dsw-alias-bg-layer-1, #fafafa)', color: 'var(--dsw-alias-label-primary, #1f2328)',
+    whiteSpace: 'nowrap',
   },
   input: {
     width: '100%', padding: '6px 10px', borderRadius: '6px', fontSize: '12px',
