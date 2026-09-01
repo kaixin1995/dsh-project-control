@@ -1,6 +1,5 @@
 # build artifacts
 node_modules/
-lib/
 dist/
 *.tsbuildinfo
 

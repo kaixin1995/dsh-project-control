@@ -38,7 +38,6 @@
   },
   "scripts": {
     "build": "node build.mjs && npm run build:client",
-    "prepare": "npm run build",
     "test": "vitest run",
     "build:client": "node build-client.mjs",
     "typecheck": "tsc --noEmit"
