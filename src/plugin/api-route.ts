@@ -377,6 +377,7 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
   }
   return {
     ready: true,
+    pluginVersion: service.version,
     project: project === null ? null : {
       id: project.id,
       name: project.name,

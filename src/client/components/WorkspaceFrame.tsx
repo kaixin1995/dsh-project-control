@@ -20,6 +20,7 @@ import React, { useEffect, useState } from 'react'
 export interface WorkspaceState {
   ready?: boolean
   reason?: string
+  pluginVersion?: string
   project?: { id: string; name: string; rootPath: string; createdAt: number } | null
   changes?: Array<{ id: string; title: string; type: string; status: string; source: string; updatedAt: number }>
   runs?: Array<{ id: string; changeId: string; status: string; startedAt: number | null; finishedAt: number | null; costUsd?: number; stepsTotal?: number; stepsDone?: number; currentStep?: string | null }>
@@ -1685,6 +1686,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           </>
         )}
       </Card>
+      <div style={{ textAlign: 'center', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary, #9ca3af)', padding: '8px 0' }}>
+        dsh-project-control v{state?.pluginVersion ?? '?'}
+      </div>
     </>
   )
 

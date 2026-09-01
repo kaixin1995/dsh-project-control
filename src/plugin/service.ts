@@ -5,6 +5,9 @@
  * @module dsh-project-control/plugin/service
  */
 
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { readFileSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { coreDomainSpec, analysisDomainSpec, historyDomainSpec } from '../store/domains.ts'
 import { DomainRepository, createInMemoryStore, type ProjectControlStore, type ProjectNoteRecord } from '../store/repository.ts'
@@ -50,6 +53,16 @@ export class ProjectControlService {
   private coreDomainHandle: any
   private analysisDomainHandle: any
   private historyDomainHandle: any
+
+  /** 插件自身版本号（取自 package.json，供工作台展示与导出文件命名）。 */
+  public readonly version: string = (() => {
+    try {
+      const pkgPath = new URL('../../package.json', import.meta.url)
+      return String(JSON.parse(readFileSync(pkgPath, 'utf8')).version ?? '0.0.0')
+    } catch {
+      return '0.0.0'
+    }
+  })()
 
   constructor(public readonly ctx: any, config: ProjectControlConfig = {}) {
     this.liveConfig = resolveFullConfig(config as never)
