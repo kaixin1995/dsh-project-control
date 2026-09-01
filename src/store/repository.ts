@@ -125,12 +125,14 @@ export function createInMemoryStore(): ProjectControlStore {
     importedChanges: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     historyCursor: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     confirmed: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
+    snapshots: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     evidence: new DomainRepository<EvidenceRecord, EvidenceId>(createMemoryKvTable<EvidenceRecord>()),
     issues: new DomainRepository<ReviewIssueRecord, IssueId>(createMemoryKvTable<ReviewIssueRecord>()),
     verifications: new DomainRepository<VerificationRecord, VerificationId>(createMemoryKvTable<VerificationRecord>()),
     memories: new DomainRepository<MemoryRecord, MemoryId>(createMemoryKvTable<MemoryRecord>()),
     concepts: new DomainRepository<any, any>(createMemoryKvTable<any>()),
     notes: new DomainRepository<ProjectNoteRecord, string>(createMemoryKvTable<ProjectNoteRecord>()),
+    pluginSettings: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
   }
 }
 
@@ -157,10 +159,12 @@ export interface ProjectControlStore {
   importedChanges: DomainRepository<Record<string, unknown>, string>
   historyCursor: DomainRepository<Record<string, unknown>, string>
   confirmed: DomainRepository<Record<string, unknown>, string>
+  snapshots: DomainRepository<Record<string, unknown>, string>
   evidence: DomainRepository<EvidenceRecord, EvidenceId>
   issues: DomainRepository<ReviewIssueRecord, IssueId>
   verifications: DomainRepository<VerificationRecord, VerificationId>
   memories: DomainRepository<MemoryRecord, MemoryId>
   concepts: DomainRepository<any, any>
   notes: DomainRepository<ProjectNoteRecord, string>
+  pluginSettings: DomainRepository<Record<string, unknown>, string>
 }

@@ -48,6 +48,7 @@ export const coreDomainSpec = defineDomain({
     attempts: domainTable(recordSchema),
     confirmed: domainTable(recordSchema),
     notes: domainTable(recordSchema),
+    plugin_settings: domainTable(recordSchema),
   },
 })
 

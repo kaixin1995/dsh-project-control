@@ -102,6 +102,27 @@
 - 多仓库 = 记忆仓库列表（localStorage pc.repos）+ 切换即 /bootstrap {rootPath} 采纳；聚合视图未做。
 - **客户端深嵌套 UI 一律写 JSX**（esbuild .tsx 原生支持）：手写 React.createElement 长链的括号配对不可维护（本轮两次构建失败根源）。
 
+**LLM 结果持久化（2026-08-31 第四轮，业主已确认方案）**
+- analysis 域闲置的 snapshots 表 = L2 持久化缓存；L1 仍是 commitAnalysisCache 进程内 Map。写路径：LLM → 双写；读路径：内存 → snapshots → 计算。
+- 键规则：`kind:rootPath|sha(或 sha 组)|diffHash(或 patch 哈希)|v<PROMPT_VERSION>|provider/model`——提交内容不可变可永久缓存；改提示词/换模型要 bump PROMPT_VERSION 或让模型名进键；工作区 diff 指纹一变键自然失效。容量上限 400 条、按 createdAt 清最旧。
+- 函数调用点（grep）永远实时重扫不缓存——保证关系图不随缓存过期；只缓存 LLM 文字说明。响应带 `cached/generatedAt`，前端显示「来自缓存 · 时间」+「重新生成」按钮（body.force=true 绕过缓存）。
+- 已验证：同进程命中 → 重启后命中（generatedAt 不变）→ force 后 cached=false 新时间戳。
+
+**页面触发执行（2026-08-31 第四轮）**
+- /runs/start：建变更 → LLM 生成计划（中文 JSON 数组，解析失败回落单步骤）→ startRun(undefined) 分离执行。**owner 传 undefined**：页面触发没有聊天会话，且 owner agent 的组合没有 jobs 控制器（报 no job controller serves this agent）→ orchestrator 内部走"不经 jobs 直接后台"分支，取消走 cancelRun。
+- **步骤 status 恒为 pending**（orchestrator 只写 claimedOutcome/verifiedOutcome，从不迁移 step.status）→ 进度展示按 claimedOutcome !== undefined 计完成数。
+- isAnalysisStep 必须覆盖中文关键词（分析/梳理/评审/调研…）——计划是中文生成的，纯英文正则会把只读步骤误判为改动型，导致"workspace shows no changes"假失败。
+- 双启动会互踩：第二个实例 boot 时 RecoveryScanner 把运行中的 run 写成 interrupted（单写者存储，第一实例内存态不受影响）→ 新启动脚本已内置 kill-old 再启动。
+
+**目录选择弃用原生对话框（2026-08-31 第五轮）**
+- 这台机器（WinSW 服务 + 手动模式都复现）的 node worker 里 CoCreateInstance(FileOpenDialog) 稳定报 0x80040111 —— 原生选目录不可用，与访问地址无关。**一切目录选择走插件自建的 /fs/list 网页浏览**（D:\Code 起点、可上级导航）。
+- 工作区注册表可程序化登记：`ctx.workspaceRegistry.create(path, title)`（本体 dsh-workspace 服务，bundle inject 需声明 'workspaceRegistry'）→ 登记后出现在聊天 composer 的工作区下拉菜单，无需原生对话框即可建会话。/workspace/register = 登记 + ensureCurrentProject 采纳。
+
+**LLM 失败降级 + 模型分级（2026-09-01）**
+- 三处 LLM 调用全部 try/catch 降级：commit-detail 失败 → 200 + 错误占位 analysis（文件/补丁照常）；review 失败 → verdict 槽放"评审失败：原因"；函数说明失败 → 空 explanations（图谱/调用点照常返回）。**响应失败也绝不让前端写入 undefined 形状的缓存数据**（曾致 `.author`/`.analysisCached` 连环崩溃）。
+- 模型分级落在用户 settings.yaml `project-control.modelTiers`（本机：分析/轻析=aitool/250K，评审/计划/验收=aitool/1M）→ resolveDeploymentRoute 第一优先读它；未配置时回落 agentDefaultModel=聊天模型（业主明确不要这样）。aitool 网关的 250K 实测可能长时间无响应——若再挂，改 settings.yaml 250K → auto。
+- 客户端控制台大量 `Resource::kQuotaBytes quota exceeded` 来自浏览器扩展（content_main.js）本地存储配额，与插件无关。
+
 **T8-L1 / T3.1 交付事实（2026-08-30）**
 - L1 逐提交轻析已实装：scanHistory 接 summaries 回调（api-route 以 resolveDeploymentRoute 解析 Fast 路由，maxSummarized=30，单条失败回落 subject 并 console.error）；真机验证 4 提交 → 真实 LLM 语义句、零失败、15s。
 - 部署路由解析 resolveDeploymentRoute(ctx, tier, cfg)：settings 等级覆盖 → **ctx.get('agentDefaultModel').currentSelection()**（ctx.get 是可选服务官方通道，属性代理读取会触发 inject 门禁）→ deepseek-v4 兜底。本机部署真实路由 = llm-pi-ai aitool/1M（settings.yaml llm-pi-ai.providers.aitool）。

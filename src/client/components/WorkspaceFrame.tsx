@@ -22,9 +22,9 @@ export interface WorkspaceState {
   reason?: string
   project?: { id: string; name: string; rootPath: string; createdAt: number } | null
   changes?: Array<{ id: string; title: string; type: string; status: string; source: string; updatedAt: number }>
-  runs?: Array<{ id: string; changeId: string; status: string; startedAt: number | null; finishedAt: number | null; costUsd?: number }>
+  runs?: Array<{ id: string; changeId: string; status: string; startedAt: number | null; finishedAt: number | null; costUsd?: number; stepsTotal?: number; stepsDone?: number; currentStep?: string | null }>
   attemptsCount?: number
-  memories?: Array<{ id: string; type: string; truthLevel: string; title: string; isHumanConfirmed: boolean; gitBranch: string | null; createdAt: number }>
+  memories?: Array<{ id: string; projectId: string; type: string; truthLevel: string; title: string; content?: string; isHumanConfirmed: boolean; gitBranch: string | null; createdAt: number }>
   evidenceCount?: number
   recentEvidence?: Array<{ id: string; source: string; truthLevel: string; locator: string; snippet: string; createdAt: number }>
   importedChanges?: Array<{ id: string; title: string; commitCount: number; firstCommitAt: number; lastCommitAt: number; confidence: number; status: string }>
@@ -63,6 +63,8 @@ interface CommitDetailPayload {
   patch: string
   commit: { message: string; author: string; date: number } | null
   analysis: { what: string; logic: string[]; risks: string[] }
+  analysisCached?: boolean
+  analysisGeneratedAt?: number | null
 }
 
 interface ImpactScopePayload {
@@ -83,12 +85,16 @@ interface ImpactScopePayload {
   }>
   levels: Array<{ level: string; depth: number; path: string; confidence: number; reason: string }>
   direct: string[]
+  explanationsCached?: boolean
+  generatedAt?: number | null
 }
 
 export interface ReviewPayload {
   issuesFound: number
   issues: string
   verdict: string
+  cached?: boolean
+  generatedAt?: number | null
   issueList?: Array<{ severity: string; category: string; title: string; evidence: string; fix: string }>
 }
 
@@ -151,7 +157,7 @@ div[class="${hashClass}"] {
   return style
 }
 
-type TabKey = 'commits' | 'overview' | 'execution' | 'notes'
+type TabKey = 'commits' | 'overview' | 'execution' | 'notes' | 'settings'
 
 export interface WorkspaceFrameProps {
   /** 官方 details 槽契约的 locale 注入（我们注册的 project-control 词典）。 */
@@ -168,6 +174,7 @@ export const WORKSPACE_DICT = {
     'tab.overview': '项目总览',
     'tab.execution': '执行中心',
     'tab.notes': '笔记与记忆',
+    'tab.settings': '设置',
     'error.load': '加载失败',
     'state.project': '当前项目',
     'state.noProject': '尚未初始化项目',
@@ -184,8 +191,6 @@ export const WORKSPACE_DICT = {
     'form.changeDesc': '需求与背景（选填）',
     'result.panel': '操作结果',
 
-    'repo.add': '添加仓库',
-    'repo.addHint': '输入本机仓库绝对路径后回车；历史仓库已自动记忆',
     'repo.scanHistory': '重建历史',
     'repo.commits': '提交',
     'repo.branch': '分支',
@@ -208,6 +213,34 @@ export const WORKSPACE_DICT = {
     'impact.funcRole': '函数功能',
     'impact.funcChange': '本次变化',
     'impact.funcCallers': '对调用方的影响',
+    'cache.hit': '来自缓存',
+    'cache.regenerate': '重新生成',
+    'exec.create': '新建执行',
+    'exec.formTitle': '要做什么（一句话）',
+    'exec.formDesc': '需求与背景：目标、涉及模块、验收标准',
+    'exec.start': '开始执行',
+    'exec.starting': '正在启动…',
+    'exec.createHint': '创建变更并自动生成计划，随后由 AI 子代理逐步执行；进度在下方实时刷新，无需去聊天。',
+    'exec.col.steps': '步骤',
+    'notes.edit': '编辑',
+    'notes.save': '保存',
+    'notes.cancel': '取消',
+    'memory.branchScope': '分支',
+    'memory.branchAll': '全部分支',
+    'notes.search': '搜索笔记…',
+    'model.title': '模型分配（解读 / 总结等任务用哪个模型）',
+    'model.loading': '读取模型清单…',
+    'model.followChat': '跟随聊天模型',
+    'model.save': '保存并生效',
+    'model.saved': '已生效',
+    'model.hint': '保存后立即生效并持久化（重启后保留）；不影响聊天模型。',
+    'notes.aiSummary': 'AI 总结笔记',
+    'notes.aiSummaryRun': '总结生成中…（约 10-30 秒）',
+    'notes.expand': '展开全文',
+    'notes.collapse': '收起',
+    'notes.summaryTag': 'AI 总结',
+    'notes.emptySearch': '无匹配笔记。',
+    'notes.contentHint': '笔记内容（支持多行）：结论、疑问、学习要点、关键决策…',
     'impact.functionsNone': '未识别出函数级调用变化（可能是样式/静态资源/纯配置改动）。',
     'review.col.severity': '级别',
     'review.col.category': '类别',
@@ -304,6 +337,7 @@ export const WORKSPACE_DICT = {
     'tab.overview': 'Overview',
     'tab.execution': 'Execution',
     'tab.notes': 'Notes & Memory',
+    'tab.settings': 'Settings',
     'error.load': 'Failed to load',
     'state.project': 'Current project',
     'state.noProject': 'No project initialized',
@@ -344,6 +378,40 @@ export const WORKSPACE_DICT = {
     'impact.funcRole': 'Function role',
     'impact.funcChange': 'Changed by this commit',
     'impact.funcCallers': 'Impact on callers',
+    'cache.hit': 'from cache',
+    'cache.regenerate': 'Regenerate',
+    'exec.create': 'New run',
+    'exec.formTitle': 'What to do (one line)',
+    'exec.formDesc': 'Requirement: goal, modules, acceptance',
+    'exec.start': 'Start run',
+    'exec.starting': 'Starting…',
+    'exec.createHint': 'Creates a change, generates a plan, then AI subagents execute step by step; progress refreshes below.',
+    'exec.col.steps': 'Steps',
+    'notes.edit': 'Edit',
+    'notes.save': 'Save',
+    'notes.cancel': 'Cancel',
+    'memory.branchScope': 'Branch',
+    'memory.branchAll': 'All branches',
+    'notes.search': 'Search notes…',
+    'model.title': 'Model assignment (which model per task)',
+    'model.loading': 'Loading models…',
+    'model.followChat': 'Follow chat model',
+    'model.save': 'Save & apply',
+    'model.saved': 'Applied',
+    'model.hint': 'Applies immediately and persists across restarts; chat model unaffected.',
+    'notes.aiSummary': 'AI summary',
+    'notes.aiSummaryRun': 'Summarizing… (10-30s)',
+    'notes.expand': 'Expand',
+    'notes.collapse': 'Collapse',
+    'notes.summaryTag': 'AI summary',
+    'notes.emptySearch': 'No matching notes.',
+    'notes.contentHint': 'Note content (multi-line): conclusions, questions, learnings…',
+    'fs.browse': 'Browse',
+    'fs.up': 'Up',
+    'fs.use': 'Use this directory',
+    'fs.register': 'Also register as session workspace',
+    'fs.loading': 'Reading…',
+    'fs.empty': 'No subdirectories.',
     'impact.functionsNone': 'No function-level call impact detected (style/asset/config-only change).',
     'review.col.severity': 'Severity',
     'review.col.category': 'Category',
@@ -441,6 +509,19 @@ function fallbackT(key: string): string {
   return dict[key] ?? key
 }
 
+/** 操作结果人性化：✓/✗ + 标量字段的紧凑行（跳过嵌套对象与原始 JSON）。 */
+function formatActionResult(data: Record<string, unknown>): string {
+  const lines: string[] = [data['ok'] === false ? '✗' : '✓']
+  for (const [key, value] of Object.entries(data)) {
+    if (key === 'ok') continue
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      lines.push(`${key}：${String(value).slice(0, 200)}`)
+    }
+  }
+  if (lines.length === 1) lines.push('成功')
+  return lines.join('\n')
+}
+
 const styles: Record<string, React.CSSProperties> = {
   root: {
     position: 'relative',
@@ -530,6 +611,34 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: 'monospace', fontSize: '11px', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
     background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
     borderRadius: '6px', padding: '10px', maxHeight: '320px', overflowY: 'auto',
+  },
+  textarea: {
+    width: '100%', padding: '8px 10px', borderRadius: '6px', fontSize: '12px',
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
+    background: 'var(--dsw-alias-bg-base, #fff)', color: 'var(--dsw-alias-label-primary, #1f2328)',
+    boxSizing: 'border-box', resize: 'vertical', lineHeight: 1.7, fontFamily: 'inherit',
+  },
+  noteCard: {
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))',
+    borderRadius: '8px', padding: '12px 14px', marginBottom: '10px',
+    background: 'var(--dsw-alias-bg-base, #fff)',
+  },
+  noteTitleRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' },
+  noteTitleText: { fontSize: '13px', fontWeight: 600, lineHeight: 1.5 },
+  noteContent: {
+    fontSize: '12px', lineHeight: 1.85, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+    color: 'var(--dsw-alias-label-primary, #1f2328)', marginTop: '6px',
+  },
+  noteClamp: {
+    display: '-webkit-box', WebkitLineClamp: 6, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+  },
+  noteMeta: {
+    display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px',
+    fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)',
+  },
+  linkBtn: {
+    background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: '0',
+    color: 'var(--dsw-alias-brand-primary, #2563eb)',
   },
   chip: (active: boolean): React.CSSProperties => ({
     padding: '2px 10px', borderRadius: '999px', fontSize: '11px', cursor: 'pointer',
@@ -676,6 +785,63 @@ function formatTime(value: number | null | undefined): string {
   return new Date(value).toLocaleString()
 }
 
+/** 二次确认弹窗：遮罩 + 居中卡片，危险操作（删除笔记/变更/约束）共用。 */
+function ConfirmDialog(props: { title: string; message: string; danger?: boolean; onCancel: () => void; onConfirm: () => void }) {
+  return React.createElement(React.Fragment, null,
+    React.createElement('div', {
+      'data-testid': 'pc-confirm-overlay',
+      style: {
+        position: 'fixed', inset: 0, zIndex: 999,
+        background: 'rgba(15,23,42,0.45)', backdropFilter: 'blur(2px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        animation: 'pcFadeIn 0.15s ease-out',
+      },
+      onClick: props.onCancel,
+    },
+      React.createElement('div', {
+        'data-testid': 'pc-confirm-card',
+        style: {
+          width: 400, maxWidth: 'calc(100vw - 48px)',
+          background: 'var(--dsw-alias-bg-base, #fff)',
+          borderRadius: '12px', boxShadow: '0 20px 50px rgba(0,0,0,0.25)',
+          padding: '20px 22px 16px',
+          onClick: (e: React.MouseEvent) => { e.stopPropagation() },
+        },
+      },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '10px' } },
+          React.createElement('div', {
+            style: {
+              width: 34, height: 34, borderRadius: '50%', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '17px',
+              background: props.danger ? 'rgba(244,63,94,0.12)' : 'rgba(37,99,235,0.1)',
+              color: props.danger ? '#e11d48' : '#2563eb',
+            },
+          }, props.danger ? '!' : '?'),
+          React.createElement('div', null,
+            React.createElement('div', { style: { fontSize: '14px', fontWeight: 600, marginBottom: '6px', color: 'var(--dsw-alias-label-primary, #1f2328)' } }, props.title),
+            React.createElement('div', { style: { fontSize: '12px', lineHeight: 1.7, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, props.message),
+          ),
+        ),
+        React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '18px' } },
+          React.createElement('button', {
+            style: { ...styles.secondary, padding: '7px 18px', borderRadius: '8px' },
+            onClick: props.onCancel,
+          }, '取消'),
+          React.createElement('button', {
+            'data-testid': 'pc-confirm-ok',
+            style: {
+              padding: '7px 18px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 500,
+              background: props.danger ? '#e11d48' : 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
+            },
+            onClick: props.onConfirm,
+          }, '确认删除'),
+        ),
+      ),
+    ),
+  )
+}
+
 /** 骨架小卡片。 */
 function Card(props: { title?: string; children?: React.ReactNode }) {
   return React.createElement('div', { style: styles.card },
@@ -714,19 +880,21 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [reviews, setReviews] = useState<Record<string, ReviewPayload>>({})
   const [reviewLoading, setReviewLoading] = useState(false)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string>>({})
-  const [repoInput, setRepoInput] = useState('')
-  const [knownRepos, setKnownRepos] = useState<string[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem('pc.repos') ?? '[]') as string[]
-    } catch {
-      return []
-    }
-  })
-
-  // ── 笔记状态 ──
+  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; danger?: boolean; onConfirm: () => void } | null>(null)
   const [notes, setNotes] = useState<NoteEntry[]>([])
   const [noteTitle, setNoteTitle] = useState('')
   const [noteContent, setNoteContent] = useState('')
+  const [editingNote, setEditingNote] = useState<{ id: string; title: string; content: string } | null>(null)
+  const [noteSearch, setNoteSearch] = useState('')
+  const [noteExpanded, setNoteExpanded] = useState<Record<string, boolean>>({})
+  const [aiSummarizing, setAiSummarizing] = useState(false)
+  const [modelTiers, setModelTiers] = useState<Record<string, { provider: string; model: string }> | null>(null)
+  const [modelOptions, setModelOptions] = useState<Array<{ provider: string; id: string; name: string }>>([])
+  const [modelSaving, setModelSaving] = useState(false)
+  const [modelSaved, setModelSaved] = useState(false)
+  const [execTitle, setExecTitle] = useState('')
+  const [execDesc, setExecDesc] = useState('')
+  const [memoryBranch, setMemoryBranch] = useState('')
 
   const post = async (path: string, body: Record<string, unknown>): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
     const response = await fetch(path, {
@@ -752,7 +920,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   const loadNotes = async (): Promise<void> => {
     try {
-      const response = await fetch('/project-control/api/notes')
+      const response = await fetch('/project-control/api/notes?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
       const data: unknown = await response.json()
       if (response.ok) setNotes((data as { notes: NoteEntry[] }).notes ?? [])
     } catch {
@@ -769,36 +937,68 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setImpact(null)
     setReviews({})
     if (!selectedTargets.includes(target)) {
-      setDetailLoading(true)
-      try {
-        const { data } = await post('/project-control/api/commit-detail', { sha: target })
-        setDetails((previous) => ({ ...previous, [target]: data as unknown as CommitDetailPayload }))
-      } catch (error: unknown) {
-        setLoadError(error instanceof Error ? error.message : String(error))
-      } finally {
-        setDetailLoading(false)
-      }
+      await loadDetail(target, false)
     }
   }
 
-  const loadImpact = async (): Promise<void> => {
+  /** 拉取单条提交的 AI 解读；force=true 时绕过缓存强制重算。失败写入错误占位（卡片不崩溃）。 */
+  const loadDetail = async (target: string, force: boolean): Promise<void> => {
+    setDetailLoading(true)
+    try {
+      const { ok, data } = await post('/project-control/api/commit-detail', { sha: target, force })
+      if (!ok) {
+        setDetails((previous) => ({
+          ...previous,
+          [target]: {
+            sha: target,
+            isWorking: target === 'working',
+            files: [],
+            insertions: 0,
+            deletions: 0,
+            patchTruncated: false,
+            patch: '',
+            commit: null,
+            analysis: { what: 'AI 解读失败：' + String(data['error'] ?? '') + '（点「重新生成」可重试）', logic: [], risks: [] },
+          } as unknown as CommitDetailPayload,
+        }))
+        return
+      }
+      setDetails((previous) => ({ ...previous, [target]: data as unknown as CommitDetailPayload }))
+    } catch (error: unknown) {
+      setLoadError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  const loadImpact = async (force = false): Promise<void> => {
     if (selectedTargets.length === 0) return
     setImpactLoading(true)
     try {
-      const { ok, data } = await post('/project-control/api/impact-scope', { shas: selectedTargets })
+      const { ok, data } = await post('/project-control/api/impact-scope', { shas: selectedTargets, force })
       setImpact(ok ? (data as unknown as ImpactScopePayload) : null)
     } finally {
       setImpactLoading(false)
     }
   }
 
-  const loadReviews = async (): Promise<void> => {
+  const loadReviews = async (force = false): Promise<void> => {
     if (selectedTargets.length === 0) return
     setReviewLoading(true)
     try {
       for (const target of selectedTargets) {
-        const { data } = await post('/project-control/api/review', { sha: target })
-        setReviews((previous) => ({ ...previous, [target]: data as unknown as ReviewPayload }))
+        const { ok, data } = await post('/project-control/api/review', { sha: target, force })
+        const payload = data as unknown as ReviewPayload
+        setReviews((previous) => ({
+          ...previous,
+          [target]: ok ? payload : {
+            issuesFound: 0,
+            issues: '',
+            verdict: '评审失败：' + String(payload['error'] ?? '') + '（可重新生成重试）',
+            issueList: [],
+            cached: false,
+          },
+        }))
       }
     } finally {
       setReviewLoading(false)
@@ -819,22 +1019,6 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setFileDiffs((previous) => ({ ...previous, [key]: String(data['patch'] ?? '') }))
   }
 
-  const switchRepo = async (rootPath: string): Promise<void> => {
-    setBusy('switchRepo')
-    try {
-      await post('/project-control/api/bootstrap', { rootPath })
-      const next = Array.from(new Set([rootPath, ...knownRepos])).slice(0, 8)
-      setKnownRepos(next)
-      localStorage.setItem('pc.repos', JSON.stringify(next))
-      setRepoInput('')
-      await loadCommits()
-      const refreshed = await fetch('/project-control/api/state')
-      if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
-    } finally {
-      setBusy(null)
-    }
-  }
-
   const addNote = async (): Promise<void> => {
     if (noteTitle.trim() === '' || noteContent.trim() === '') return
     const { ok } = await post('/project-control/api/notes', {
@@ -851,7 +1035,54 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   const removeNote = async (id: string): Promise<void> => {
     await post('/project-control/api/notes/delete', { id })
+    if (editingNote !== null && editingNote.id === id) setEditingNote(null)
     await loadNotes()
+  }
+
+  const saveNoteEdit = async (): Promise<void> => {
+    if (editingNote === null) return
+    await post('/project-control/api/notes/update', { id: editingNote.id, title: editingNote.title, content: editingNote.content })
+    setEditingNote(null)
+    await loadNotes()
+  }
+
+  /** AI 学习总结：把已有笔记 + 项目档案提炼成一条总结笔记。 */
+  const aiSummarize = async (): Promise<void> => {
+    setAiSummarizing(true)
+    try {
+      const { ok, data } = await post('/project-control/api/notes/ai-summary', {})
+      if (!ok) {
+        setActionResult('✗ ' + String(data['error'] ?? 'error'))
+        return
+      }
+      await loadNotes()
+    } catch (error: unknown) {
+      setActionResult('✗ ' + (error instanceof Error ? error.message : String(error)))
+    } finally {
+      setAiSummarizing(false)
+    }
+  }
+
+  /** 页面一键启动执行：建变更 → LLM 生成计划 → 后台子代理逐步执行。 */
+  const startRun = async (): Promise<void> => {
+    if (execTitle.trim() === '' || execDesc.trim() === '') return
+    setBusy('startRun')
+    setActionResult(null)
+    try {
+      const { ok, data } = await post('/project-control/api/runs/start', { title: execTitle.trim(), description: execDesc.trim() })
+      if (!ok) {
+        setActionResult('✗ ' + String(data['error'] ?? 'error'))
+        return
+      }
+      setActionResult('已启动执行：' + JSON.stringify(data, null, 2))
+      setExecTitle('')
+      setExecDesc('')
+      await refreshState()
+    } catch (error: unknown) {
+      setActionResult('✗ ' + (error instanceof Error ? error.message : String(error)))
+    } finally {
+      setBusy(null)
+    }
   }
 
   // 会话打开/切换时官方会 closeDetails 收起轨道；看门狗每 500ms 检查，
@@ -944,7 +1175,39 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   useEffect(() => {
     if (tab === 'commits') void loadCommits()
     if (tab === 'notes') void loadNotes()
+    if (tab === 'settings' && modelTiers === null) void loadModelConfig()
   }, [tab, props.sessionId])
+
+  const loadModelConfig = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/model-config')
+      if (!response.ok) return
+      const data: unknown = await response.json()
+      setModelTiers((data as { tiers: Record<string, { provider: string; model: string }> }).tiers ?? {})
+      setModelOptions((data as { options: Array<{ provider: string; id: string; name: string }> }).options ?? [])
+    } catch {
+      // 模型配置加载失败不打断页面
+    }
+  }
+
+  const saveModelConfig = async (): Promise<void> => {
+    if (modelTiers === null) return
+    setModelSaving(true)
+    setModelSaved(false)
+    try {
+      const response = await fetch('/project-control/api/model-config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tiers: modelTiers }),
+      })
+      if (response.ok) {
+        setModelSaved(true)
+        setTimeout(() => { setModelSaved(false) }, 2500)
+      }
+    } finally {
+      setModelSaving(false)
+    }
+  }
 
   const refreshState = async (): Promise<void> => {
     const refreshed = await fetch('/project-control/api/state', { headers: { accept: 'application/json' } })
@@ -961,7 +1224,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         setActionResult(`✗ ${String(data['error'] ?? 'error')}`)
         return
       }
-      setActionResult(JSON.stringify(data, null, 2))
+      setActionResult(formatActionResult(data))
       await refreshState()
     } catch (error: unknown) {
       setActionResult(`✗ ${error instanceof Error ? error.message : String(error)}`)
@@ -1011,6 +1274,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     { key: 'overview', label: t('tab.overview') },
     { key: 'execution', label: t('tab.execution') },
     { key: 'notes', label: t('tab.notes') },
+    { key: 'settings', label: t('tab.settings') },
   ]
 
   /** 操作结果面板（总览页签的快捷动作共用）。 */
@@ -1056,7 +1320,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     <>
       {/* 仓库栏 */}
       <Card>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
           <span style={styles.badge('#2563eb')}>{commitsData?.branch ?? '—'}</span>
           <span style={{ fontSize: '12px' }}>{commitsData?.rootPath ?? project?.rootPath ?? '—'}</span>
           <span style={{ flex: 1 }} />
@@ -1067,32 +1331,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             onClick={() => { void runAction('scanHistory', '/project-control/api/bootstrap', { includeHistory: true, summarize: true, maxCommits: 30 }) }}
           >{busy === 'scanHistory' ? t('action.running') : t('repo.scanHistory')}</button>
         </div>
-        {knownRepos.length > 0 && (
-          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' }}>
-            {knownRepos.map((repo) => (
-              <span
-                key={repo}
-                style={styles.chip(repo === (commitsData?.rootPath ?? ''))}
-                onClick={() => { void switchRepo(repo) }}
-                title={repo}
-              >{repo.split(/[\\/]/).filter(Boolean).pop() ?? repo}</span>
-            ))}
-          </div>
-        )}
-        <div style={{ display: 'flex', gap: '6px' }}>
-          <input
-            style={styles.input}
-            placeholder={t('repo.addHint')}
-            value={repoInput}
-            onChange={(e) => { setRepoInput(e.target.value) }}
-            onKeyDown={(e) => { if (e.key === 'Enter' && repoInput.trim() !== '') void switchRepo(repoInput.trim()) }}
-          />
-          <button style={styles.button} disabled={busy !== null || repoInput.trim() === ''} onClick={() => { void switchRepo(repoInput.trim()) }}>
-            {busy === 'switchRepo' ? t('action.running') : t('repo.add')}
-          </button>
-        </div>
       </Card>
-
       {/* 提交多选下拉（紧凑；选中内容完整展示，允许自然换行） */}
       <Card title={t('picker.title')}>
         <div style={{ position: 'relative' }}>
@@ -1164,6 +1403,14 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         const label = target === 'working' ? t('repo.working') : (d?.commit?.message ?? target.slice(0, 8))
         return (
           <Card key={`d-${target}`} title={`🔍 ${label}${target !== 'working' ? `（${target.slice(0, 8)}）` : ''}`}>
+            {d !== undefined && (
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                {d.analysisCached === true && (
+                  <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{d.analysisGeneratedAt ? ' · ' + new Date(d.analysisGeneratedAt).toLocaleString() : ''}</span>
+                )}
+                <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadDetail(target, true) }}>{t('cache.regenerate')}</button>
+              </div>
+            )}
             {d === undefined ? (
               <div style={styles.empty}>{t('detail.aiLoading')}</div>
             ) : (
@@ -1234,6 +1481,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           <button style={styles.button} disabled={impactLoading} onClick={() => { void loadImpact() }}>
             {impactLoading ? t('detail.impactLoading') : t('detail.impact')}
           </button>
+          {impact !== null && impact.explanationsCached === true && (
+            <span style={{ ...styles.badge('#8b8b8b'), marginLeft: '8px' }}>
+              {t('cache.hit')}{impact.generatedAt ? ' · ' + new Date(impact.generatedAt).toLocaleString() : ''}
+            </span>
+          )}
+          {impact !== null && (
+            <button style={{ ...styles.secondary, marginLeft: '8px', padding: '2px 8px', fontSize: '11px' }} disabled={impactLoading} onClick={() => { void loadImpact(true) }}>
+              {t('cache.regenerate')}
+            </button>
+          )}
           {impact !== null && (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px', margin: '10px 0 4px', flexWrap: 'wrap' }}>
@@ -1332,7 +1589,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             const label = target === 'working' ? t('repo.working') : target.slice(0, 8)
             return (
               <div key={`r-${target}`} style={{ marginTop: '10px' }}>
-                <div style={{ ...styles.sectionTitle }}>{label}</div>
+                <div style={{ ...styles.sectionTitle, display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  {label}
+                  {r.cached === true && (
+                    <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{r.generatedAt ? ' · ' + new Date(r.generatedAt).toLocaleString() : ''}</span>
+                  )}
+                  <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadReviews(true) }}>{t('cache.regenerate')}</button>
+                </div>
                 {r.verdict !== '' && (
                   <div style={{ ...styles.what, background: 'rgba(37,99,235,0.05)', border: '1px solid rgba(37,99,235,0.2)', borderRadius: '6px', padding: '8px 10px' }}>{r.verdict}</div>
                 )}
@@ -1368,7 +1631,63 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     </>
   )
 
-  // ── 项目总览页签 ──
+  // ── 设置页签 ──
+  const TIER_LABELS: Array<{ key: string; zh: string; desc: string }> = [
+    { key: 'standard', zh: '解读 / 函数影响说明', desc: '提交核查的 AI 解读、影响分析' },
+    { key: 'reasoning', zh: '最优性核查 / 执行计划', desc: '评审、计划生成、AI 学习总结' },
+    { key: 'fast', zh: '历史轻析', desc: '扫描历史时的逐提交一句话' },
+    { key: 'verifier', zh: '验收', desc: '改动验收的 AI 复核' },
+  ]
+
+  const settingsTab = (
+    <>
+      {/* 模型分配：可视化切换各任务用的模型，保存即生效 */}
+      <Card title={t('model.title')}>
+        {modelTiers === null ? (
+          <div style={styles.empty}>{t('model.loading')}</div>
+        ) : (
+          <>
+            {TIER_LABELS.map((tier) => {
+              const current = modelTiers[tier.key]
+              const value = current ? current.provider + '/' + current.model : ''
+              return (
+                <div key={tier.key} style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap' }}>
+                  <span style={{ minWidth: 150, fontSize: '12px', fontWeight: 600 }}>{tier.zh}</span>
+                  <select
+                    style={{ ...styles.input, width: 240 }}
+                    value={value}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      if (v === '') { setModelTiers({ ...modelTiers, [tier.key]: { provider: '', model: '' } }); return }
+                      const [provider, ...rest] = v.split('/')
+                      const model = rest.join('/')
+                      setModelTiers({ ...modelTiers, [tier.key]: { provider, model } })
+                    }}
+                  >
+                    <option value="">{t('model.followChat')}</option>
+                    {modelOptions.map((option) => (
+                      <option key={option.provider + '/' + option.id} value={option.provider + '/' + option.id}>
+                        {option.provider} / {option.name}
+                      </option>
+                    ))}
+                  </select>
+                  <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{tier.desc}</span>
+                </div>
+              )
+            })}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
+              <button style={styles.button} disabled={modelSaving} onClick={() => { void saveModelConfig() }}>
+                {modelSaving ? t('action.running') : t('model.save')}
+              </button>
+              {modelSaved && <span style={styles.badge('#4ec9b0')}>{t('model.saved')}</span>}
+              <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('model.hint')}</span>
+            </div>
+          </>
+        )}
+      </Card>
+    </>
+  )
+
   const overviewTab = (
     <>
       <Card>
@@ -1414,7 +1733,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       )}
       <Card title={t('confirmed.title')}>
         <div style={styles.formRow}>
-          <input style={styles.input} placeholder={t('confirmed.text')} value={confirmedText} onChange={(e) => { setConfirmedText(e.target.value) }} />
+          <textarea rows={2} style={styles.textarea} placeholder={t('confirmed.text')} value={confirmedText} onChange={(e) => { setConfirmedText(e.target.value) }} />
           <input style={styles.input} placeholder={t('confirmed.paths')} value={confirmedPaths} onChange={(e) => { setConfirmedPaths(e.target.value) }} />
           <button
             style={styles.button}
@@ -1447,7 +1766,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       <Card title={t('action.createChange')}>
         <div style={styles.formRow}>
           <input style={styles.input} placeholder={t('form.changeTitle')} value={changeTitle} onChange={(e) => { setChangeTitle(e.target.value) }} />
-          <input style={styles.input} placeholder={t('form.changeDesc')} value={changeDesc} onChange={(e) => { setChangeDesc(e.target.value) }} />
+          <textarea rows={2} style={styles.textarea} placeholder={t('form.changeDesc')} value={changeDesc} onChange={(e) => { setChangeDesc(e.target.value) }} />
           <button
             style={styles.button}
             disabled={busy !== null || changeTitle === ''}
@@ -1468,6 +1787,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <td style={styles.td}>{change.type}</td>
                   <td style={styles.td}><span style={styles.badge(change.status === 'completed' ? '#4ec9b0' : '#569cd6')}>{change.status}</span></td>
                   <td style={styles.td}>{formatTime(change.updatedAt)}</td>
+                  <td style={styles.td}>
+                    <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这个变更任务？', message: '「' + change.title + '」及其全部执行记录、计划、问题清单将被永久删除。', danger: true, onConfirm: () => { void runAction('deleteChange', '/project-control/api/changes/delete', { id: change.id }) } }) }}>✕</button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -1477,12 +1799,20 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     </>
   )
 
-  // ── 执行中心页签 ──
+  // ── 执行中心页签：页面直接创建并启动执行，聊天只是另一种入口 ──
   const executionTab = (
     <>
-      <Card>
-        <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('exec.hint')}</div>
+      <Card title={t('exec.create')}>
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('exec.formTitle')} value={execTitle} onChange={(e) => { setExecTitle(e.target.value) }} />
+          <textarea style={styles.textarea} rows={3} placeholder={t('exec.formDesc')} value={execDesc} onChange={(e) => { setExecDesc(e.target.value) }} />
+          <button style={styles.button} disabled={busy !== null || execTitle.trim() === '' || execDesc.trim() === ''} onClick={() => { void startRun() }}>
+            {busy === 'startRun' ? t('exec.starting') : t('exec.start')}
+          </button>
+        </div>
+        <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('exec.createHint')}</div>
       </Card>
+      {resultPanel}
       <Card>
         <div style={styles.row}>
           <span><span style={styles.label}>{t('exec.attempts')}</span>{String(state?.attemptsCount ?? 0)}</span>
@@ -1492,13 +1822,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         ) : (
           <table style={styles.table}>
             <thead>
-              <tr>{['exec.col.change', 'exec.col.status', 'exec.col.started', 'exec.col.cost'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+              <tr>{['exec.col.change', 'exec.col.steps', 'exec.col.status', 'exec.col.started', 'exec.col.cost'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
             </thead>
             <tbody>
               {runs.map((run) => (
                 <tr key={run.id}>
-                  <td style={styles.td}>{run.changeId}</td>
-                  <td style={styles.td}><span style={styles.badge(run.status === 'completed' ? '#4ec9b0' : '#dcdcaa')}>{run.status}</span></td>
+                  <td style={styles.td}>{(changes.find((change) => change.id === run.changeId)?.title) ?? run.changeId}</td>
+                  <td style={styles.td}>{run.stepsTotal ? (run.stepsDone ?? 0) + '/' + run.stepsTotal : '—'}</td>
+                  <td style={styles.td}>
+                    <span style={styles.badge(run.status === 'completed' ? '#4ec9b0' : run.status === 'failed' ? '#f14c4c' : '#dcdcaa')}>{run.status}</span>
+                    {run.currentStep !== null && run.currentStep !== undefined && run.status === 'running' && (
+                      <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.currentStep}</div>
+                    )}
+                  </td>
                   <td style={styles.td}>{formatTime(run.startedAt)}</td>
                   <td style={styles.td}>{run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'}</td>
                 </tr>
@@ -1513,61 +1849,133 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // ── 笔记与记忆页签 ──
   const notesTab = (
     <>
+      {/* ── 笔记：卡片式阅读 + 多行编辑 + 搜索 + AI 总结 ── */}
       <Card title={t('notes.title')}>
-        <div style={styles.formRow}>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' }}>
+          <input
+            style={{ ...styles.input, width: 220 }}
+            placeholder={t('notes.search')}
+            value={noteSearch}
+            onChange={(e) => { setNoteSearch(e.target.value) }}
+          />
+          <span style={{ flex: 1 }} />
+          <button style={styles.secondary} disabled={aiSummarizing} onClick={() => { void aiSummarize() }}>
+            {aiSummarizing ? t('notes.aiSummaryRun') : '✨ ' + t('notes.aiSummary')}
+          </button>
+        </div>
+        <div style={{ ...styles.formRow, border: '1px dashed var(--dsw-alias-border-l2, rgba(5,5,5,0.15))', borderRadius: '8px', padding: '10px' }}>
           <input style={styles.input} placeholder={t('notes.formTitle')} value={noteTitle} onChange={(e) => { setNoteTitle(e.target.value) }} />
-          <input style={styles.input} placeholder={t('notes.formContent')} value={noteContent} onChange={(e) => { setNoteContent(e.target.value) }} />
+          <textarea
+            style={styles.textarea}
+            rows={4}
+            placeholder={t('notes.contentHint')}
+            value={noteContent}
+            onChange={(e) => { setNoteContent(e.target.value) }}
+          />
           {selectedTargets.length > 0 && (
             <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
               {t('notes.boundTo')}: {selectedTargets[0] === 'working' ? t('repo.working') : selectedTargets[0].slice(0, 8)}
             </div>
           )}
-          <button style={styles.button} disabled={noteTitle.trim() === '' || noteContent.trim() === ''} onClick={() => { void addNote() }}>{t('notes.add')}</button>
+          <div>
+            <button style={styles.button} disabled={noteTitle.trim() === '' || noteContent.trim() === ''} onClick={() => { void addNote() }}>{t('notes.add')}</button>
+          </div>
         </div>
-        {notes.length === 0 ? (
-          <div style={styles.empty}>{t('notes.empty')}</div>
-        ) : (
-          <table style={styles.table}>
-            <thead>
-              <tr>{['notes.col.time', 'notes.col.title', 'notes.col.content', 'notes.col.sha', ''].map((key, i) => <th key={i} style={styles.th}>{key === '' ? '' : t(key)}</th>)}</tr>
-            </thead>
-            <tbody>
-              {notes.map((note) => (
-                <tr key={note.id}>
-                  <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>{new Date(note.createdAt).toLocaleString()}</td>
-                  <td style={styles.td}>{note.title}</td>
-                  <td style={styles.td}>{note.content}</td>
-                  <td style={styles.td}>{note.sha === undefined ? '—' : note.sha === 'working' ? t('repo.working') : note.sha.slice(0, 8)}</td>
-                  <td style={styles.td}>
-                    <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void removeNote(note.id) }}>✕</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        {(() => {
+          const keyword = noteSearch.trim().toLowerCase()
+          const visible = keyword === ''
+            ? notes
+            : notes.filter((note) => (note.title + ' ' + note.content).toLowerCase().includes(keyword))
+          if (visible.length === 0) {
+            return <div style={styles.empty}>{notes.length === 0 ? t('notes.empty') : t('notes.emptySearch')}</div>
+          }
+          return visible.map((note) => {
+            const isSummary = note.sha === 'summary'
+            const editing = editingNote !== null && editingNote.id === note.id ? editingNote : null
+            const expanded = noteExpanded[note.id] === true
+            const long = note.content.length > 260 || note.content.split('\n').length > 6
+            return (
+              <div
+                key={note.id}
+                style={{
+                  ...styles.noteCard,
+                  ...(isSummary ? { background: 'rgba(37,99,235,0.04)', borderColor: 'rgba(37,99,235,0.3)' } : {}),
+                }}
+              >
+                {editing !== null ? (
+                  <div style={styles.formRow}>
+                    <input style={styles.input} value={editing.title} onChange={(e) => { setEditingNote({ ...editing, title: e.target.value }) }} />
+                    <textarea style={styles.textarea} rows={8} value={editing.content} onChange={(e) => { setEditingNote({ ...editing, content: e.target.value }) }} />
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <button style={{ ...styles.button, padding: '4px 12px' }} onClick={() => { void saveNoteEdit() }}>{t('notes.save')}</button>
+                      <button style={{ ...styles.secondary, padding: '4px 12px' }} onClick={() => { setEditingNote(null) }}>{t('notes.cancel')}</button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div style={styles.noteTitleRow}>
+                      <div style={styles.noteTitleText}>{isSummary ? '📖 ' : ''}{note.title}</div>
+                      <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setEditingNote({ id: note.id, title: note.title, content: note.content }) }}>{t('notes.edit')}</button>
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这条笔记？', message: '「' + note.title + '」将被永久删除，不可恢复。', danger: true, onConfirm: () => { void removeNote(note.id) } }) }}>✕</button>
+                      </div>
+                    </div>
+                    <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{note.content}</div>
+                    {long && (
+                      <button style={styles.linkBtn} onClick={() => { setNoteExpanded({ ...noteExpanded, [note.id]: !expanded }) }}>
+                        {expanded ? t('notes.collapse') : t('notes.expand')}（{note.content.length} 字）
+                      </button>
+                    )}
+                    <div style={styles.noteMeta}>
+                      <span>{new Date(note.createdAt).toLocaleString()}</span>
+                      {isSummary && <span style={styles.badge('#2563eb')}>{t('notes.summaryTag')}</span>}
+                      {note.sha !== undefined && note.sha !== 'summary' && (
+                        <span style={styles.badge('#8b8b8b')}>{note.sha === 'working' ? t('repo.working') : note.sha.slice(0, 8)}</span>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )
+          })
+        })()}
       </Card>
-      <Card title={t('memory.record')}>
+      <Card title={t('memory.record') + (project !== null ? ' · ' + project.name : '')}>
         <div style={styles.formRow}>
           <input style={styles.input} placeholder={t('form.memoryTitle')} value={memoryTitle} onChange={(e) => { setMemoryTitle(e.target.value) }} />
-          <input style={styles.input} placeholder={t('form.memoryContent')} value={memoryContent} onChange={(e) => { setMemoryContent(e.target.value) }} />
+          <textarea style={styles.textarea} rows={3} placeholder={t('form.memoryContent')} value={memoryContent} onChange={(e) => { setMemoryContent(e.target.value) }} />
           <button
             style={styles.button}
             disabled={busy !== null || memoryTitle === '' || memoryContent === ''}
             onClick={() => { void runAction('recordMemory', '/project-control/api/memory', { memoryType: 'project_log', title: memoryTitle, content: memoryContent }).then(() => { setMemoryTitle(''); setMemoryContent('') }) }}
           >{busy === 'recordMemory' ? t('action.running') : t('memory.record')}</button>
         </div>
+        {project !== null && (
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('memory.branchScope')}</span>
+            <select style={{ ...styles.input, width: 'auto', padding: '3px 8px' }} value={memoryBranch} onChange={(e) => { setMemoryBranch(e.target.value) }}>
+              <option value="">{t('memory.branchAll')}</option>
+              {Array.from(new Set(memories.filter((memory) => memory.projectId === project.id).map((memory) => memory.gitBranch).filter((branch): branch is string => branch !== null && branch !== ''))).map((branch) => (
+                <option key={branch} value={branch}>{branch}</option>
+              ))}
+            </select>
+          </div>
+        )}
         {memories.length === 0 ? (
           <div style={styles.empty}>{t('memory.empty')}</div>
         ) : (
           <table style={styles.table}>
             <thead>
-              <tr>{['memory.col.title', 'memory.col.type', 'memory.col.truth', 'memory.col.branch', 'memory.confirm'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+              <tr>{['memory.col.title', 'memory.col.content', 'memory.col.type', 'memory.col.truth', 'memory.col.branch', 'memory.confirm'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
             </thead>
             <tbody>
-              {memories.map((memory) => (
+              {memories
+                .filter((memory) => project === null || project === undefined || memory.projectId === project.id)
+                .filter((memory) => memoryBranch === '' || memory.gitBranch === memoryBranch)
+                .map((memory) => (
                 <tr key={memory.id}>
                   <td style={styles.td}>{memory.title}</td>
+                  <td style={{ ...styles.td, fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{memory.content ?? '—'}</td>
                   <td style={styles.td}>{memory.type}</td>
                   <td style={styles.td}><span style={styles.badge(memory.isHumanConfirmed ? '#4ec9b0' : '#dcdcaa')}>{memory.isHumanConfirmed ? 'confirmed' : memory.truthLevel}</span></td>
                   <td style={styles.td}>{memory.gitBranch ?? '—'}</td>
@@ -1663,7 +2071,17 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {tab === 'overview' && overviewTab}
         {tab === 'execution' && executionTab}
         {tab === 'notes' && notesTab}
+        {tab === 'settings' && settingsTab}
       </div>
+      {confirmDialog !== null && (
+        <ConfirmDialog
+          title={confirmDialog.title}
+          message={confirmDialog.message}
+          danger={confirmDialog.danger}
+          onCancel={() => { setConfirmDialog(null) }}
+          onConfirm={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }}
+        />
+      )}
     </div>
   )
 }

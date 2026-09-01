@@ -100,13 +100,31 @@ export class ProjectControlService {
       importedChanges: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('imported_changes')),
       historyCursor: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('history_cursor')),
       confirmed: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('confirmed')),
+      snapshots: new DomainRepository<Record<string, unknown>>(this.analysisDomainHandle.table('snapshots')),
       notes: new DomainRepository<ProjectNoteRecord>(this.coreDomainHandle.table('notes')),
+      pluginSettings: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('plugin_settings')),
       evidence: new DomainRepository<EvidenceRecord>(this.analysisDomainHandle.table('evidence')),
       issues: new DomainRepository<ReviewIssueRecord>(this.historyDomainHandle.table('issues')),
       verifications: new DomainRepository<VerificationRecord>(this.historyDomainHandle.table('verifications')),
       memories: new DomainRepository<MemoryRecord>(this.historyDomainHandle.table('memories')),
       concepts: new DomainRepository<any>(this.historyDomainHandle.table('concepts')),
     })
+
+    // 页面保存的模型分配覆盖 settings.yaml（可视化配置优先）。
+    const savedTiers = this.store.pluginSettings?.get('model-tiers')
+    if (savedTiers !== undefined && savedTiers !== null && typeof savedTiers === 'object') {
+      const saved = savedTiers as Record<string, unknown>
+      const clean: Record<string, { provider: string; model: string }> = {}
+      for (const key of ['standard', 'fast', 'reasoning', 'verifier']) {
+        const entry = saved[key]
+        if (typeof entry === 'object' && entry !== null) {
+          const provider = String((entry as Record<string, unknown>)['provider'] ?? '')
+          const model = String((entry as Record<string, unknown>)['model'] ?? '')
+          if (provider !== '' && model !== '') clean[key] = { provider, model }
+        }
+      }
+      this.liveConfig = { ...this.liveConfig, modelTiers: { ...this.liveConfig.modelTiers, ...clean } } as typeof this.liveConfig
+    }
 
     // 执行系统启动时的未完成任务恢复扫描
     const recoveryScanner = new RecoveryScanner(this.store)

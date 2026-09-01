@@ -150,10 +150,11 @@ export class RunOrchestrator {
   // ── Run ─────────────────────────────────────────────────────────────────
 
   /**
-   * 启动一次执行：创建 Run + Step 持久记录，然后经 ctx.jobs 后台执行。
-   * @param owner 触发执行的 agent（job owner：agent 取消 / 释放会连带取消任务）。
+   * 启动一次执行：创建 Run + Step 持久记录，然后后台执行。
+   * @param owner 触发执行的 agent（聊天路径；agent 取消/释放会连带取消任务）。
+   *   传 undefined = 页面触发的无会话执行：不经 jobs，直接后台跑，取消走 cancelRun。
    */
-  async startRun(owner: Agent, change: ChangeRecord, options: { wait?: boolean } = {}): Promise<RunId> {
+  async startRun(owner: Agent | undefined, change: ChangeRecord, options: { wait?: boolean } = {}): Promise<RunId> {
     if (change.currentPlanId === undefined) {
       throw new Error(`change "${change.id}" has no plan; create a plan first`)
     }
@@ -162,7 +163,7 @@ export class RunOrchestrator {
 
     const runId = createRunId()
     // 步骤代理路由：优先发起会话的当前路由（provider 已在本部署注册），settings 覆盖其次。
-    const sessionRoute = owner.session.requestHeader()?.config
+    const sessionRoute = owner?.session.requestHeader()?.config
     const standardOverride = this.deps.config().modelTiers.standard
     if (sessionRoute && sessionRoute.provider && sessionRoute.model) {
       this.runRoutes.set(runId, { provider: standardOverride?.provider || sessionRoute.provider, model: standardOverride?.model || sessionRoute.model, modelClass: 'standard' })
@@ -219,6 +220,15 @@ export class RunOrchestrator {
       } finally {
         this.runRoutes.delete(runId)
       }
+      return runId
+    }
+
+    if (owner === undefined) {
+      // 无会话执行（页面触发）：不经 jobs（owner agent 的组合没有 jobs 控制器），
+      // 直接后台跑；取消统一走 orchestrator.cancelRun。
+      void this.executeRun(run, change, plan).catch(() => {}).finally(() => {
+        this.runRoutes.delete(runId)
+      })
       return runId
     }
 
@@ -469,9 +479,9 @@ export class RunOrchestrator {
     return { provider: deployment.provider, model: deployment.model, modelClass }
   }
 
-  /** 是否只读步骤（分析 / 审查类，不要求工作区变化）。 */
+  /** 是否只读步骤（分析 / 审查类，不要求工作区变化）。中英文关键词都要覆盖——计划是中文生成的。 */
   private isAnalysisStep(definition: PlanStepDefinition): boolean {
-    return /analy|review|read|inspect|investigat/i.test(definition.title + ' ' + definition.description)
+    return /analy|review|read|inspect|investigat|分析|审查|评审|阅读|调研|梳理|总结|检查|理解|了解/i.test(definition.title + ' ' + definition.description)
   }
 
   /** 汇总子代理会话的 token usage（assistant/message 自带 usage 字段）。 */

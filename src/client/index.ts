@@ -68,21 +68,35 @@ export function apply(ctx: any): void {
   })
 
   // ── 2. 侧边栏底部：工作台 ⇄ 官方详情 切换 ─────────────────────────────
+  // 按钮状态明示：工作台显示中 → 「🧭 工作台 ✓」；已切官方详情 → 「🧭 打开工作台」高亮，
+  // 用户随时看得到怎么切回来（切换经 window 事件通知按钮重渲染）。
+  const TOGGLE_EVENT = 'pc-workspace-toggle'
+  const fireToggle = (enabled: boolean): void => {
+    window.dispatchEvent(new CustomEvent(TOGGLE_EVENT, { detail: enabled }))
+  }
   ctx.slots.inject('sidebar.footer.action', () => {
     return ctx.slots.register({
       name: 'sidebar.footer.action',
       id: 'project-control-toggle',
     }, () => {
+      const [enabled, setEnabled] = React.useState(workspaceEnabled)
+      React.useEffect(() => {
+        const handler = (event: Event): void => { setEnabled((event as CustomEvent<boolean>).detail) }
+        window.addEventListener(TOGGLE_EVENT, handler)
+        return () => { window.removeEventListener(TOGGLE_EVENT, handler) }
+      }, [])
       return React.createElement(
         'button',
         {
           'data-testid': 'project-control-sidebar-toggle',
-          title: '项目工作台 ⇄ 详情面板',
+          title: enabled ? '当前显示项目核查台。点击可临时切换为官方「详情」面板（查看工具调用的完整输入/输出）；再点本按钮即恢复。' : '当前显示官方「详情」面板。点击恢复项目核查台。',
           style: {
             display: 'flex', alignItems: 'center', gap: '6px',
             padding: '6px 10px', fontSize: '12px',
             background: 'none', border: 'none',
-            color: 'inherit', cursor: 'pointer', opacity: 0.85,
+            color: enabled ? 'inherit' : 'var(--dsw-alias-brand-primary, #2563eb)',
+            fontWeight: enabled ? 400 : 600,
+            cursor: 'pointer', opacity: 0.9,
           },
           onClick: () => {
             workspaceEnabled = !workspaceEnabled
@@ -92,9 +106,10 @@ export function apply(ctx: any): void {
             } catch (error: unknown) {
               console.warn('[project-control] workspace toggle failed', error)
             }
+            fireToggle(workspaceEnabled)
           },
         },
-        '🧭 工作台',
+        enabled ? '🧭 工作台 ✓' : '🧭 打开工作台',
       )
     })
   })

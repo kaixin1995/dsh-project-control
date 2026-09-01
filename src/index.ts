@@ -27,7 +27,7 @@ export const name = 'project-control'
  * 注入的服务依赖（直接读取的服务必须在此声明；storageDomain / webServer 为
  * 可选动态注入——headless 等面不挂载，静默降级，不阻塞激活）。
  */
-export const inject = ['tools', 'commands', 'agents', 'jobs', 'sessions', 'llm', 'systemPrompt']
+export const inject = ['tools', 'commands', 'agents', 'jobs', 'sessions', 'llm', 'systemPrompt', 'workspaceRegistry']
 
 /**
  * 插件装配函数：创建服务、提供 projectControl、启动存储（动态）、
