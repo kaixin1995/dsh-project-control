@@ -57,7 +57,7 @@ export class ProjectControlService {
   /** 插件自身版本号（取自 package.json，供工作台展示与导出文件命名）。 */
   public readonly version: string = (() => {
     try {
-      const pkgPath = new URL('../../package.json', import.meta.url)
+      const pkgPath = new URL('../package.json', import.meta.url)
       return String(JSON.parse(readFileSync(pkgPath, 'utf8')).version ?? '0.0.0')
     } catch {
       return '0.0.0'
