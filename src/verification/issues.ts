@@ -13,6 +13,8 @@ export interface CreateIssueParams {
   projectId: ProjectId
   changeId: ChangeId
   severity: IssueSeverity
+  /** 问题分类（评审输出中的自由文本分类，如 并发/错误处理）。 */
+  category?: string
   title: string
   description: string
   evidenceIds?: EvidenceId[]
@@ -32,6 +34,7 @@ export class ReviewIssueManager {
       projectId: params.projectId,
       changeId: params.changeId,
       severity: params.severity,
+      category: params.category,
       status: 'open',
       title: params.title,
       description: params.description,

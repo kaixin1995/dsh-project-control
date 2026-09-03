@@ -29,6 +29,9 @@ import { ChangeService } from '../domain/change.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
 import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
+import type { ConfirmedItemRecord } from './confirmed.ts'
+import { ReviewIssueManager } from '../verification/issues.ts'
+import type { IssueSeverity } from '../domain/models.ts'
 import { resolveDeploymentRoute } from '../config.ts'
 import type { ProjectControlService } from './service.ts'
 
@@ -318,12 +321,15 @@ function sessionCwdOf(service: ProjectControlService, body: Record<string, unkno
 
 /**
  * 采纳当前项目，按优先级：
- * 1. 已采纳项目；
+ * 1. 请求显式携带 rootPath（与 /bootstrap 一致的直连方式，测试与脚本用）；
  * 2. 请求携带 sessionId 时反查会话工作目录并 ensureProject（多项目/换工作区场景，页面按钮的主路径）；
- * 3. 回落最后一个已持久化项目（重启后首次调用）。
+ * 3. 已采纳项目；
+ * 4. 回落最后一个已持久化项目（重启后首次调用）。
  */
 async function adoptProject(service: ProjectControlService, body: Record<string, unknown> = {}): Promise<{ id: string } | undefined> {
-  const cwd = sessionCwdOf(service, body)
+  // 显式 rootPath 优先（与 /bootstrap 一致的调用方直连方式），其次会话工作目录。
+  const explicitRoot = typeof body['rootPath'] === 'string' && body['rootPath'] !== '' ? body['rootPath'] : undefined
+  const cwd = explicitRoot ?? sessionCwdOf(service, body)
   if (service.currentProject === undefined || cwd !== undefined) {
     const root = cwd ?? service.currentProject?.identity.rootPath
     if (root !== undefined) {
@@ -348,6 +354,67 @@ function trimSnippet(text: string, max = 160): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`
 }
 
+/**
+ * LLM 评审严重度（critical/high/medium/low/info）→ 领域枚举（blocker/critical/major/minor/info）。
+ * 保持严重度序不变：仅 critical 映射为可阻塞级（hasBlockingIssues 只认 blocker/critical）。
+ * 旧版落库的历史记录未做该映射，读取边界统一归一。
+ */
+const ISSUE_SEVERITY_MAP: Record<string, IssueSeverity> = {
+  critical: 'critical',
+  high: 'major',
+  medium: 'minor',
+  low: 'minor',
+  info: 'info',
+}
+
+/** 严重度归一（未知值回落 minor）：GET /issues 读取边界使用，兼容历史记录。 */
+function normalizeSeverity(severity: string): IssueSeverity {
+  return ISSUE_SEVERITY_MAP[severity] ?? 'minor'
+}
+
+/** 解析请求体里的标签字段：接受逗号分隔字符串或字符串数组；无有效标签返回 undefined。 */
+function parseTags(raw: unknown): string[] | undefined {
+  const list = typeof raw === 'string' ? raw.split(/[,，]/) : Array.isArray(raw) ? raw : []
+  const tags = list.filter((tag): tag is string => typeof tag === 'string')
+    .map((tag) => tag.trim()).filter((tag) => tag !== '')
+  return tags.length > 0 ? Array.from(new Set(tags)) : undefined
+}
+
+/** 评审问题清单条目（/review 解析结果与缓存载荷共用）。 */
+interface ReviewIssueEntry {
+  severity: string
+  category: string
+  title: string
+  evidence: string
+  fix: string
+}
+
+/**
+ * 把评审结果落到 issues 表（「Review 问题」板块数据源）：
+ * 同一评审目标先清旧记录再写入，重新评审替换而非堆积。
+ */
+async function persistReviewIssues(
+  service: ProjectControlService,
+  projectId: string,
+  issueTarget: string,
+  issueList: ReviewIssueEntry[],
+): Promise<void> {
+  for (const stale of service.store.issues.list((issue) => issue.changeId === issueTarget)) {
+    await service.store.issues.delete(stale.id)
+  }
+  const issuesManager = new ReviewIssueManager(service.store.issues)
+  for (const entry of issueList) {
+    await issuesManager.createIssue({
+      projectId: projectId as never,
+      changeId: issueTarget as never,
+      severity: ISSUE_SEVERITY_MAP[entry.severity] ?? 'minor',
+      category: entry.category,
+      title: entry.title,
+      description: `证据：${entry.evidence}${entry.fix === '' ? '' : `；建议：${entry.fix}`}`,
+    })
+  }
+}
+
 /** 工作台所需的完整状态快照（来自 storage-domain 真实数据）。 */
 function buildState(service: ProjectControlService): Record<string, unknown> {
   const store = service.store
@@ -356,12 +423,16 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
   }
   const projects = store.projects.list()
   const project = service.currentProject ?? projects.at(-1) ?? null
-  const changes = store.changes.list()
-  const runs = store.runs.list()
-  const attempts = store.attempts.list()
-  const memories = store.memories.list()
-  const evidence = store.evidence.list()
-  const checkpoint = store.checkpoints.list().at(-1) ?? null
+  // 工作台是项目级视图：所有业务列表按当前项目过滤，跨项目数据不串显。
+  const pid = project?.id
+  const inProject = <T extends { projectId: string }>(records: T[]): T[] =>
+    pid === undefined ? [] : records.filter((record) => record.projectId === pid)
+  const changes = inProject(store.changes.list())
+  const runs = inProject(store.runs.list())
+  const attempts = inProject(store.attempts.list())
+  const memories = inProject(store.memories.list())
+  const evidence = inProject(store.evidence.list())
+  const checkpoint = inProject(store.checkpoints.list()).at(-1) ?? null
   const costTracker = new CostTracker()
   const runCostUsd = (runId: string): number => {
     let usd = 0
@@ -415,7 +486,7 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       }
     }),
     attemptsCount: attempts.length,
-    importedChanges: (store.importedChanges?.list() ?? []).slice(-100).map((item) => ({
+    importedChanges: inProject(store.importedChanges?.list() ?? []).slice(-100).map((item) => ({
       id: item.id,
       title: item.title,
       commitCount: item.commitShas.length,
@@ -424,15 +495,15 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       confidence: item.confidence,
       status: item.status,
     })),
-    issues: store.issues.list().slice(-50).map((issue) => ({
+    issues: inProject(store.issues.list()).slice(-50).map((issue) => ({
       id: issue.id,
       changeId: issue.changeId,
       severity: issue.severity,
-      category: issue.category,
+      category: issue.category ?? '',
       title: issue.title,
       status: issue.status,
     })),
-    verifications: store.verifications.list().slice(-50).map((verification) => ({
+    verifications: inProject(store.verifications.list()).slice(-50).map((verification) => ({
       id: verification.id,
       changeId: verification.changeId,
       name: verification.name,
@@ -440,13 +511,15 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       status: verification.status,
       createdAt: verification.createdAt,
     })),
-    confirmed: (store.confirmed?.list() ?? []).filter((item) => (item as { status?: string }).status === 'active').map((item) => ({
-      id: (item as { id: string }).id,
-      type: (item as { type: string }).type,
-      text: (item as { text: string }).text,
-      forbiddenPaths: (item as { forbiddenPaths?: string[] }).forbiddenPaths ?? [],
-    })),
-    concepts: (store.concepts?.list() ?? []).slice(-50).map((concept) => ({
+    confirmed: inProject((store.confirmed?.list() ?? []) as ConfirmedItemRecord[])
+      .filter((item) => item.status === 'active')
+      .map((item) => ({
+        id: item.id,
+        type: item.type,
+        text: item.text,
+        forbiddenPaths: item.forbiddenPaths ?? [],
+      })),
+    concepts: inProject(store.concepts?.list() ?? []).slice(-50).map((concept) => ({
       id: concept.id,
       name: concept.name,
       category: concept.category,
@@ -618,6 +691,13 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             if (text === '') {
               res.writeHead(400, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'text is required' }))
+              return
+            }
+            // 约束归属当前会话项目：无项目时明确报错，而不是错标到 prj_ad_hoc。
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized; open a project workspace first' }))
               return
             }
             const item = addConfirmedItem(service, {
@@ -841,15 +921,27 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             }
             const reviewRoute = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
             const reviewStoreKey = `rv:${cwd}|${reviewSha ?? 'working'}|${diff.diffHash}|v${PROMPT_VERSION}|${reviewRoute.provider}/${reviewRoute.model}`
+            // 评审问题落库目标：请求带有效 changeId 时挂靠该变更，否则按评审对象（提交 sha / 工作区）建合成目标。
+            const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : undefined
+            const boundChange = changeId !== undefined && changeId !== ''
+              ? service.store.changes.get(changeId as never)
+              : undefined
+            const issueTarget = boundChange !== undefined ? boundChange.id : `review:${reviewSha ?? 'worktree'}`
             if (!reviewForce) {
               const storeHit = cacheRead(service, reviewStoreKey)
               if (storeHit !== undefined) {
+                const cachedList = (storeHit.payload['issueList'] ?? []) as ReviewIssueEntry[]
+                // 缓存命中也保证落库：该目标尚无记录时补写一次（后续命中不再重复写）。
+                if (cachedList.length > 0
+                  && service.store.issues.list((issue) => issue.changeId === issueTarget).length === 0) {
+                  await persistReviewIssues(service, project.id, issueTarget, cachedList)
+                }
                 res.writeHead(200, { 'content-type': 'application/json' })
                 res.end(JSON.stringify({
                   issuesFound: Number(storeHit.payload['issuesFound'] ?? 0),
                   issues: String(storeHit.payload['issues'] ?? ''),
                   verdict: String(storeHit.payload['verdict'] ?? ''),
-                  issueList: storeHit.payload['issueList'] ?? [],
+                  issueList: cachedList,
                   cached: true,
                   generatedAt: storeHit.createdAt,
                 }))
@@ -857,7 +949,6 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               }
             }
             const route = reviewRoute
-            const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : undefined
             let analysis: { text: string }
             try {
               analysis = await runLlmAnalysis(ctx, {
@@ -889,7 +980,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const verdict = verdictMatch?.[1]?.trim() ?? ''
             const lines = analysis.text.slice(0, verdictMatch?.index ?? analysis.text.length)
               .split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
-            const issueList = lines.map((line) => {
+            const issueList: ReviewIssueEntry[] = lines.map((line) => {
               const parts = line.split('|').map((part) => part.trim())
               return {
                 severity: parts[0] ?? 'medium',
@@ -899,25 +990,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 fix: parts[4] ?? '',
               }
             })
-            if (changeId !== undefined && changeId !== '') {
-              const change = service.store.changes.get(changeId as never)
-              if (change !== undefined) {
-                const issuesManager = new ReviewIssueManager(service.store.issues)
-                for (const line of lines) {
-                  const parts = line.split('|').map((part) => part.trim())
-                  if (parts.length < 4) continue
-                  const severity = parts[0]!.toLowerCase()
-                  await issuesManager.createIssue({
-                    projectId: change.projectId,
-                    changeId: change.id,
-                    severity: (['critical', 'high', 'medium', 'low', 'info'].includes(severity) ? severity : 'medium') as never,
-                    category: parts[1]!,
-                    title: parts[2]!,
-                    description: `Evidence: ${parts[3]}. Suggested fix: ${parts[4] ?? 'none'}`,
-                  })
-                }
-              }
-            }
+            await persistReviewIssues(service, project.id, issueTarget, issueList)
             const generatedAt = Date.now()
             cacheWrite(service, reviewStoreKey, 'review', { issuesFound: lines.length, issues: analysis.text, verdict, issueList })
             res.writeHead(200, { 'content-type': 'application/json' })
@@ -1723,6 +1796,195 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
         }
 
         // 笔记：人工/AI 的核查批注，可关联提交。
+        // ── Review 问题板块（独立页签数据源）：全量、按严重度排序。 ──────────────
+        if (req.method === 'GET' && routePath === '/issues') {
+          const query: Record<string, unknown> = {}
+          for (const [key, value] of url.searchParams.entries()) query[key] = value
+          const project = await adoptProject(service, query)
+          const pid = project?.id
+          const severityWeight: Record<string, number> = { blocker: 0, critical: 1, major: 2, minor: 3, info: 4 }
+          const issues = (service.store?.issues.list() ?? [])
+            .filter((issue) => pid === undefined || issue.projectId === pid)
+            .sort((left, right) =>
+              (severityWeight[left.severity] ?? 9) - (severityWeight[right.severity] ?? 9)
+              || right.createdAt - left.createdAt)
+            .map((issue) => ({
+              id: issue.id,
+              changeId: issue.changeId,
+              severity: normalizeSeverity(issue.severity),
+              category: issue.category ?? '',
+              title: issue.title,
+              description: issue.description ?? '',
+              status: issue.status,
+              resolution: issue.resolution ?? '',
+              createdAt: issue.createdAt,
+              updatedAt: issue.updatedAt,
+            }))
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ issues }))
+          return
+        }
+        if (req.method === 'POST' && routePath === '/issues/status') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const status = typeof body['status'] === 'string' ? body['status'] : ''
+            const allowed = ['open', 'fixing', 'resolved', 'accepted', 'rejected']
+            if (id === '' || !allowed.includes(status)) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'id and a valid status are required' }))
+              return
+            }
+            const manager = new ReviewIssueManager(service.store.issues)
+            await manager.updateStatus(id as never, status as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        // 问题复检：对一组未解决问题重跑检测（修复确认 + 最优性/最小侵入 + 新问题扫描）。
+        // 只有复检判定 FIXED 才置 resolved；人工不直接标记解决状态。
+        if (req.method === 'POST' && routePath === '/issues/verify') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const target = typeof body['target'] === 'string' && body['target'] !== '' ? body['target'] : ''
+            if (target === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'target is required' }))
+              return
+            }
+            const openIssues = service.store.issues.list(
+              (issue) => issue.projectId === project.id && issue.changeId === target
+                && (issue.status === 'open' || issue.status === 'fixing'),
+            ).sort((left, right) => left.createdAt - right.createdAt)
+            // 评审基线：提交评审取该提交，工作区/变更评审取 HEAD（未提交改动）。
+            const baseSha = target.startsWith('review:') && target !== 'review:worktree' ? target.slice('review:'.length) : undefined
+            const diff = baseSha !== undefined
+              ? await service.git.getDiff(cwd, { from: baseSha, maxBytes: 200 * 1024 })
+              : await service.git.getDiff(cwd)
+            const targetLabel = target.startsWith('review:') && target !== 'review:worktree'
+              ? `提交 ${target.slice('review:'.length, 'review:'.length + 8)}` : '工作区'
+            if (diff.filesChanged === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({
+                ok: true,
+                target,
+                resolved: [],
+                stillOpen: openIssues.map((issue) => ({ title: issue.title, reason: '评审基线以来代码无改动，问题不可能已修复' })),
+                newIssues: [],
+                verdict: `复检对象（${targetLabel}）自评审基线以来无任何代码改动。`,
+              }))
+              return
+            }
+            const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+            let analysis: { text: string }
+            try {
+              analysis = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是代码评审复检员。下面是「此前评审发现且尚未解决的问题清单」和「当前代码相对评审基线的完整差异」。',
+                  '任务一（修复确认）：逐条判断每个问题在当前代码中是否已修复，每行输出：',
+                  'FIXED | 问题序号 | 一句话依据（引用差异中的具体变化）',
+                  '或 NOT_FIXED | 问题序号 | 一句话说明当前代码为何仍存在该问题',
+                  '任务二（新问题扫描）：对当前差异做一次完整复审——正确性、错误处理、并发、资源泄漏、安全、侵入式是否最小、实现是否最优；每个新问题一行：',
+                  'NEW | SEVERITY | category | title | evidence location | suggested fix',
+                  '（SEVERITY 为 critical/high/medium/low/info；无新问题则只输出：NEW | CLEAN）',
+                  '任务三：最后一行输出 OPTIMALITY: <中文 1-3 句：当前改动是否最优实现、是否最小侵入；若有更优方案请指出>',
+                  '判定只能依据给定材料，不要编造。除 FIXED/NOT_FIXED/NEW/SEVERITY 关键字外全部用中文。',
+                  '',
+                  `== 待复检问题清单（对象：${targetLabel}）==`,
+                  ...(openIssues.length > 0
+                    ? openIssues.map((issue, index) => `#${index + 1} [${issue.severity}] ${issue.title}\n   ${issue.description}`)
+                    : ['（无未解决问题，仅做新问题扫描）']),
+                  '',
+                  '== 当前代码相对评审基线的差异 ==',
+                  diff.patch,
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-issue-verify',
+              })
+            } catch (error: unknown) {
+              // 复检失败不 500：返回可见的失败结论，可重试。
+              const message = error instanceof Error ? error.message : String(error)
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: `复检失败：${message}（可重试）` }))
+              return
+            }
+            const verdict = analysis.text.match(/OPTIMALITY[:：]\s*([\s\S]*)/)?.[1]?.trim() ?? ''
+            const verifyLines = analysis.text.slice(0, analysis.text.match(/OPTIMALITY[:：]\s*/)?.index ?? analysis.text.length)
+            const now = Date.now()
+            const resolved: string[] = []
+            const stillOpen: Array<{ title: string; reason: string }> = []
+            const existingTitles = new Set(openIssues.map((issue) => issue.title.trim().toLowerCase()))
+            const newIssues: Array<{ severity: string; title: string }> = []
+            const issuesManager = new ReviewIssueManager(service.store.issues)
+            for (const rawLine of verifyLines.split('\n')) {
+              const line = rawLine.trim()
+              if (line.startsWith('FIXED |') || line.startsWith('NOT_FIXED |')) {
+                const parts = line.split('|').map((part) => part.trim())
+                const index = Number.parseInt((parts[1] ?? '').replace('#', ''), 10)
+                const issue = Number.isInteger(index) ? openIssues[index - 1] : undefined
+                if (issue === undefined) continue
+                const reason = parts.slice(2).join('：') || '复检未给出依据'
+                if (line.startsWith('FIXED |')) {
+                  issue.status = 'resolved'
+                  issue.resolution = `复检通过（${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}）：${reason.slice(0, 300)}`
+                  issue.updatedAt = now
+                  await service.store.issues.save(issue)
+                  resolved.push(issue.title)
+                } else {
+                  issue.description = `${issue.description}\n[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${reason.slice(0, 200)}`
+                  issue.updatedAt = now
+                  await service.store.issues.save(issue)
+                  stillOpen.push({ title: issue.title, reason })
+                }
+              } else if (line.startsWith('NEW |') && !line.startsWith('NEW | CLEAN')) {
+                const parts = line.split('|').map((part) => part.trim())
+                if (parts.length < 4) continue
+                const title = parts[3] ?? ''
+                if (title === '' || existingTitles.has(title.toLowerCase())) continue
+                existingTitles.add(title.toLowerCase())
+                await issuesManager.createIssue({
+                  projectId: project.id as never,
+                  changeId: target as never,
+                  severity: ISSUE_SEVERITY_MAP[parts[1] ?? ''] ?? 'minor',
+                  category: parts[2] ?? '',
+                  title,
+                  description: `证据：${parts[4] ?? ''}${(parts[5] ?? '') === '' ? '' : `；建议：${parts[5]}`}`,
+                })
+                newIssues.push({ severity: parts[1] ?? '', title })
+              }
+            }
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, target, resolved, stillOpen, newIssues, verdict }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
         if (req.method === 'GET' && routePath === '/notes') {
           const query: Record<string, unknown> = {}
           for (const [key, value] of url.searchParams.entries()) query[key] = value
@@ -1752,13 +2014,17 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'title and content are required' }))
               return
             }
+            const now = Date.now()
             const note = {
-              id: `note_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+              id: `note_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
               projectId: project?.id ?? 'prj_ad_hoc',
               sha: typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : undefined,
               title,
               content,
-              createdAt: Date.now(),
+              tags: parseTags(body['tags']),
+              pinned: body['pinned'] === true,
+              createdAt: now,
+              updatedAt: now,
             }
             await service.store.notes.save(note)
             res.writeHead(200, { 'content-type': 'application/json' })
@@ -1780,57 +2046,109 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const body = await readJsonBody(req)
             const project = await adoptProject(service, body)
             const pid = project?.id
-            const notes = (service.store.notes?.list() ?? [])
-              .filter((note) => note.sha !== 'summary' && (pid === undefined || note.projectId === pid))
+            const allNotes = (service.store.notes?.list() ?? [])
+              .filter((note) => pid === undefined || note.projectId === pid)
+            // 上一次总结（sha='summary' 的最新一条）：本次做增量对比的基线。
+            const previousSummaries = allNotes
+              .filter((note) => note.sha === 'summary')
               .sort((left, right) => right.createdAt - left.createdAt)
-              .slice(0, 60)
+            const previous = previousSummaries[0] ?? null
+            const sinceMs = previous?.createdAt
+            const notes = allNotes
+              .filter((note) => note.sha !== 'summary')
+              .filter((note) => sinceMs === undefined || note.createdAt > sinceMs)
+              .sort((left, right) => right.createdAt - left.createdAt)
+              .slice(0, 30)
             const memories = (service.store?.memories?.list() ?? [])
               .filter((memory) => pid === undefined || memory.projectId === pid)
-              .slice(0, 30)
+              .filter((memory) => sinceMs === undefined || memory.createdAt > sinceMs)
+              .slice(0, 20)
               .map((memory) => `- [${memory.isHumanConfirmed ? '已确认' : memory.truthLevel}] ${memory.title}：${String(memory.content ?? '').slice(0, 120)}`)
             const bootstrap = service.store.checkpoints.list().at(-1) ?? null
             const recentChanges = (service.store.changes?.list() ?? [])
               .filter((change) => pid === undefined || change.projectId === pid)
+              .filter((change) => sinceMs === undefined || change.updatedAt > sinceMs)
               .slice(0, 10)
               .map((change) => `- ${change.title}（${change.status}）`)
-            // 真实提交历史：总结的基底素材（即使笔记还很少，项目实际在做什么永远有据可依）。
+            const reviewIssues = (service.store?.issues.list() ?? [])
+              .filter((issue) => pid === undefined || issue.projectId === pid)
+              .filter((issue) => sinceMs === undefined || issue.createdAt > sinceMs)
+              .slice(0, 10)
+              .map((issue) => `- [${issue.severity}] ${issue.title}`)
+            // 真实提交历史：总结的基底素材；有基线时只取上次总结以来的新提交。
             const cwd = project?.identity?.rootPath
             const commitLines: string[] = []
             if (cwd !== undefined) {
-              const log = await service.git.runGit(['log', '-n', '12', '--date=short', '--format=- %ad %s'], cwd).catch(() => '')
+              const logArgs = ['log', '--date=short', '--format=- %ad %s']
+              if (sinceMs === undefined) logArgs.push('-n', '12')
+              else { logArgs.push('-n', '40', `--since=${new Date(sinceMs).toISOString()}`) }
+              const log = await service.git.runGit(logArgs, cwd).catch(() => '')
               for (const line of log.split('\n')) {
                 const trimmed = line.trim()
                 if (trimmed !== '') commitLines.push(trimmed)
               }
             }
             const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+            const sinceLabel = sinceMs === undefined ? ''
+              : new Date(sinceMs).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
             let summaryText: string
             try {
               const llm = await runLlmAnalysis(ctx, {
-                prompt: [
-                  '你是学习助理。根据以下项目材料，产出一份结构化的学习总结笔记，供开发者复习、也给 AI 助手日后阅读。',
-                  '用 Markdown 风格分节输出（用「## 」做节标题），必须包含以下节：',
-                  '## 核心要点（3-6 条，每条一行：这个项目是做什么的、关键结构/模块、当前状态）',
-                  '## 关键决策与理由（来自记忆/笔记/提交历史中体现的取舍；没有就写（暂无））',
-                  '## 易错点与风险（值得反复提醒的；没有就写（暂无））',
-                  '## 近期工作脉络（必填：按提交历史归纳最近在做什么，结合变更记录与笔记）',
-                  '全部用中文；内容必须来自给定材料，不要编造；「近期提交」是最权威的工作脉络来源。',
-                  '',
-                  `项目：${project?.name ?? '未知'}（${project?.identity?.rootPath ?? ''}）`,
-                  `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
-                  '',
-                  '== 近期提交（git 历史）==',
-                  ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
-                  '',
-                  '== 已确认记忆 ==',
-                  ...(memories.length > 0 ? memories : ['（暂无）']),
-                  '',
-                  '== 已有笔记 ==',
-                  ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
-                  '',
-                  '== 近期变更 ==',
-                  ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
-                ].join('\n'),
+                prompt: previous === null
+                  ? [
+                    '你是学习助理。根据以下项目材料，产出一份结构化的学习总结笔记，供开发者复习、也给 AI 助手日后阅读。',
+                    '用 Markdown 风格分节输出（用「## 」做节标题），必须包含以下节：',
+                    '## 核心要点（3-6 条，每条一行：这个项目是做什么的、关键结构/模块、当前状态）',
+                    '## 关键决策与理由（来自记忆/笔记/提交历史中体现的取舍；没有就写（暂无））',
+                    '## 易错点与风险（值得反复提醒的；没有就写（暂无））',
+                    '## 近期工作脉络（必填：按提交历史归纳最近在做什么，结合变更记录与笔记）',
+                    '全部用中文；内容必须来自给定材料，不要编造；「近期提交」是最权威的工作脉络来源。',
+                    '',
+                    `项目：${project?.name ?? '未知'}（${project?.identity?.rootPath ?? ''}）`,
+                    `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
+                    '',
+                    '== 近期提交（git 历史）==',
+                    ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
+                    '',
+                    '== 已确认记忆 ==',
+                    ...(memories.length > 0 ? memories : ['（暂无）']),
+                    '',
+                    '== 已有笔记 ==',
+                    ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
+                    '',
+                    '== 近期变更 ==',
+                    ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
+                  ].join('\n')
+                  : [
+                    '你是学习助理。下面有「上一次的学习总结」和「自上次总结以来的新增材料」。请产出更新版总结。',
+                    '要求：',
+                    '1. 第一节必须是「## 本次更新」：3-6 条列出相对上次的新增与变化（新提交做了什么、新笔记、新记忆、新评审问题）；若新增材料无实质内容，如实写明「自上次总结以来无新增素材」，不要硬凑。',
+                    '2. 之后输出完整总结正文（不是差异补丁，而是合并后的完整可独立阅读版本）：保留上次总结中仍然有效的内容，吸收新增材料，合并重复项，删除已被新提交取代的过时项。',
+                    '必须包含节：## 本次更新 / ## 核心要点 / ## 关键决策与理由 / ## 易错点与风险 / ## 近期工作脉络',
+                    '全部用中文；内容必须来自给定材料，不要编造。',
+                    '',
+                    `项目：${project?.name ?? '未知'}（${project?.identity?.rootPath ?? ''}）`,
+                    `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
+                    `上次总结时间：${sinceLabel}`,
+                    '',
+                    '== 上一次的学习总结 ==',
+                    (previous.content ?? '').slice(0, 4000),
+                    '',
+                    `== 自上次总结以来的新增提交（${sinceLabel} 起）==`,
+                    ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
+                    '',
+                    '== 新增记忆 ==',
+                    ...(memories.length > 0 ? memories : ['（暂无）']),
+                    '',
+                    '== 新增笔记 ==',
+                    ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
+                    '',
+                    '== 新增/更新的变更 ==',
+                    ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
+                    '',
+                    '== 新增评审问题 ==',
+                    ...(reviewIssues.length > 0 ? reviewIssues : ['（暂无）']),
+                  ].join('\n'),
                 provider: route.provider,
                 model: route.model,
                 maxTokens: service.liveConfig.analysisMaxTokens,
@@ -1844,17 +2162,23 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ ok: false, error: `AI 总结失败：${message}（可重试）` }))
               return
             }
+            const now = Date.now()
             const note = {
-              id: `note_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+              id: `note_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
               projectId: project?.id ?? 'prj_ad_hoc',
               sha: 'summary',
-              title: `📖 学习总结 · ${new Date().toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`,
+              title: `📖 学习总结 · ${new Date().toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${previous === null ? '' : '（增量更新）'}`,
               content: summaryText,
-              createdAt: Date.now(),
+              createdAt: now,
+              updatedAt: now,
+            }
+            // 总结是一份「活文档」：保存新版前移除本项目的旧总结，避免重复雷同的总结堆积。
+            for (const stale of previousSummaries) {
+              if (stale.id !== note.id) await service.store.notes.delete(stale.id)
             }
             await service.store.notes.save(note)
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ ok: true, id: note.id }))
+            res.end(JSON.stringify({ ok: true, id: note.id, updated: previous !== null }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -1881,6 +2205,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const content = typeof body['content'] === 'string' ? body['content'].trim() : ''
             if (title !== '') note.title = title
             if (content !== '') note.content = content
+            if (body['tags'] !== undefined) note.tags = parseTags(body['tags'])
+            if (body['pinned'] !== undefined) note.pinned = body['pinned'] === true
+            note.updatedAt = Date.now()
             await service.store.notes.save(note)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))

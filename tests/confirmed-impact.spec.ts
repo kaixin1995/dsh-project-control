@@ -19,8 +19,16 @@ function makeConfirmedRepo(items: Array<Record<string, unknown>>) {
   }
 }
 
-function makeService(confirmed: Array<Record<string, unknown>>): ProjectControlService {
-  return { store: { confirmed: makeConfirmedRepo(confirmed) } } as unknown as ProjectControlService
+function makeService(
+  confirmed: Array<Record<string, unknown>>,
+  projects: Array<{ id: string; identity: { rootPath: string } }> = [],
+): ProjectControlService {
+  return {
+    store: {
+      confirmed: makeConfirmedRepo(confirmed),
+      projects: { list: () => projects },
+    },
+  } as unknown as ProjectControlService
 }
 
 function makeExec(name: string, filePath?: string) {
@@ -123,6 +131,61 @@ describe('Confirmed constraint conflict guard (B4)', () => {
       () => Promise.resolve({ kind: 'allow' }),
     )) as { kind: string }
     expect(removedConstraint.kind).toBe('allow')
+  })
+})
+
+describe('Confirmed constraint project scoping', () => {
+  const projects = [
+    { id: 'prj_a', identity: { rootPath: 'D:/Code/alpha' } },
+    { id: 'prj_b', identity: { rootPath: 'D:/Code/beta' } },
+  ]
+  const constraintOfA = {
+    id: 'cfm_scope',
+    projectId: 'prj_a',
+    type: 'constraint',
+    text: '核心目录禁改',
+    forbiddenPaths: ['src/core'],
+    status: 'active',
+    createdAt: 1,
+  }
+
+  it('enforces a relative forbidden path against absolute writes inside the owning project root', async () => {
+    const ctx = new Context()
+    registerConflictGuard(ctx, makeService([constraintOfA], projects) as never)
+
+    const decision = (await (ctx as any).waterfall(
+      ctx,
+      'tools/pre-execute',
+      makeExec('write', 'D:/Code/alpha/src/core/engine.ts'),
+      () => Promise.resolve({ kind: 'allow' }),
+    )) as { kind: string }
+    expect(decision.kind).toBe('deny')
+  })
+
+  it('does not enforce a constraint on writes under another project root', async () => {
+    const ctx = new Context()
+    registerConflictGuard(ctx, makeService([constraintOfA], projects) as never)
+
+    const decision = (await (ctx as any).waterfall(
+      ctx,
+      'tools/pre-execute',
+      makeExec('write', 'D:/Code/beta/src/core/engine.ts'),
+      () => Promise.resolve({ kind: 'allow' }),
+    )) as { kind: string }
+    expect(decision.kind).toBe('allow')
+  })
+
+  it('resolves a relative tool path against the owning project root before matching', async () => {
+    const ctx = new Context()
+    registerConflictGuard(ctx, makeService([constraintOfA], projects) as never)
+
+    const decision = (await (ctx as any).waterfall(
+      ctx,
+      'tools/pre-execute',
+      makeExec('edit', 'src/core/engine.ts'),
+      () => Promise.resolve({ kind: 'allow' }),
+    )) as { kind: string }
+    expect(decision.kind).toBe('deny')
   })
 })
 

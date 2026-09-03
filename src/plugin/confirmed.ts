@@ -29,10 +29,18 @@ function normalizePath(path: string): string {
   return path.replaceAll('\\', '/').replace(/\/+$/, '')
 }
 
+/** 判断禁改路径是否按绝对路径书写（盘符或 POSIX 根开头）。 */
+function isAbsolutePath(path: string): boolean {
+  return /^[A-Za-z]:\//.test(path) || path.startsWith('/')
+}
+
 /**
  * 注册冲突拦截监听（在插件入口调用；存储未启动时安全跳过）。
  * 拦截规则：AI 调 write/edit/str_replace_editor 且 file_path 命中任一 active 约束的
  * forbiddenPaths 前缀 → deny（写明命中的已确定事项）。
+ * 生效范围：约束只对归属项目生效——能查到项目根时，写入目标必须位于该项目根之下，
+ * 禁改路径支持相对（相对项目根，如 src/core）与绝对两种写法；查不到项目根时
+ * 退回纯路径前缀比对（双方都按原样书写才命中）。
  */
 export function registerConflictGuard(ctx: Context, service: ProjectControlService): void {
   ctx.on('tools/pre-execute', async (exec, next) => {
@@ -41,11 +49,33 @@ export function registerConflictGuard(ctx: Context, service: ProjectControlServi
     if (store === undefined) return next()
     const rawPath = (exec.arguments as { file_path?: unknown }).file_path
     if (typeof rawPath !== 'string' || rawPath === '') return next()
-    const candidate = normalizePath(rawPath)
+    const target = normalizePath(rawPath)
     const active = store.confirmed.list((item) => (item as ConfirmedItemRecord).status === 'active') as ConfirmedItemRecord[]
+    if (active.length === 0) return next()
+    const projects = (store as { projects?: { list(): Array<{ id: string; identity?: { rootPath?: string } }> } }).projects?.list() ?? []
+    const roots = new Map<string, string>()
+    for (const project of projects) {
+      const rootPath = project.identity?.rootPath
+      if (typeof rootPath === 'string' && rootPath !== '') roots.set(project.id, normalizePath(rootPath))
+    }
     for (const item of active) {
+      const root = roots.get(item.projectId) ?? ''
+      if (root !== '') {
+        // 跨项目隔离：写入目标不在约束归属项目的根目录下则跳过该约束。
+        const insideRoot = isAbsolutePath(target)
+          ? target === root || target.startsWith(root + '/')
+          : true
+        if (!insideRoot) continue
+      }
+      // 工具传相对路径且知道项目根时按根补全，保证与相对禁改路径可比。
+      const candidate = root !== '' && !isAbsolutePath(target) ? `${root}/${target}` : target
       const hit = item.forbiddenPaths.some((forbidden) => {
         const normalized = normalizePath(forbidden)
+        if (normalized === '') return false
+        if (root !== '' && !isAbsolutePath(normalized)) {
+          const effective = `${root}/${normalized}`
+          return candidate === effective || candidate.startsWith(effective + '/')
+        }
         return candidate === normalized || candidate.startsWith(normalized + '/')
       })
       if (hit) {

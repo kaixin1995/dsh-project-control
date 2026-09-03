@@ -160,11 +160,15 @@ export interface ReviewIssueRecord {
   projectId: ProjectId
   changeId: ChangeId
   severity: IssueSeverity
+  /** 问题分类（评审输出的自由文本分类，如 并发/错误处理/安全）。 */
+  category?: string
   status: IssueStatus
   title: string
   description: string
   evidenceIds: EvidenceId[]
   suggestedFix?: string
+  /** 复检通过依据（自动置 resolved 时写入，含时间与一句话判定依据）。 */
+  resolution?: string
   createdAt: number
   updatedAt: number
 }

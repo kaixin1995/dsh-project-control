@@ -105,7 +105,75 @@ interface NoteEntry {
   sha?: string
   title: string
   content: string
+  tags?: string[]
+  pinned?: boolean
   createdAt: number
+  updatedAt?: number
+}
+
+/** GET /issues 的评审问题条目（Review 问题页签数据源）。 */
+interface IssueEntry {
+  id: string
+  changeId: string
+  severity: string
+  category: string
+  title: string
+  description: string
+  status: string
+  resolution: string
+  createdAt: number
+  updatedAt: number
+}
+
+/** 评审问题状态 → 中文标签。 */
+const ISSUE_STATUS_LABELS: Record<string, string> = {
+  open: '待处理',
+  fixing: '修复中',
+  resolved: '已解决',
+  accepted: '已接受',
+  rejected: '已拒绝',
+}
+
+/** 评审问题严重度 → 徽章底色。 */
+function severityColor(severity: string): string {
+  if (severity === 'critical' || severity === 'blocker') return '#ce9178'
+  if (severity === 'major') return '#d7ba7d'
+  if (severity === 'info') return '#6b8b8b'
+  return '#569cd6'
+}
+
+/** 严重度归一（兼容历史记录里的 high/medium/low；未知回落 minor），统计/筛选/着色共用。 */
+function normalizeIssueSeverity(severity: string): string {
+  if (severity === 'high') return 'major'
+  if (severity === 'medium' || severity === 'low') return 'minor'
+  return severity === 'blocker' || severity === 'critical' || severity === 'major' || severity === 'minor' || severity === 'info'
+    ? severity : 'minor'
+}
+
+/** 评审目标（changeId）→ 可读标签：合成 review:<sha> 指向提交，chg_* 指向变更，adhoc 为工作区。 */
+function issueTargetLabel(changeId: string): string {
+  const id = typeof changeId === 'string' ? changeId : ''
+  if (id.startsWith('review:')) return `提交 ${id.slice(7, 15)}`
+  if (id === 'adhoc') return '工作区'
+  return `变更 ${id.slice(0, 11)}`
+}
+
+/** 总结/结构化笔记的轻量 Markdown 渲染：「## 」节标题着色加粗，「- 」列表加圆点，其余原样。 */
+function renderStructuredContent(content: string): React.ReactNode[] {
+  if (typeof content !== 'string' || content === '') return []
+  return content.split('\n').map((line, index) => {
+    if (line.startsWith('## ')) {
+      return (
+        <div key={index} style={{ fontWeight: 600, fontSize: '12.5px', marginTop: index === 0 ? 0 : 10, marginBottom: 2, color: 'var(--dsw-alias-brand-primary, #2563eb)' }}>
+          {line.slice(3)}
+        </div>
+      )
+    }
+    if (line.startsWith('- ')) {
+      return <div key={index} style={{ paddingLeft: 14, textIndent: -10 }}>• {line.slice(2)}</div>
+    }
+    return <div key={index}>{line === '' ? '\u00A0' : line}</div>
+  })
 }
 
 /**
@@ -158,7 +226,7 @@ div[class="${hashClass}"] {
   return style
 }
 
-type TabKey = 'commits' | 'overview' | 'execution' | 'notes' | 'settings'
+type TabKey = 'commits' | 'overview' | 'execution' | 'review' | 'notes' | 'settings'
 
 export interface WorkspaceFrameProps {
   /** 官方 details 槽契约的 locale 注入（我们注册的 project-control 词典）。 */
@@ -174,6 +242,7 @@ export const WORKSPACE_DICT = {
     'tab.commits': '提交核查',
     'tab.overview': '项目总览',
     'tab.execution': '执行中心',
+    'tab.review': 'Review 问题',
     'tab.notes': '笔记与记忆',
     'tab.settings': '设置',
     'error.load': '加载失败',
@@ -242,6 +311,18 @@ export const WORKSPACE_DICT = {
     'notes.summaryTag': 'AI 总结',
     'notes.emptySearch': '无匹配笔记。',
     'notes.contentHint': '笔记内容（支持多行）：结论、疑问、学习要点、关键决策…',
+    'notes.tagsHint': '标签（逗号分隔，选填；保存后可点击筛选）',
+    'notes.pin': '置顶',
+    'notes.unpin': '取消置顶',
+    'notes.editedAt': '编辑于',
+    'review.filterAll': '全部',
+    'review.statusAll': '全部状态',
+    'review.verify': '复检',
+    'review.verifyRunning': '复检中…',
+    'review.verifyHint': '修改代码后点击：自动检测问题是否修复、改动是否最优/最小侵入、有无新问题；全部通过才自动置为已解决',
+    'review.refresh': '刷新',
+    'review.target': '对象',
+    'review.workingTarget': '工作区',
     'impact.functionsNone': '未识别出函数级调用变化（可能是样式/静态资源/纯配置改动）。',
     'review.col.severity': '级别',
     'review.col.category': '类别',
@@ -301,18 +382,20 @@ export const WORKSPACE_DICT = {
     'memory.confirm': '确认',
     'memory.empty': '暂无项目记忆。可在聊天中让 AI 记录，或在上方手动添加。',
     'concepts.title': '学习概念',
-    'concepts.none': '暂无学习概念。对变更调用 summarize_learning 后自动积累。',
+    'concepts.none': '暂无学习概念。执行中心跑完变更后自动沉淀，也可在聊天中让 AI 总结学习要点。',
     'concepts.col.name': '概念',
     'concepts.col.category': '类别',
     'concepts.col.count': '次数',
     'review.recordsTitle': 'Review 问题',
+    'review.recordsEmpty': '暂无问题记录。提交审查页评审出的问题会自动登记到这里；重新评审会替换旧记录。',
     'verify.records': '验收记录',
+    'verify.recordsEmpty': '暂无验收记录。在执行中心点「验收」即生成。',
 
     'confirmed.title': '已确定约束（人工确认，AI 禁改自动拦截）',
     'confirmed.add': '添加约束',
     'confirmed.text': '约束/需求内容',
-    'confirmed.paths': '禁改路径（逗号分隔，选填）',
-    'confirmed.none': '暂无约束。添加后 AI 修改禁改路径将被自动拒绝。',
+    'confirmed.paths': '禁改路径（逗号分隔；相对项目根如 src/core，或绝对路径）',
+    'confirmed.none': '暂无约束。添加后，AI 修改本项目的禁改路径将被自动拒绝（仅对本项目生效）。',
 
     'changes.title': '变更任务',
     'state.noChanges': '暂无变更任务。在聊天中让 AI 创建，或用上方「新建变更」。',
@@ -337,6 +420,7 @@ export const WORKSPACE_DICT = {
     'tab.commits': 'Commit Review',
     'tab.overview': 'Overview',
     'tab.execution': 'Execution',
+    'tab.review': 'Review issues',
     'tab.notes': 'Notes & Memory',
     'tab.settings': 'Settings',
     'error.load': 'Failed to load',
@@ -407,6 +491,18 @@ export const WORKSPACE_DICT = {
     'notes.summaryTag': 'AI summary',
     'notes.emptySearch': 'No matching notes.',
     'notes.contentHint': 'Note content (multi-line): conclusions, questions, learnings…',
+    'notes.tagsHint': 'Tags (comma separated, optional; click a tag to filter)',
+    'notes.pin': 'Pin',
+    'notes.unpin': 'Unpin',
+    'notes.editedAt': 'edited',
+    'review.filterAll': 'All',
+    'review.statusAll': 'All statuses',
+    'review.verify': 'Re-verify',
+    'review.verifyRunning': 'Verifying…',
+    'review.verifyHint': 'After fixing the code, click to re-check: whether issues are fixed, whether the change is optimal and minimally invasive, and whether new issues appeared. Only a passing re-verification marks issues resolved.',
+    'review.refresh': 'Refresh',
+    'review.target': 'Target',
+    'review.workingTarget': 'Working tree',
     'fs.browse': 'Browse',
     'fs.up': 'Up',
     'fs.use': 'Use this directory',
@@ -472,18 +568,20 @@ export const WORKSPACE_DICT = {
     'memory.confirm': 'Confirm',
     'memory.empty': 'No project memories yet. Ask the AI in chat to record one, or add above.',
     'concepts.title': 'Learning concepts',
-    'concepts.none': 'No learning concepts yet. Run summarize_learning on a change to accumulate.',
+    'concepts.none': 'No learning concepts yet. They accumulate after successful change runs, or ask the AI to summarize learning points.',
     'concepts.col.name': 'Concept',
     'concepts.col.category': 'Category',
     'concepts.col.count': 'Count',
     'review.recordsTitle': 'Review issues',
+    'review.recordsEmpty': 'No issue records yet. Issues found by the commit-review page are recorded here automatically; re-reviewing replaces old records.',
     'verify.records': 'Verification records',
+    'verify.recordsEmpty': 'No verification records yet. Click "Verify" in the execution tab to generate one.',
 
     'confirmed.title': 'Confirmed constraints (human-confirmed; AI edits to forbidden paths are auto-denied)',
     'confirmed.add': 'Add constraint',
     'confirmed.text': 'Requirement / constraint text',
-    'confirmed.paths': 'Forbidden paths (comma separated, optional)',
-    'confirmed.none': 'No constraints yet. AI edits to forbidden paths will be auto-denied once added.',
+    'confirmed.paths': 'Forbidden paths (comma separated; relative to project root like src/core, or absolute)',
+    'confirmed.none': 'No constraints yet. Once added, AI edits to forbidden paths in this project are auto-denied.',
 
     'changes.title': 'Change tasks',
     'state.noChanges': 'No change tasks yet. Ask the AI in chat to create one, or use "Create change" above.',
@@ -885,9 +983,15 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [notes, setNotes] = useState<NoteEntry[]>([])
   const [noteTitle, setNoteTitle] = useState('')
   const [noteContent, setNoteContent] = useState('')
-  const [editingNote, setEditingNote] = useState<{ id: string; title: string; content: string } | null>(null)
+  const [noteTags, setNoteTags] = useState('')
+  const [editingNote, setEditingNote] = useState<{ id: string; title: string; content: string; tags: string } | null>(null)
   const [noteSearch, setNoteSearch] = useState('')
   const [noteExpanded, setNoteExpanded] = useState<Record<string, boolean>>({})
+  const [issuesData, setIssuesData] = useState<IssueEntry[] | null>(null)
+  const [issueSeverityFilter, setIssueSeverityFilter] = useState('')
+  const [issueStatusFilter, setIssueStatusFilter] = useState('')
+  const [issueExpanded, setIssueExpanded] = useState<Record<string, boolean>>({})
+  const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
   const [aiSummarizing, setAiSummarizing] = useState(false)
   const [modelTiers, setModelTiers] = useState<Record<string, { provider: string; model: string }> | null>(null)
   const [modelOptions, setModelOptions] = useState<Array<{ provider: string; id: string; name: string }>>([])
@@ -1020,16 +1124,60 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setFileDiffs((previous) => ({ ...previous, [key]: String(data['patch'] ?? '') }))
   }
 
+  const loadIssues = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/issues?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
+      const data: unknown = await response.json()
+      if (response.ok) setIssuesData((data as { issues: IssueEntry[] }).issues ?? [])
+    } catch {
+      // 问题列表加载失败不打断页面：列表保持原样。
+    }
+  }
+
+  /**
+   * 问题复检：对该问题所属评审目标重跑检测（修复确认 + 最优性/最小侵入 + 新问题扫描），
+   * 只有复检通过才自动置为已解决；结果以复检报告形式展示。
+   */
+  const verifyIssues = async (target: string): Promise<void> => {
+    setVerifyingTarget(target)
+    try {
+      const { ok, data } = await post('/project-control/api/issues/verify', { target })
+      if (!ok) {
+        setActionResult('✗ ' + String(data['error'] ?? 'error'))
+        return
+      }
+      const resolved = (data['resolved'] as string[] | undefined) ?? []
+      const stillOpen = (data['stillOpen'] as Array<{ title: string; reason: string }> | undefined) ?? []
+      const newIssues = (data['newIssues'] as Array<{ severity: string; title: string }> | undefined) ?? []
+      const verdict = String(data['verdict'] ?? '')
+      const lines = [
+        `复检完成：已修复 ${resolved.length} · 仍未修复 ${stillOpen.length} · 新增问题 ${newIssues.length}`,
+        ...(resolved.length > 0 ? [`✓ 已修复：${resolved.join('；')}`] : []),
+        ...(stillOpen.length > 0 ? stillOpen.map((item) => `✗ 未修复：${item.title} —— ${item.reason}`) : []),
+        ...(newIssues.length > 0 ? newIssues.map((item) => `＋ 新问题：[${item.severity}] ${item.title}`) : []),
+        ...(verdict === '' ? [] : [`最优性：${verdict}`]),
+      ]
+      setActionResult(lines.join('\n'))
+      await loadIssues()
+    } catch (error: unknown) {
+      setActionResult('✗ ' + (error instanceof Error ? error.message : String(error)))
+    } finally {
+      setVerifyingTarget(null)
+    }
+  }
+
   const addNote = async (): Promise<void> => {
     if (noteTitle.trim() === '' || noteContent.trim() === '') return
     const { ok } = await post('/project-control/api/notes', {
       title: noteTitle.trim(),
       content: noteContent.trim(),
+      tags: noteTags,
       sha: selectedTargets.length === 0 ? undefined : selectedTargets[0],
     })
     if (ok) {
       setNoteTitle('')
       setNoteContent('')
+      setNoteTags('')
       await loadNotes()
     }
   }
@@ -1042,12 +1190,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   const saveNoteEdit = async (): Promise<void> => {
     if (editingNote === null) return
-    await post('/project-control/api/notes/update', { id: editingNote.id, title: editingNote.title, content: editingNote.content })
+    await post('/project-control/api/notes/update', { id: editingNote.id, title: editingNote.title, content: editingNote.content, tags: editingNote.tags })
     setEditingNote(null)
     await loadNotes()
   }
 
-  /** AI 学习总结：把已有笔记 + 项目档案提炼成一条总结笔记。 */
+  /** 置顶/取消置顶一条笔记。 */
+  const toggleNotePin = async (note: NoteEntry): Promise<void> => {
+    await post('/project-control/api/notes/update', { id: note.id, pinned: note.pinned !== true })
+    await loadNotes()
+  }
+
+  /** AI 学习总结：对比上次总结做增量更新，把笔记+项目档案提炼成一份「活」的总结文档。 */
   const aiSummarize = async (): Promise<void> => {
     setAiSummarizing(true)
     try {
@@ -1056,6 +1210,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         setActionResult('✗ ' + String(data['error'] ?? 'error'))
         return
       }
+      setActionResult(data['updated'] === true
+        ? '✓ 已对比上次总结完成增量更新（新增变化见总结的「本次更新」一节），旧总结已合并替换'
+        : '✓ 已生成首份学习总结')
       await loadNotes()
     } catch (error: unknown) {
       setActionResult('✗ ' + (error instanceof Error ? error.message : String(error)))
@@ -1172,10 +1329,11 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }, [])
 
-  // 进入提交/笔记页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
+  // 进入提交/笔记/Review 页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
   useEffect(() => {
     if (tab === 'commits') void loadCommits()
     if (tab === 'notes') void loadNotes()
+    if (tab === 'review') void loadIssues()
     if (tab === 'settings' && modelTiers === null) void loadModelConfig()
   }, [tab, props.sessionId])
 
@@ -1265,7 +1423,6 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const changes = state?.changes ?? []
   const runs = state?.runs ?? []
   const memories = state?.memories ?? []
-  const issues = state?.issues ?? []
   const verifications = state?.verifications ?? []
   const confirmed = state?.confirmed ?? []
   const concepts = state?.concepts ?? []
@@ -1274,6 +1431,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     { key: 'commits', label: t('tab.commits') },
     { key: 'overview', label: t('tab.overview') },
     { key: 'execution', label: t('tab.execution') },
+    { key: 'review', label: t('tab.review') },
     { key: 'notes', label: t('tab.notes') },
     { key: 'settings', label: t('tab.settings') },
   ]
@@ -1869,9 +2027,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         </div>
         <div style={{ ...styles.formRow, border: '1px dashed var(--dsw-alias-border-l2, rgba(5,5,5,0.15))', borderRadius: '8px', padding: '10px' }}>
           <input style={styles.input} placeholder={t('notes.formTitle')} value={noteTitle} onChange={(e) => { setNoteTitle(e.target.value) }} />
+          <input style={{ ...styles.input }} placeholder={t('notes.tagsHint')} value={noteTags} onChange={(e) => { setNoteTags(e.target.value) }} />
           <textarea
             style={styles.textarea}
-            rows={4}
+            rows={6}
             placeholder={t('notes.contentHint')}
             value={noteContent}
             onChange={(e) => { setNoteContent(e.target.value) }}
@@ -1887,9 +2046,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         </div>
         {(() => {
           const keyword = noteSearch.trim().toLowerCase()
-          const visible = keyword === ''
+          const matched = keyword === ''
             ? notes
-            : notes.filter((note) => (note.title + ' ' + note.content).toLowerCase().includes(keyword))
+            : notes.filter((note) => (note.title + ' ' + note.content + ' ' + (note.tags ?? []).join(' ')).toLowerCase().includes(keyword))
+          // 置顶优先，其余按创建时间倒序。
+          const visible = [...matched].sort((left, right) =>
+            Number(right.pinned === true) - Number(left.pinned === true) || right.createdAt - left.createdAt)
           if (visible.length === 0) {
             return <div style={styles.empty}>{notes.length === 0 ? t('notes.empty') : t('notes.emptySearch')}</div>
           }
@@ -1909,7 +2071,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 {editing !== null ? (
                   <div style={styles.formRow}>
                     <input style={styles.input} value={editing.title} onChange={(e) => { setEditingNote({ ...editing, title: e.target.value }) }} />
-                    <textarea style={styles.textarea} rows={8} value={editing.content} onChange={(e) => { setEditingNote({ ...editing, content: e.target.value }) }} />
+                    <input style={styles.input} placeholder={t('notes.tagsHint')} value={editing.tags} onChange={(e) => { setEditingNote({ ...editing, tags: e.target.value }) }} />
+                    <textarea style={styles.textarea} rows={10} value={editing.content} onChange={(e) => { setEditingNote({ ...editing, content: e.target.value }) }} />
                     <div style={{ display: 'flex', gap: '6px' }}>
                       <button style={{ ...styles.button, padding: '4px 12px' }} onClick={() => { void saveNoteEdit() }}>{t('notes.save')}</button>
                       <button style={{ ...styles.secondary, padding: '4px 12px' }} onClick={() => { setEditingNote(null) }}>{t('notes.cancel')}</button>
@@ -1918,20 +2081,41 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 ) : (
                   <>
                     <div style={styles.noteTitleRow}>
-                      <div style={styles.noteTitleText}>{isSummary ? '📖 ' : ''}{note.title}</div>
+                      <div style={styles.noteTitleText}>{isSummary ? '📖 ' : ''}{note.pinned === true ? '📌 ' : ''}{note.title}</div>
                       <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
-                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setEditingNote({ id: note.id, title: note.title, content: note.content }) }}>{t('notes.edit')}</button>
+                        <button
+                          style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px', color: note.pinned === true ? 'var(--dsw-alias-brand-primary, #2563eb)' : undefined }}
+                          title={note.pinned === true ? t('notes.unpin') : t('notes.pin')}
+                          onClick={() => { void toggleNotePin(note) }}
+                        >📌</button>
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setEditingNote({ id: note.id, title: note.title, content: note.content, tags: (note.tags ?? []).join(', ') }) }}>{t('notes.edit')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这条笔记？', message: '「' + note.title + '」将被永久删除，不可恢复。', danger: true, onConfirm: () => { void removeNote(note.id) } }) }}>✕</button>
                       </div>
                     </div>
-                    <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{note.content}</div>
+                    {isSummary
+                      ? <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{renderStructuredContent(note.content)}</div>
+                      : <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{note.content}</div>}
                     {long && (
                       <button style={styles.linkBtn} onClick={() => { setNoteExpanded({ ...noteExpanded, [note.id]: !expanded }) }}>
                         {expanded ? t('notes.collapse') : t('notes.expand')}（{note.content.length} 字）
                       </button>
                     )}
+                    {(note.tags ?? []).length > 0 && (
+                      <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '6px' }}>
+                        {(note.tags ?? []).map((tag) => (
+                          <button
+                            key={tag}
+                            style={{ ...styles.badge('rgba(37,99,235,0.12)'), cursor: 'pointer', border: 'none', padding: '1px 8px', borderRadius: '999px', fontSize: '10px' }}
+                            onClick={() => { setNoteSearch(tag) }}
+                          >#{tag}</button>
+                        ))}
+                      </div>
+                    )}
                     <div style={styles.noteMeta}>
                       <span>{new Date(note.createdAt).toLocaleString()}</span>
+                      {note.updatedAt !== undefined && note.updatedAt > note.createdAt + 1000 && (
+                        <span>（{t('notes.editedAt')} {new Date(note.updatedAt).toLocaleString()}）</span>
+                      )}
                       {isSummary && <span style={styles.badge('#2563eb')}>{t('notes.summaryTag')}</span>}
                       {note.sha !== undefined && note.sha !== 'summary' && (
                         <span style={styles.badge('#8b8b8b')}>{note.sha === 'working' ? t('repo.working') : note.sha.slice(0, 8)}</span>
@@ -2014,26 +2198,105 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           </table>
         )}
       </Card>
+    </>
+  )
+
+  // ── Review 问题页签：全量问题看板（统计 + 筛选 + 状态流转）+ 验收记录 ──
+  const reviewTab = (
+    <>
+      {resultPanel}
       <Card title={t('review.recordsTitle')}>
-        {issues.length === 0 ? (
-          <div style={styles.empty}>—</div>
-        ) : (
-          <table style={styles.table}>
-            <tbody>
-              {issues.slice(0, 20).map((issue) => (
-                <tr key={issue.id}>
-                  <td style={styles.td}><span style={styles.badge(issue.severity === 'critical' || issue.severity === 'high' ? '#ce9178' : '#569cd6')}>{issue.severity}</span></td>
-                  <td style={styles.td}>{issue.title}</td>
-                  <td style={styles.td}>{issue.status}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        {(() => {
+          const all = (issuesData ?? []).map((issue) => ({ ...issue, severity: normalizeIssueSeverity(issue.severity) }))
+          const openCount = all.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+          const counts: Array<{ key: string; label: string; count: number }> = [
+            { key: '', label: t('review.filterAll'), count: all.length },
+            { key: 'critical', label: 'critical', count: all.filter((issue) => issue.severity === 'critical' || issue.severity === 'blocker').length },
+            { key: 'major', label: 'major', count: all.filter((issue) => issue.severity === 'major').length },
+            { key: 'minor', label: 'minor', count: all.filter((issue) => issue.severity === 'minor').length },
+            { key: 'info', label: 'info', count: all.filter((issue) => issue.severity === 'info').length },
+          ]
+          const visible = all
+            .filter((issue) => {
+              if (issueSeverityFilter === '') return true
+              if (issueSeverityFilter === 'critical') return issue.severity === 'critical' || issue.severity === 'blocker'
+              return issue.severity === issueSeverityFilter
+            })
+            .filter((issue) => issueStatusFilter === '' || issue.status === issueStatusFilter)
+          return (
+            <>
+              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' }}>
+                {counts.map((item) => (
+                  <button key={item.key === '' ? 'all' : item.key} style={styles.chip(issueSeverityFilter === item.key)}
+                    onClick={() => { setIssueSeverityFilter(item.key) }}>
+                    {item.label} · {item.count}
+                  </button>
+                ))}
+                <span style={{ flex: 1 }} />
+                <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{openCount} 待处理 / 共 {all.length}</span>
+                <select style={{ ...styles.input, width: 'auto', padding: '3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
+                  <option value="">{t('review.statusAll')}</option>
+                  {Object.entries(ISSUE_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+                <button style={styles.secondary} onClick={() => { void loadIssues() }}>{t('review.refresh')}</button>
+              </div>
+              {all.length === 0 ? (
+                <div style={styles.empty}>{issuesData === null ? '…' : t('review.recordsEmpty')}</div>
+              ) : visible.length === 0 ? (
+                <div style={styles.empty}>{t('notes.emptySearch')}</div>
+              ) : visible.map((issue) => {
+                const expanded = issueExpanded[issue.id] === true
+                const description = issue.description ?? ''
+                const long = description.length > 200
+                return (
+                  <div key={issue.id} style={styles.noteCard}>
+                    <div style={styles.noteTitleRow}>
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span style={styles.badge(severityColor(issue.severity))}>{issue.severity}</span>
+                        {issue.category ? <span style={styles.badge('rgba(96,96,128,0.18)')}>{issue.category}</span> : null}
+                        <span style={styles.badge(issue.status === 'open' || issue.status === 'fixing' ? '#dcdcaa' : issue.status === 'resolved' || issue.status === 'accepted' ? '#4ec9b0' : '#8b8b8b')}>
+                          {ISSUE_STATUS_LABELS[issue.status] ?? issue.status}
+                        </span>
+                        <span style={styles.noteTitleText}>{issue.title}</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                        {(issue.status === 'open' || issue.status === 'fixing') && (
+                          <button
+                            style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                            disabled={verifyingTarget !== null}
+                            title={t('review.verifyHint')}
+                            onClick={() => { void verifyIssues(issue.changeId) }}
+                          >{verifyingTarget === issue.changeId ? t('review.verifyRunning') : '🔍 ' + t('review.verify')}</button>
+                        )}
+                      </div>
+                    </div>
+                    {description !== '' && (
+                      <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{description}</div>
+                    )}
+                    {issue.resolution ? (
+                      <div style={{ marginTop: '6px', padding: '6px 10px', borderRadius: '6px', background: 'rgba(78, 201, 176, 0.08)', border: '1px solid rgba(78, 201, 176, 0.35)', fontSize: '11px', color: 'var(--dsw-alias-label-primary, #1f2328)' }}>
+                        ✓ {issue.resolution}
+                      </div>
+                    ) : null}
+                    {long && (
+                      <button style={styles.linkBtn} onClick={() => { setIssueExpanded({ ...issueExpanded, [issue.id]: !expanded }) }}>
+                        {expanded ? t('notes.collapse') : t('notes.expand')}
+                      </button>
+                    )}
+                    <div style={styles.noteMeta}>
+                      <span>{t('review.target')}: {issueTargetLabel(issue.changeId)}</span>
+                      <span>{formatTime(issue.createdAt)}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </>
+          )
+        })()}
       </Card>
       <Card title={t('verify.records')}>
         {verifications.length === 0 ? (
-          <div style={styles.empty}>—</div>
+          <div style={styles.empty}>{t('verify.recordsEmpty')}</div>
         ) : (
           <table style={styles.table}>
             <tbody>
@@ -2074,6 +2337,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {tab === 'commits' && commitsTab}
         {tab === 'overview' && overviewTab}
         {tab === 'execution' && executionTab}
+        {tab === 'review' && reviewTab}
         {tab === 'notes' && notesTab}
         {tab === 'settings' && settingsTab}
       </div>

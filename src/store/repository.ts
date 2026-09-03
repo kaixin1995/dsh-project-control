@@ -144,7 +144,13 @@ export interface ProjectNoteRecord {
   sha?: string
   title: string
   content: string
+  /** 标签（用户自定义分类，点击可筛选）。 */
+  tags?: string[]
+  /** 置顶：笔记列表排在最前。 */
+  pinned?: boolean
   createdAt: number
+  /** 最后编辑时间；创建时与 createdAt 相同。 */
+  updatedAt?: number
 }
 
 /** Project Control 系统的完整存储仓储聚合接口。 */
