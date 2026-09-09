@@ -22,6 +22,10 @@ import type {
   ReviewIssueRecord,
   VerificationRecord,
   MemoryRecord,
+  RunContextRecord,
+  MemoryBaselineRecord,
+  ScheduledTaskRecord,
+  ImportedChangeRecord,
 } from '../domain/models.ts'
 import { ProjectService } from '../domain/project.ts'
 import { ChangeService } from '../domain/change.ts'
@@ -32,6 +36,7 @@ import { MemoryContextInjector } from '../memory/context.ts'
 import { ConceptService } from '../learning/concept.ts'
 import { RecoveryScanner } from '../runtime/recovery.ts'
 import { RunOrchestrator } from '../runtime/orchestrator.ts'
+import { ScheduledTaskRunner } from '../runtime/scheduler.ts'
 import { resolveFullConfig, type ResolvedProjectControlConfig } from '../config.ts'
 
 export interface ProjectControlConfig {
@@ -46,6 +51,7 @@ export class ProjectControlService {
   public evidenceManager = new EvidenceManager()
   public currentProject?: ProjectRecord
   public orchestrator?: RunOrchestrator
+  public scheduler?: ScheduledTaskRunner
   public memoryService?: MemoryService
   public conceptService?: ConceptService
   public liveConfig: ResolvedProjectControlConfig
@@ -110,12 +116,15 @@ export class ProjectControlService {
       steps: new DomainRepository<StepRecord>(this.coreDomainHandle.table('steps')),
       attempts: new DomainRepository<AttemptRecord>(this.coreDomainHandle.table('attempts')),
       checkpoints: new DomainRepository<ProjectBootstrapCheckpoint>(this.historyDomainHandle.table('checkpoints')),
-      importedChanges: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('imported_changes')),
+      importedChanges: new DomainRepository<ImportedChangeRecord>(this.historyDomainHandle.table('imported_changes')),
       historyCursor: new DomainRepository<Record<string, unknown>>(this.historyDomainHandle.table('history_cursor')),
       confirmed: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('confirmed')),
       snapshots: new DomainRepository<Record<string, unknown>>(this.analysisDomainHandle.table('snapshots')),
       notes: new DomainRepository<ProjectNoteRecord>(this.coreDomainHandle.table('notes')),
       pluginSettings: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('plugin_settings')),
+      runContexts: new DomainRepository<RunContextRecord>(this.coreDomainHandle.table('run_contexts')),
+      scheduledTasks: new DomainRepository<ScheduledTaskRecord>(this.coreDomainHandle.table('scheduled_tasks')),
+      memoryBaselines: new DomainRepository<MemoryBaselineRecord>(this.historyDomainHandle.table('memory_baselines')),
       evidence: new DomainRepository<EvidenceRecord>(this.analysisDomainHandle.table('evidence')),
       issues: new DomainRepository<ReviewIssueRecord>(this.historyDomainHandle.table('issues')),
       verifications: new DomainRepository<VerificationRecord>(this.historyDomainHandle.table('verifications')),
@@ -142,6 +151,25 @@ export class ProjectControlService {
     // 执行系统启动时的未完成任务恢复扫描
     const recoveryScanner = new RecoveryScanner(this.store)
     await recoveryScanner.scanAndRecover()
+
+    // 断点续跑：自动恢复被中断的 Run（跳过已成功步骤；autoResumeRuns 可关）。
+    if (this.liveConfig.autoResumeRuns !== false) {
+      const interrupted = this.store.runs.list((run) => run.status === 'interrupted')
+      for (const run of interrupted) {
+        const change = this.store.changes.get(run.changeId)
+        if (change?.currentPlanId === undefined) continue
+        try {
+          await this.orchestrator?.resumeRun(run.id, 'continue')
+          this.ctx?.logger?.info?.(`project-control: auto-resumed interrupted run ${run.id}`)
+        } catch (error: unknown) {
+          this.ctx?.logger?.warn?.(`project-control: auto-resume run ${run.id} failed: ${String(error)}`)
+        }
+      }
+    }
+
+    // 例行任务调度器：每分钟扫描到期任务（run/review/summary）。
+    this.scheduler = new ScheduledTaskRunner(this.ctx, this)
+    this.scheduler.start()
   }
 
   /**

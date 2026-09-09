@@ -7,7 +7,7 @@
  */
 
 import { createMemoryId, type MemoryId, type ProjectId, type EvidenceId } from '../domain/ids.ts'
-import type { MemoryRecord, MemoryType } from '../domain/models.ts'
+import type { MemoryRecord, MemoryType, MemoryScope, MemorySourceTag, MemoryStatus } from '../domain/models.ts'
 import type { TruthLevel } from '../domain/truth.ts'
 import { canOverrideTruth } from '../domain/truth.ts'
 import type { DomainRepository } from '../store/repository.ts'
@@ -23,6 +23,12 @@ export interface RecordMemoryParams {
   isHumanConfirmed?: boolean
   gitBranch?: string
   tags?: string[]
+  /** 作用域（缺省 project；branch 需与 gitBranch 配合）。 */
+  scope?: MemoryScope
+  /** 来源标签（缺省 manual）。 */
+  sourceTag?: MemorySourceTag
+  /** 血缘：基于哪个提交产生。 */
+  basisSha?: string
 }
 
 export class MemoryService {
@@ -43,11 +49,15 @@ export class MemoryService {
       relatedFiles: params.relatedFiles ?? [],
       evidenceIds: params.evidenceIds ?? [],
       isHumanConfirmed: params.isHumanConfirmed ?? false,
-      gitBranch: params.gitBranch,
       tags: params.tags ?? [],
+      scope: params.scope ?? 'project',
+      sourceTag: params.sourceTag ?? 'manual',
+      status: 'active',
       createdAt: now,
       updatedAt: now,
     }
+    if (params.gitBranch !== undefined) memory.gitBranch = params.gitBranch
+    if (params.basisSha !== undefined) memory.basisSha = params.basisSha
 
     await this.memoriesRepo.save(memory)
     return memory
@@ -130,7 +140,7 @@ export class MemoryService {
    * 导出项目记忆为 Markdown 格式，便于系统提示词或文档呈现。
    */
   exportToMarkdown(projectId: ProjectId, gitBranch?: string): string {
-    const memories = this.queryMemories(projectId, { gitBranch })
+    const memories = this.queryMemories(projectId, gitBranch === undefined ? {} : { gitBranch })
     if (memories.length === 0) return '# Project Memory\n\nNo recorded memories yet.'
 
     const lines: string[] = ['# Project Memory\n']
@@ -167,5 +177,46 @@ export class MemoryService {
     }
 
     return lines.join('\n')
+  }
+
+  /**
+   * 更新记忆有效性状态（归档 / 疑似过时 / 已取代 / 恢复生效），供拉取同步与人工管理。
+   */
+  async updateStatus(id: MemoryId, status: MemoryStatus, supersededBy?: MemoryId): Promise<MemoryRecord> {
+    const memory = this.memoriesRepo.get(id)
+    if (!memory) throw new Error(`Memory not found: ${id}`)
+    memory.status = status
+    if (supersededBy !== undefined) memory.supersededBy = supersededBy
+    memory.updatedAt = Date.now()
+    await this.memoriesRepo.save(memory)
+    return memory
+  }
+
+  /**
+   * 刷新验证基线（拉取同步判定"相关文件未动"时的自动续命）。
+   */
+  async renewBaseline(ids: MemoryId[], verifiedSha: string): Promise<number> {
+    let renewed = 0
+    for (const id of ids) {
+      const memory = this.memoriesRepo.get(id)
+      if (memory === undefined) continue
+      memory.lastVerifiedSha = verifiedSha
+      memory.updatedAt = Date.now()
+      await this.memoriesRepo.save(memory)
+      renewed += 1
+    }
+    return renewed
+  }
+
+  /**
+   * 分支记忆归一到主干：scope 改为 project（合并回主干后的人工确认动作）。
+   */
+  async normalizeToProject(id: MemoryId): Promise<MemoryRecord> {
+    const memory = this.memoriesRepo.get(id)
+    if (!memory) throw new Error(`Memory not found: ${id}`)
+    memory.scope = 'project'
+    memory.updatedAt = Date.now()
+    await this.memoriesRepo.save(memory)
+    return memory
   }
 }

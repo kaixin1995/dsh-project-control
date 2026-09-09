@@ -623,7 +623,7 @@ ${result.references}` }]
       const memory = await service.memoryService.recordMemory({
         projectId: service.currentProject?.id ?? 'prj_ad_hoc',
         type: args.memoryType as never,
-        truthLevel: 'analysis',
+        truthLevel: 'inferred',
         title: args.title,
         content: args.content,
         relatedFiles: args.relatedFiles,

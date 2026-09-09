@@ -45,16 +45,19 @@ export interface ProjectControlFullConfig {
   /** 确定性验收命令（按项目技术栈在 cordis.yml / settings 配置）。 */
   buildCommand?: string
   testCommand?: string
-  /** 执行工作区模式：current=直接改当前工作区；isolated-worktree=每次 Run 在独立 worktree（V1.0 §38）。 */
-  workspaceMode?: 'current' | 'isolated-worktree'
-  /** 学习模式（V1.0 §78/79）：主语言↔项目语言映射解释。 */
-  learning?: {
-    primaryLanguage?: string
-    projectLanguage?: string
-  }
   /** 一次性 LLM 调用上限。 */
   analysisMaxTokens: number
   analysisTimeoutMs: number
+  /** 已解决评审问题的保留天数（超期自动清理；0=永久保留）。 */
+  resolvedIssueRetentionDays: number
+  /** 单次步骤尝试的停滞超时（毫秒）：超时视为失败进入重试，防子代理卡死。 */
+  stepTimeoutMs: number
+  /** Run 结束是否强制执行确定性收尾验收（配置了 build/test 命令时）。 */
+  finalVerificationGate: boolean
+  /** 启动时自动恢复 interrupted 的 Run（断点续跑；跳过已完成步骤）。 */
+  autoResumeRuns: boolean
+  /** 例行任务调度器开关。 */
+  scheduledTasksEnabled: boolean
   workspaceMode: 'current' | 'isolated-worktree'
   learning: {
     primaryLanguage?: string
@@ -98,6 +101,11 @@ export const PROJECT_CONTROL_SETTINGS_SCHEMA: z<ProjectControlFullConfig> = z.ob
   }),
   analysisMaxTokens: z.number().min(256).default(4096),
   analysisTimeoutMs: z.number().min(5000).default(120000),
+  resolvedIssueRetentionDays: z.number().min(0).default(7),
+  stepTimeoutMs: z.number().min(30_000).default(600_000),
+  finalVerificationGate: z.boolean().default(true),
+  autoResumeRuns: z.boolean().default(true),
+  scheduledTasksEnabled: z.boolean().default(true),
 })
 
 export const PROJECT_CONTROL_DEFAULTS: ProjectControlFullConfig = {
@@ -117,6 +125,11 @@ export const PROJECT_CONTROL_DEFAULTS: ProjectControlFullConfig = {
   },
   analysisMaxTokens: 4096,
   analysisTimeoutMs: 120000,
+  resolvedIssueRetentionDays: 7,
+  stepTimeoutMs: 600_000,
+  finalVerificationGate: true,
+  autoResumeRuns: true,
+  scheduledTasksEnabled: true,
   workspaceMode: 'current',
   learning: {},
 }

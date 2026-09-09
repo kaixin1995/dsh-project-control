@@ -5,7 +5,7 @@
 ## 不可违背的约束
 
 1. **零本体改动**：绝不修改 `deepseek-harness/` 内任何被 git 跟踪的文件。本体对本目录的屏蔽靠其 `.git/info/exclude`（本地文件，非本体内容）。需要本体新能力时，先确认它是否已是文档化扩展点；不是则调整本插件设计，而不是改本体。
-2. **禁止新增会话事件类型**：仓外插件新增 `SessionEventMap` 事件可以在运行中追加，但**重启后持久化日志会被本体拒读**（`KNOWN_SESSION_EVENT_TYPES` 只扫描本体 `packages/*/*/src`，见本体 `packages/core/session/src/known-event-types.ts` 头注释）。本插件持久状态走 storage-domain；模型可见内容经工具结果 / `deferContext` / `agent.inject()` 进入；**聊天卡片（Run/Review/Verification Card）一律骑核心事件类型**：插件工具的 `tool/call`+`tool/result`（meta 携带卡片数据）与命令的 `command/run`+`command/done`——ConversationNode 匹配这些即可回放（V1.0 §118–124 据此修正，见 development-plan R1）。
+2. **禁止新增会话事件类型**：仓外插件新增 `SessionEventMap` 事件可以在运行中追加，但**重启后持久化日志会被本体拒读**（`KNOWN_SESSION_EVENT_TYPES` 只扫描本体 `packages/*/*/src`，见本体 `packages/core/session/src/known-event-types.ts` 头注释）。本插件持久状态走 storage-domain；模型可见内容经工具结果 / `deferContext` / `agent.inject()` 进入；**聊天卡片（Run/Review/Verification Card）一律骑核心事件类型**：插件工具的 `tool/call`+`tool/result`（meta 携带卡片数据）与命令的 `command/run`+`command/done`——ConversationNode 匹配这些即可回放（V1.0 §118–124 据此修正）。
 3. **ESM**：`"type": "module"`，`.ts` 相对导入带 `.ts` 后缀。开发期经本体 tsx ESM 钩子加载。
 4. **bundle 依赖声明**：`cordis.patch.yml` 中每个裸名插件行必须是本包 `package.json` 的**生产依赖**，否则不会被链入 profile 的 `node_modules`（本体 `verify-cordis-config` 门禁与 `healProfileModuleFallback` 均按此规则工作）。
 5. **注册即效果**：所有注册走 `ctx.effect()` / `ctx.on()` / 注册方法返回的 disposer；瀑布监听（`tools/pre-execute`、`tools/execute`、`tools/post-execute`、`agent/pre-step`、`agent/request`、`llm/stream`、`system-prompt/assemble`）**必须调用 `next()`** 委托。
@@ -150,4 +150,4 @@
 - **本体**：`deepseek-harness/` 仓库（D:\Code\deepseek-harness）。
 - **插件 / 本仓库**：`dsh-project-insight/`，独立本地 git 仓库，暂不推送云端。
 - **业主**：本插件的产品决策人。
-- **文档层级**：`docs/AI 项目认知与开发控制插件.md` = **V1.0 技术设计（工程权威，161 节；§118–124/§127/§154-Phase0 已被 development-plan R1–R3 修正）**；`docs/development-plan.md` = 开发任务清单（唯一执行依据，含修正决定 R1–R7）；`docs/SESSION-HANDOFF.md` = 新会话入口；`docs/product-master-plan.md` = 产品总纲（V0.4，业主确认）；`docs/v04-section-mapping.md`、`docs/design-scope.md` = 历史参考（design-scope 的存储/UI/Plan 决策已被 V1.0 取代）。冲突时：产品以总纲定方向，工程以 V1.0+development-plan 定做法。
+- **文档层级**：`docs/AI 项目认知与开发控制插件.md` = **V1.0 技术设计（工程权威，161 节；§118–124/§127/§154-Phase0 的卡片与回放设计已按实际实现修正）**；`docs/product-master-plan.md` = 产品总纲（V0.4，业主确认）；`docs/v04-section-mapping.md`、`docs/design-scope.md` = 历史参考（design-scope 的存储/UI/Plan 决策已被 V1.0 取代）。冲突时：产品以总纲定方向，工程以 V1.0 技术设计定做法。

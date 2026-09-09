@@ -29,6 +29,10 @@ import type {
   ReviewIssueRecord,
   VerificationRecord,
   MemoryRecord,
+  RunContextRecord,
+  MemoryBaselineRecord,
+  ScheduledTaskRecord,
+  ImportedChangeRecord,
 } from '../domain/models.ts'
 
 export interface EntityWithProject {
@@ -122,7 +126,7 @@ export function createInMemoryStore(): ProjectControlStore {
     steps: new DomainRepository<StepRecord, StepId>(createMemoryKvTable<StepRecord>()),
     attempts: new DomainRepository<AttemptRecord, AttemptId>(createMemoryKvTable<AttemptRecord>()),
     checkpoints: new DomainRepository<ProjectBootstrapCheckpoint, string>(createMemoryKvTable<ProjectBootstrapCheckpoint>()),
-    importedChanges: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
+    importedChanges: new DomainRepository<ImportedChangeRecord, string>(createMemoryKvTable<ImportedChangeRecord>()),
     historyCursor: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     confirmed: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     snapshots: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
@@ -133,6 +137,9 @@ export function createInMemoryStore(): ProjectControlStore {
     concepts: new DomainRepository<any, any>(createMemoryKvTable<any>()),
     notes: new DomainRepository<ProjectNoteRecord, string>(createMemoryKvTable<ProjectNoteRecord>()),
     pluginSettings: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
+    runContexts: new DomainRepository<RunContextRecord, string>(createMemoryKvTable<RunContextRecord>()),
+    scheduledTasks: new DomainRepository<ScheduledTaskRecord, string>(createMemoryKvTable<ScheduledTaskRecord>()),
+    memoryBaselines: new DomainRepository<MemoryBaselineRecord, string>(createMemoryKvTable<MemoryBaselineRecord>()),
   }
 }
 
@@ -162,7 +169,7 @@ export interface ProjectControlStore {
   steps: DomainRepository<StepRecord, StepId>
   attempts: DomainRepository<AttemptRecord, AttemptId>
   checkpoints: DomainRepository<ProjectBootstrapCheckpoint, string>
-  importedChanges: DomainRepository<Record<string, unknown>, string>
+  importedChanges: DomainRepository<ImportedChangeRecord, string>
   historyCursor: DomainRepository<Record<string, unknown>, string>
   confirmed: DomainRepository<Record<string, unknown>, string>
   snapshots: DomainRepository<Record<string, unknown>, string>
@@ -173,4 +180,10 @@ export interface ProjectControlStore {
   concepts: DomainRepository<any, any>
   notes: DomainRepository<ProjectNoteRecord, string>
   pluginSettings: DomainRepository<Record<string, unknown>, string>
+  /** 任务工作记忆（RunContext），id 即 runId。 */
+  runContexts: DomainRepository<RunContextRecord, string>
+  /** 例行任务（定时触发模板）。 */
+  scheduledTasks: DomainRepository<ScheduledTaskRecord, string>
+  /** 记忆拉取同步基线（每项目每分支一条）。 */
+  memoryBaselines: DomainRepository<MemoryBaselineRecord, string>
 }

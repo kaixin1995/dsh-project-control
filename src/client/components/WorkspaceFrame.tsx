@@ -28,6 +28,7 @@ export interface WorkspaceState {
   memories?: Array<{ id: string; projectId: string; type: string; truthLevel: string; title: string; content?: string; isHumanConfirmed: boolean; gitBranch: string | null; createdAt: number }>
   evidenceCount?: number
   recentEvidence?: Array<{ id: string; source: string; truthLevel: string; locator: string; snippet: string; createdAt: number }>
+  resolvedIssueRetentionDays?: number
   importedChanges?: Array<{ id: string; title: string; commitCount: number; firstCommitAt: number; lastCommitAt: number; confidence: number; status: string }>
   issues?: Array<{ id: string; changeId: string; severity: string; category: string; title: string; status: string }>
   verifications?: Array<{ id: string; changeId: string; name: string; type: string; status: string; createdAt: number }>
@@ -121,8 +122,94 @@ interface IssueEntry {
   description: string
   status: string
   resolution: string
+  fixStats: { files: number; insertions: number; deletions: number } | null
+  fixFiles: string[]
+  fixImpact: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }>
+  fixDiff: string
   createdAt: number
   updatedAt: number
+}
+
+/** 修复差异的行级着色渲染：+ 绿、- 红、文件头加粗、其余弱化。 */
+function renderDiffLines(diff: string): React.ReactNode[] {
+  if (typeof diff !== 'string' || diff === '') return []
+  return diff.split('\n').slice(0, 400).map((line, index) => {
+    const style: React.CSSProperties = {
+      fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)',
+      fontSize: '11px', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+    }
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff --git') || line.startsWith('@@')) {
+      style.color = 'var(--dsw-alias-label-secondary, #6b7280)'
+    } else if (line.startsWith('+')) {
+      style.color = '#1a7f37'
+      style.background = 'rgba(46,160,67,0.08)'
+    } else if (line.startsWith('-')) {
+      style.color = '#d1242f'
+      style.background = 'rgba(209,36,47,0.08)'
+    } else {
+      style.color = 'var(--dsw-alias-label-secondary, #6b7280)'
+    }
+    return <div key={index} style={style}>{line === '' ? '\u00A0' : line}</div>
+  })
+}
+
+/** 计划确认页的可编辑步骤（/runs/start 返回）。 */
+interface PlanConfirmStep {
+  id: string
+  title: string
+  description: string
+  targetFiles: string[]
+  role: string
+  acceptance: string
+  failurePolicy: string
+  enabled: boolean
+  modelProvider: string
+  modelId: string
+}
+
+/** GET /runs/detail 的载荷。 */
+interface RunDetail {
+  run: { id: string; changeId: string; changeTitle: string; status: string; pausePoint: { stepId: string; reason: string; at: number } | null; error: { message: string } | null; startedAt: number | null; finishedAt: number | null }
+  steps: Array<{ id: string; title: string; role: string; model: string | null; status: string; attemptsCount: number; claimedOutcome: string | null; verified: boolean; costUsd: number }>
+  context: {
+    projectDigest: string; branch: string | null; headSha: string | null
+    injectedMemories: Array<{ id: string; title: string }>
+    stepSummaries: Array<{ stepTitle: string; summary: string; changedFiles: string[]; at: number }>
+    decisionLog: Array<{ kind: string; detail: string; at: number }>
+  } | null
+}
+
+/** GET /scheduled 的任务条目。 */
+interface ScheduledTaskEntry {
+  id: string; name: string; type: string; title: string; description: string
+  intervalMinutes: number; enabled: boolean; lastRunAt: number | null; lastResult: string; nextDueAt: number
+}
+
+/** GET /memories 的记忆条目（记忆面板数据源）。 */
+interface MemoryEntry {
+  id: string; type: string; title: string; content: string; relatedFiles: string[]
+  isHumanConfirmed: boolean; gitBranch: string | null; scope: string; sourceTag: string
+  basisSha: string | null; status: string; lastVerifiedSha: string | null
+  createdAt: number; updatedAt: number
+}
+
+interface MemoriesPayload {
+  memories: MemoryEntry[]
+  branch: string | null
+  headSha: string | null
+  baseline: { sha: string | null; updatedAt: number } | null
+  behindCount: number
+}
+
+/** POST /memory/sync 的同步报告。 */
+interface SyncReport {
+  ok: boolean
+  error?: string
+  behindCount?: number
+  staleProposals?: Array<{ id: string; title: string; reason: string }>
+  renewed?: number
+  newCandidates?: Array<{ type: string; title: string; content: string }>
+  verdict?: string
 }
 
 /** 评审问题状态 → 中文标签。 */
@@ -132,6 +219,39 @@ const ISSUE_STATUS_LABELS: Record<string, string> = {
   resolved: '已解决',
   accepted: '已接受',
   rejected: '已拒绝',
+}
+
+/** 记忆类型 → 中文标签。 */
+const MEMORY_TYPE_LABELS: Record<string, string> = {
+  architecture_decision: '架构决策', pattern_rule: '模式规则', risk_hotspot: '风险热点',
+  learned_concept: '学习概念', user_profile: '用户偏好', project_log: '项目日志', daily_log: '日志',
+}
+
+/** 记忆来源 → 中文标签。 */
+const MEMORY_SOURCE_LABELS: Record<string, string> = {
+  run: '执行提炼', review: '核查沉淀', sync: '拉取同步', chat: 'AI 记录', manual: '手动',
+}
+
+/** 编排角色 → 中文标签。 */
+const ROLE_LABELS: Record<string, string> = {
+  analysis: '分析', planning: '规划', coding: '开发', ops: '简单操作', verification: '验收',
+}
+
+/** 步骤失败策略 → 中文标签。 */
+const POLICY_LABELS: Record<string, string> = {
+  'retry-escalate': '重试并升级模型', 'retry-fallback': '重试', skip: '失败则跳过', ask: '失败则暂停问人',
+}
+
+/** Run 状态 → 中文标签。 */
+const RUN_STATUS_LABELS: Record<string, string> = {
+  queued: '排队中', running: '运行中', paused: '已暂停', blocked: '阻塞', retrying: '重试中',
+  verifying: '收尾验收中', succeeded: '已成功', completed: '已成功', failed: '失败', cancelled: '已取消', interrupted: '已中断',
+}
+
+/** 步骤状态 → 中文标签。 */
+const STEP_STATUS_LABELS: Record<string, string> = {
+  pending: '待执行', ready: '就绪', running: '执行中', paused: '暂停', retrying: '重试中',
+  succeeded: '已成功', failed: '失败', skipped: '已跳过', blocked: '阻塞', cancelled: '已取消', interrupted: '已中断',
 }
 
 /** 评审问题严重度 → 徽章底色。 */
@@ -148,6 +268,55 @@ function normalizeIssueSeverity(severity: string): string {
   if (severity === 'medium' || severity === 'low') return 'minor'
   return severity === 'blocker' || severity === 'critical' || severity === 'major' || severity === 'minor' || severity === 'info'
     ? severity : 'minor'
+}
+
+/** 解析 #rrggbb 或 rgb()/rgba() 颜色前三个分量为 [r, g, b]；无法解析返回 null。 */
+function parseColor(color: string): [number, number, number] | null {
+  const hex = /^#([0-9a-f]{6})$/i.exec(color)
+  if (hex !== null) {
+    const value = Number.parseInt(hex[1]!, 16)
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
+  }
+  const functional = /^rgba?\(\s*(\d{1,3})[,\s]+(\d{1,3})[,\s]+(\d{1,3})/i.exec(color)
+  if (functional !== null) {
+    return [Number(functional[1]), Number(functional[2]), Number(functional[3])]
+  }
+  return null
+}
+
+/** WCAG 相对亮度（0=黑，1=白）。 */
+function relativeLuminance(r: number, g: number, b: number): number {
+  const channel = (value: number): number => {
+    const v = value / 255
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
+  }
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+/** 深化颜色直到白底对比度 ≥4.5:1（每步向 #1f2328 混合 20%，至多 12 步）。 */
+function darkenForWhiteBackground(r: number, g: number, b: number): string {
+  let red = r
+  let green = g
+  let blue = b
+  for (let step = 0; step < 12 && relativeLuminance(red, green, blue) > 0.183; step += 1) {
+    red = Math.round(red * 0.8 + 0x1f * 0.2)
+    green = Math.round(green * 0.8 + 0x23 * 0.2)
+    blue = Math.round(blue * 0.8 + 0x28 * 0.2)
+  }
+  return `rgb(${red}, ${green}, ${blue})`
+}
+
+/**
+ * 主题自适应文字色：深色主题原样返回（亮色可读），浅色主题深化到白底 ≥4.5:1。
+ * 徽章、风险数字、符号高亮等所有强调色文本统一走这里，杜绝淡字压白底。
+ */
+function themeAwareText(color: string): string {
+  const rgb = parseColor(color)
+  if (rgb === null) return color
+  if (typeof document !== 'undefined' && document.body?.hasAttribute?.('data-ds-dark-theme') === true) {
+    return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`
+  }
+  return darkenForWhiteBackground(rgb[0], rgb[1], rgb[2])
 }
 
 /** 评审目标（changeId）→ 可读标签：合成 review:<sha> 指向提交，chg_* 指向变更，adhoc 为工作区。 */
@@ -293,6 +462,14 @@ export const WORKSPACE_DICT = {
     'exec.createHint': '创建变更并自动生成计划，随后由 AI 子代理逐步执行；进度在下方实时刷新，无需去聊天。',
     'exec.col.steps': '步骤',
     'notes.edit': '编辑',
+    'notes.toMemory': '转记忆',
+    'notes.toMemoryHint': '把这条笔记的标题与内容填入下方记忆表单，确认后入库',
+    'notes.toMemoryDone': '✓ 已填入记忆表单（在下方「项目记忆」区确认类型后添加）',
+    'detail.saveNote': '存为笔记',
+    'detail.saveNoteHint': '把本次核查结论（改了什么/实现逻辑/风险点）一键存为结构化笔记',
+    'detail.saveNoteTitle': '核查记录',
+    'detail.saveMemory': '沉淀为记忆',
+    'detail.saveMemoryHint': '把本次核查结论沉淀为项目记忆（进入待确认队列）',
     'notes.save': '保存',
     'notes.cancel': '取消',
     'memory.branchScope': '分支',
@@ -320,9 +497,57 @@ export const WORKSPACE_DICT = {
     'review.verify': '复检',
     'review.verifyRunning': '复检中…',
     'review.verifyHint': '修改代码后点击：自动检测问题是否修复、改动是否最优/最小侵入、有无新问题；全部通过才自动置为已解决',
+    'review.fixDetail': '修复详情',
+    'review.fixStatFiles': '文件',
+    'review.fixFiles': '修复涉及文件',
+    'review.fixImpact': '影响范围（改动符号与调用点）',
+    'review.definedIn': '定义于',
+    'review.callCount': '处调用',
+    'review.fixDiff': '修复差异（相对评审基线）',
     'review.refresh': '刷新',
+    'review.retentionHint': '已解决问题保留 {days} 天后自动清理',
     'review.target': '对象',
     'review.workingTarget': '工作区',
+
+    'plan.title': '编排计划确认',
+    'plan.hint': '每步的角色决定上下文注入与默认模型（分析/操作=fast，开发=standard，规划=reasoning，验收=verifier）；可调整后再启动。',
+    'plan.col.step': '步骤', 'plan.col.role': '角色', 'plan.col.model': '模型', 'plan.col.policy': '失败策略', 'plan.col.enabled': '启用', 'plan.col.attempts': '尝试',
+    'plan.modelDefault': '跟随角色默认',
+    'plan.launchEdited': '保存修改并启动',
+    'plan.launchDirect': '按原计划启动',
+    'plan.discard': '放弃',
+    'plan.viewDetail': '详情', 'plan.refreshDetail': '刷新', 'plan.closeDetail': '收起',
+    'plan.detailTitle': 'Run 详情',
+    'plan.pausedBanner': '任务已暂停，等待你的决策',
+    'plan.resumeRetry': '重试该步骤并继续',
+    'plan.resumeSkip': '跳过该步骤继续',
+    'plan.resumeFailed': '从失败处恢复',
+    'plan.contextTitle': '任务上下文（本 Run 注入了什么）',
+    'plan.branch': '分支', 'plan.injectedMemories': '注入记忆', 'plan.decisionLog': '决策日志',
+    'exec.col.detail': '详情',
+
+    'sched.title': '例行任务',
+    'sched.formName': '任务名称', 'sched.formInterval': '间隔（分钟）',
+    'sched.typeReview': '自动评审', 'sched.typeSummary': 'AI 总结', 'sched.typeRun': '定时执行',
+    'sched.add': '创建',
+    'sched.hint': '到点自动执行：自动评审=评审近 24 小时的新提交（问题进 Review 面板）；AI 总结=生成增量学习总结；定时执行=按模板跑一次编排任务。最小 1 分钟。',
+    'sched.empty': '暂无例行任务。',
+    'sched.col.name': '名称', 'sched.col.type': '类型', 'sched.col.interval': '周期', 'sched.col.next': '下次执行', 'sched.col.lastResult': '上次结果', 'sched.col.actions': '操作',
+    'sched.day': ' 天', 'sched.hour': ' 小时', 'sched.minute': ' 分钟',
+    'sched.disable': '暂停', 'sched.enable': '启用', 'sched.runNow': '立即执行',
+
+    'memory.zoneTitle': '项目记忆',
+    'memory.syncBaseline': '同步基线', 'memory.syncNone': '未同步',
+    'memory.behind': '落后 {n} 个提交未同步',
+    'memory.sync': '同步记忆', 'memory.syncing': '同步中…', 'memory.syncFailed': '同步失败',
+    'memory.staleTitle': '疑似过时（相关代码已被改动，待你复核）',
+    'memory.markStale': '标记过时', 'memory.archiveBtn': '归档', 'memory.keepActive': '仍有效',
+    'memory.newCandidates': '新增候选（已入待确认队列）：',
+    'memory.closeReport': '关闭报告',
+    'memory.scopeProject': '主干（全分支）', 'memory.scopeBranch': '仅当前分支',
+    'memory.pendingQueue': '待确认队列',
+    'memory.toNote': '转笔记', 'memory.normalize': '归一到主干', 'memory.restore': '恢复',
+    'memory.statusStale': '疑似过时',
     'impact.functionsNone': '未识别出函数级调用变化（可能是样式/静态资源/纯配置改动）。',
     'review.col.severity': '级别',
     'review.col.category': '类别',
@@ -473,6 +698,14 @@ export const WORKSPACE_DICT = {
     'exec.createHint': 'Creates a change, generates a plan, then AI subagents execute step by step; progress refreshes below.',
     'exec.col.steps': 'Steps',
     'notes.edit': 'Edit',
+    'notes.toMemory': 'To memory',
+    'notes.toMemoryHint': 'Prefill the memory form below with this note',
+    'notes.toMemoryDone': '✓ Prefilled the memory form (choose a type in the Project memory zone below, then add)',
+    'detail.saveNote': 'Save as note',
+    'detail.saveNoteHint': 'Save this review conclusion (what/logic/risks) as a structured note',
+    'detail.saveNoteTitle': 'Review record',
+    'detail.saveMemory': 'Distill to memory',
+    'detail.saveMemoryHint': 'Distill this review conclusion into a project memory (queued for confirmation)',
     'notes.save': 'Save',
     'notes.cancel': 'Cancel',
     'memory.branchScope': 'Branch',
@@ -500,9 +733,57 @@ export const WORKSPACE_DICT = {
     'review.verify': 'Re-verify',
     'review.verifyRunning': 'Verifying…',
     'review.verifyHint': 'After fixing the code, click to re-check: whether issues are fixed, whether the change is optimal and minimally invasive, and whether new issues appeared. Only a passing re-verification marks issues resolved.',
+    'review.fixDetail': 'Fix details',
+    'review.fixStatFiles': 'files',
+    'review.fixFiles': 'Files touched by the fix',
+    'review.fixImpact': 'Impact scope (changed symbols and callers)',
+    'review.definedIn': 'defined in',
+    'review.callCount': 'call site(s)',
+    'review.fixDiff': 'Fix diff (relative to the review baseline)',
     'review.refresh': 'Refresh',
+    'review.retentionHint': 'Resolved issues are auto-purged after {days} day(s)',
     'review.target': 'Target',
     'review.workingTarget': 'Working tree',
+
+    'plan.title': 'Orchestration plan',
+    'plan.hint': 'Each step role drives context injection and the default model (analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier); adjust before launching.',
+    'plan.col.step': 'Step', 'plan.col.role': 'Role', 'plan.col.model': 'Model', 'plan.col.policy': 'Failure policy', 'plan.col.enabled': 'On', 'plan.col.attempts': 'Attempts',
+    'plan.modelDefault': 'Role default',
+    'plan.launchEdited': 'Save edits & launch',
+    'plan.launchDirect': 'Launch as-is',
+    'plan.discard': 'Discard',
+    'plan.viewDetail': 'Detail', 'plan.refreshDetail': 'Refresh', 'plan.closeDetail': 'Close',
+    'plan.detailTitle': 'Run detail',
+    'plan.pausedBanner': 'Run paused, awaiting your decision',
+    'plan.resumeRetry': 'Retry step & continue',
+    'plan.resumeSkip': 'Skip step & continue',
+    'plan.resumeFailed': 'Resume from failure',
+    'plan.contextTitle': 'Run context (what was injected)',
+    'plan.branch': 'Branch', 'plan.injectedMemories': 'Injected memories', 'plan.decisionLog': 'Decision log',
+    'exec.col.detail': 'Detail',
+
+    'sched.title': 'Scheduled tasks',
+    'sched.formName': 'Task name', 'sched.formInterval': 'Interval (minutes)',
+    'sched.typeReview': 'Auto review', 'sched.typeSummary': 'AI summary', 'sched.typeRun': 'Timed run',
+    'sched.add': 'Create',
+    'sched.hint': 'Runs automatically when due: auto review = review commits from the last 24h (issues land in the Review tab); AI summary = incremental learning summary; timed run = execute the template as an orchestrated task. Minimum 1 minute.',
+    'sched.empty': 'No scheduled tasks yet.',
+    'sched.col.name': 'Name', 'sched.col.type': 'Type', 'sched.col.interval': 'Cycle', 'sched.col.next': 'Next run', 'sched.col.lastResult': 'Last result', 'sched.col.actions': 'Actions',
+    'sched.day': ' d', 'sched.hour': ' h', 'sched.minute': ' min',
+    'sched.disable': 'Pause', 'sched.enable': 'Enable', 'sched.runNow': 'Run now',
+
+    'memory.zoneTitle': 'Project memory',
+    'memory.syncBaseline': 'Sync baseline', 'memory.syncNone': 'never synced',
+    'memory.behind': '{n} commits behind',
+    'memory.sync': 'Sync memory', 'memory.syncing': 'Syncing…', 'memory.syncFailed': 'Sync failed',
+    'memory.staleTitle': 'Possibly stale (related code changed; review needed)',
+    'memory.markStale': 'Mark stale', 'memory.archiveBtn': 'Archive', 'memory.keepActive': 'Still valid',
+    'memory.newCandidates': 'New candidates (queued for confirmation):',
+    'memory.closeReport': 'Close report',
+    'memory.scopeProject': 'Mainline (all branches)', 'memory.scopeBranch': 'Current branch only',
+    'memory.pendingQueue': 'Pending confirmation',
+    'memory.toNote': 'To note', 'memory.normalize': 'Normalize to mainline', 'memory.restore': 'Restore',
+    'memory.statusStale': 'Stale',
     'fs.browse': 'Browse',
     'fs.up': 'Up',
     'fs.use': 'Use this directory',
@@ -688,10 +969,19 @@ const styles: Record<string, React.CSSProperties> = {
     background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
     borderRadius: '6px', padding: '10px 12px', maxHeight: '320px', overflowY: 'auto',
   },
-  badge: (color: string): React.CSSProperties => ({
-    display: 'inline-block', padding: '1px 8px', borderRadius: '4px', fontSize: '11px',
-    background: `${color}22`, color,
-  }),
+  badge: (color: string): React.CSSProperties => {
+    const rgb = parseColor(color)
+    if (rgb === null) {
+      return { display: 'inline-block', padding: '1px 8px', borderRadius: '4px', fontSize: '11px', background: `${color}22`, color }
+    }
+    const [r, g, b] = rgb
+    // 底色统一 16% 色调；文字色主题自适应（浅色深化到白底可读）。
+    return {
+      display: 'inline-block', padding: '1px 8px', borderRadius: '4px', fontSize: '11px',
+      background: `rgba(${r}, ${g}, ${b}, 0.16)`,
+      color: themeAwareText(color),
+    }
+  },
   sectionTitle: { fontWeight: 600, fontSize: '12px', marginBottom: '8px' },
   what: { fontSize: '12px', lineHeight: 1.7, margin: '4px 0 8px' },
   logicStep: { fontSize: '12px', lineHeight: 1.8, display: 'flex', gap: '6px' },
@@ -815,7 +1105,7 @@ function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => stri
     }))
   }
   for (const item of indirect.slice(0, 20)) pushEdge(chainStart(item.reason), item.path, '#d97706', `ei-${item.path}`)
-  for (const item of potential.slice(0, 16)) pushEdge(chainStart(item.reason), item.path, '#8b8b8b', `ep-${item.path}`)
+  for (const item of potential.slice(0, 16)) pushEdge(chainStart(item.reason), item.path, '#57606a', `ep-${item.path}`)
 
   return React.createElement('div', null,
     React.createElement('svg', { width: '100%', viewBox: `0 0 1024 ${height}`, style: { maxHeight: 480 } },
@@ -823,7 +1113,7 @@ function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => stri
         React.createElement('text', { key: String(col), x: colX[col as number], y: 24, fontSize: 12, fontWeight: 700, fill: 'var(--dsw-alias-label-primary, #1f2328)' }, name as string)),
       renderCol(0, col0, '#2563eb'),
       renderCol(1, col1, '#d97706'),
-      renderCol(2, col2, '#8b8b8b'),
+      renderCol(2, col2, '#57606a'),
       edges,
     ),
   )
@@ -835,16 +1125,16 @@ const DIFF_KEYWORDS = /\b(public|private|protected|internal|static|void|class|st
 function highlightCodeLine(line: string, keyPrefix: string): React.ReactNode[] {
   const trimmed = line.trimStart()
   if (trimmed.startsWith('//') || trimmed.startsWith('///') || trimmed.startsWith('*') || trimmed.startsWith('/*') || trimmed.startsWith('#')) {
-    return [React.createElement('span', { key: `${keyPrefix}-c`, style: { color: '#6a9955' } }, line)]
+    return [React.createElement('span', { key: `${keyPrefix}-c`, style: { color: themeAwareText('#6a9955') } }, line)]
   }
   const parts = line.split(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g)
   return parts.map((part, i) => {
-    if (i % 2 === 1) return React.createElement('span', { key: `${keyPrefix}-s${i}`, style: { color: '#ce9178' } }, part)
+    if (i % 2 === 1) return React.createElement('span', { key: `${keyPrefix}-s${i}`, style: { color: themeAwareText('#ce9178') } }, part)
     const sub: React.ReactNode[] = []
     let last = 0
     for (const match of part.matchAll(DIFF_KEYWORDS)) {
       if (match.index! > last) sub.push(part.slice(last, match.index))
-      sub.push(React.createElement('span', { key: `${keyPrefix}-k${i}-${match.index}`, style: { color: '#569cd6' } }, match[0]))
+      sub.push(React.createElement('span', { key: `${keyPrefix}-k${i}-${match.index}`, style: { color: themeAwareText('#569cd6') } }, match[0]))
       last = match.index! + match[0].length
     }
     if (last < part.length) sub.push(part.slice(last))
@@ -868,7 +1158,7 @@ function DiffView(props: { patch: string }) {
           : line.startsWith('-') ? 'del' : 'ctx'
     const bg = kind === 'add' ? 'rgba(46,160,67,0.14)' : kind === 'del' ? 'rgba(248,81,73,0.13)' : kind === 'hunk' ? 'rgba(56,139,253,0.1)' : 'transparent'
     const content = kind === 'meta' || kind === 'hunk'
-      ? React.createElement('span', { style: { color: '#388bfd', fontWeight: 600 } }, line)
+      ? React.createElement('span', { style: { color: '#0969da', fontWeight: 600 } }, line)
       : kind === 'add' || kind === 'del'
         ? React.createElement('span', { style: { color: kind === 'add' ? '#1a7f37' : '#cf222e', fontWeight: 600 } }, line[0])
         : null
@@ -991,15 +1281,31 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [issueSeverityFilter, setIssueSeverityFilter] = useState('')
   const [issueStatusFilter, setIssueStatusFilter] = useState('')
   const [issueExpanded, setIssueExpanded] = useState<Record<string, boolean>>({})
+  const [fixExpanded, setFixExpanded] = useState<Record<string, boolean>>({})
   const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
   const [aiSummarizing, setAiSummarizing] = useState(false)
   const [modelTiers, setModelTiers] = useState<Record<string, { provider: string; model: string }> | null>(null)
   const [modelOptions, setModelOptions] = useState<Array<{ provider: string; id: string; name: string }>>([])
   const [modelSaving, setModelSaving] = useState(false)
   const [modelSaved, setModelSaved] = useState(false)
+  // ── 执行中心：计划确认 / Run 详情 / 例行任务 ──
+  const [planConfirm, setPlanConfirm] = useState<{ changeId: string; steps: PlanConfirmStep[] } | null>(null)
+  const [planBusy, setPlanBusy] = useState(false)
+  const [runDetail, setRunDetail] = useState<RunDetail | null>(null)
+  const [scheduledData, setScheduledData] = useState<ScheduledTaskEntry[] | null>(null)
+  const [schedName, setSchedName] = useState('')
+  const [schedType, setSchedType] = useState('review')
+  const [schedTitle, setSchedTitle] = useState('')
+  const [schedDesc, setSchedDesc] = useState('')
+  const [schedInterval, setSchedInterval] = useState('1440')
+  // ── 记忆面板：全量数据 / 同步报告 ──
+  const [memoriesData, setMemoriesData] = useState<MemoriesPayload | null>(null)
+  const [syncReport, setSyncReport] = useState<SyncReport | null>(null)
+  const [memoryScope, setMemoryScope] = useState<'project' | 'branch'>('project')
+  const [memoryType, setMemoryType] = useState('architecture_decision')
+  const [memorySyncing, setMemorySyncing] = useState(false)
   const [execTitle, setExecTitle] = useState('')
   const [execDesc, setExecDesc] = useState('')
-  const [memoryBranch, setMemoryBranch] = useState('')
 
   const post = async (path: string, body: Record<string, unknown>): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
     const response = await fetch(path, {
@@ -1221,7 +1527,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
-  /** 页面一键启动执行：建变更 → LLM 生成计划 → 后台子代理逐步执行。 */
+  /** 页面创建执行：建变更 → LLM 生成编排计划 → 计划确认页（角色/模型/策略可调）→ 确认后启动。 */
   const startRun = async (): Promise<void> => {
     if (execTitle.trim() === '' || execDesc.trim() === '') return
     setBusy('startRun')
@@ -1232,15 +1538,179 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         setActionResult('✗ ' + String(data['error'] ?? 'error'))
         return
       }
-      setActionResult('已启动执行：' + JSON.stringify(data, null, 2))
+      if (data['autoStarted'] === true) {
+        setActionResult('✓ 已启动执行：' + String(data['runId'] ?? ''))
+        setExecTitle('')
+        setExecDesc('')
+        await refreshState()
+        return
+      }
+      const steps = (data['steps'] as Array<Record<string, unknown>> | undefined) ?? []
+      setPlanConfirm({
+        changeId: String(data['changeId'] ?? ''),
+        steps: steps.map((step) => ({
+          id: String(step['id'] ?? ''),
+          title: String(step['title'] ?? ''),
+          description: String(step['description'] ?? ''),
+          targetFiles: (step['targetFiles'] as string[] | undefined) ?? [],
+          role: String(step['role'] ?? 'coding'),
+          acceptance: String(step['acceptance'] ?? ''),
+          failurePolicy: String(step['failurePolicy'] ?? 'retry-escalate'),
+          enabled: step['enabled'] !== false,
+          modelProvider: '',
+          modelId: '',
+        })),
+      })
+      if (modelOptions.length === 0 && modelTiers === null) void loadModelConfig()
+      setActionResult('✓ 计划已生成，请在下方确认编排后启动')
       setExecTitle('')
       setExecDesc('')
-      await refreshState()
     } catch (error: unknown) {
       setActionResult('✗ ' + (error instanceof Error ? error.message : String(error)))
     } finally {
       setBusy(null)
     }
+  }
+
+  /** 计划确认页：保存编辑（新版本计划）并启动执行。 */
+  const launchPlan = async (withEdits: boolean): Promise<void> => {
+    if (planConfirm === null) return
+    setPlanBusy(true)
+    try {
+      let changeId = planConfirm.changeId
+      if (withEdits) {
+        const { ok, data } = await post('/project-control/api/runs/plan/update', { changeId, steps: planConfirm.steps })
+        if (!ok) {
+          setActionResult('✗ ' + String(data['error'] ?? 'error'))
+          return
+        }
+      }
+      const { ok, data } = await post('/project-control/api/runs/launch', { changeId })
+      if (!ok) {
+        setActionResult('✗ ' + String(data['error'] ?? 'error'))
+        return
+      }
+      setActionResult('✓ 已启动执行：' + String(data['runId'] ?? ''))
+      setPlanConfirm(null)
+      await refreshState()
+    } catch (error: unknown) {
+      setActionResult('✗ ' + (error instanceof Error ? error.message : String(error)))
+    } finally {
+      setPlanBusy(false)
+    }
+  }
+
+  /** 加载 Run 详情（步骤时间线 + 任务工作记忆）。 */
+  const loadRunDetail = async (id: string): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/runs/detail?id=' + encodeURIComponent(id))
+      const data: unknown = await response.json()
+      if (response.ok) setRunDetail(data as RunDetail)
+    } catch {
+      setRunDetail(null)
+    }
+  }
+
+  /** 恢复暂停/中断/失败的 Run。 */
+  const resumeRun = async (runId: string, action: 'continue' | 'skip-current'): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/runs/resume', { runId, action })
+    if (ok) {
+      setActionResult('✓ 已恢复执行（' + action + '）')
+      await refreshState()
+      await loadRunDetail(runId)
+    } else {
+      setActionResult('✗ ' + String(data['error'] ?? 'error'))
+    }
+  }
+
+  /** 加载例行任务列表。 */
+  const loadScheduled = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/scheduled?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
+      const data: unknown = await response.json()
+      if (response.ok) setScheduledData((data as { tasks: ScheduledTaskEntry[] }).tasks ?? [])
+    } catch {
+      // 列表加载失败不打断页面
+    }
+  }
+
+  /** 创建 / 更新 / 删除 / 立即执行例行任务。 */
+  const addScheduled = async (): Promise<void> => {
+    const intervalMinutes = Number(schedInterval)
+    if (schedName.trim() === '' || !Number.isFinite(intervalMinutes) || intervalMinutes < 1) {
+      setActionResult('✗ 请填写任务名称与有效间隔（分钟）')
+      return
+    }
+    const { ok, data } = await post('/project-control/api/scheduled', {
+      name: schedName.trim(), type: schedType, intervalMinutes,
+      title: schedTitle.trim() || undefined, description: schedDesc.trim() || undefined,
+    })
+    if (ok) {
+      setSchedName(''); setSchedTitle(''); setSchedDesc('')
+      setActionResult('✓ 例行任务已创建')
+      await loadScheduled()
+    } else {
+      setActionResult('✗ ' + String(data['error'] ?? 'error'))
+    }
+  }
+
+  const scheduledAction = async (path: string, body: Record<string, unknown>): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/scheduled/' + path, body)
+    if (ok) await loadScheduled()
+    else setActionResult('✗ ' + String(data['error'] ?? 'error'))
+  }
+
+  /** 加载记忆面板全量数据（含同步基线）。 */
+  const loadMemories = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/memories?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
+      const data: unknown = await response.json()
+      if (response.ok) setMemoriesData(data as MemoriesPayload)
+    } catch {
+      // 加载失败不打断页面
+    }
+  }
+
+  /** 拉取同步：三向判定（失效提案/新增候选/自动续命）。 */
+  const syncMemories = async (): Promise<void> => {
+    setMemorySyncing(true)
+    try {
+      const { ok, data } = await post('/project-control/api/memory/sync', {})
+      if (!ok && data['error'] !== undefined) {
+        setSyncReport({ ok: false, error: String(data['error']) })
+        return
+      }
+      setSyncReport(data as SyncReport)
+      await loadMemories()
+    } catch (error: unknown) {
+      setSyncReport({ ok: false, error: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setMemorySyncing(false)
+    }
+  }
+
+  /** 同步报告后续：把选中的疑似过时项落为 stale / 归档。 */
+  const applySync = async (ids: string[], action: 'mark-stale' | 'archive'): Promise<void> => {
+    await post('/project-control/api/memory/sync/apply', { ids, action })
+    setSyncReport((previous) => previous === null ? null : { ...previous, staleProposals: (previous.staleProposals ?? []).filter((proposal) => !ids.includes(proposal.id)) })
+    await loadMemories()
+  }
+
+  /** 记忆状态操作（归档/恢复）与分支归一。 */
+  const memoryAction = async (path: string, body: Record<string, unknown>): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/memory/' + path, body)
+    if (ok) await loadMemories()
+    else setActionResult('✗ ' + String(data['error'] ?? 'error'))
+  }
+
+  /** 记忆转笔记：引用进学习档案。 */
+  const memoryToNote = async (memory: MemoryEntry): Promise<void> => {
+    const { ok } = await post('/project-control/api/notes', {
+      title: memory.title,
+      content: memory.content + (memory.basisSha !== null ? `\n（来源：项目记忆 ${memory.basisSha.slice(0, 8)}）` : ''),
+      tags: '记忆, ' + memory.type,
+    })
+    if (ok) setActionResult('✓ 已把记忆转为笔记')
   }
 
   // 会话打开/切换时官方会 closeDetails 收起轨道；看门狗每 500ms 检查，
@@ -1310,7 +1780,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     let disposed = false
     const load = async (): Promise<void> => {
       try {
-        const response = await fetch('/project-control/api/state', { headers: { accept: 'application/json' } })
+        const response = await fetch('/project-control/api/state?sessionId=' + encodeURIComponent(props.sessionId ?? ''), { headers: { accept: 'application/json' } })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const data: unknown = await response.json()
         if (!disposed) {
@@ -1332,8 +1802,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // 进入提交/笔记/Review 页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
   useEffect(() => {
     if (tab === 'commits') void loadCommits()
-    if (tab === 'notes') void loadNotes()
+    if (tab === 'notes') { void loadNotes(); void loadMemories() }
     if (tab === 'review') void loadIssues()
+    if (tab === 'execution') { void loadScheduled(); if (runDetail !== null) void loadRunDetail(runDetail.run.id) }
     if (tab === 'settings' && modelTiers === null) void loadModelConfig()
   }, [tab, props.sessionId])
 
@@ -1369,7 +1840,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   }
 
   const refreshState = async (): Promise<void> => {
-    const refreshed = await fetch('/project-control/api/state', { headers: { accept: 'application/json' } })
+    const refreshed = await fetch('/project-control/api/state?sessionId=' + encodeURIComponent(props.sessionId ?? ''), { headers: { accept: 'application/json' } })
     if (refreshed.ok) setState(await refreshed.json() as WorkspaceState)
   }
 
@@ -1422,7 +1893,6 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const bootstrap = state?.bootstrap ?? null
   const changes = state?.changes ?? []
   const runs = state?.runs ?? []
-  const memories = state?.memories ?? []
   const verifications = state?.verifications ?? []
   const confirmed = state?.confirmed ?? []
   const concepts = state?.concepts ?? []
@@ -1473,7 +1943,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     ? allTargets
     : allTargets.filter((entry) => (entry.label + entry.meta).toLowerCase().includes(pickerFilter.trim().toLowerCase()))
 
-  const impactRiskColor = impact === null ? '#8b8b8b' : (RISK_COLOR[impact.riskLevel] ?? '#8b8b8b')
+  const impactRiskColor = themeAwareText(impact === null ? '#57606a' : (RISK_COLOR[impact.riskLevel] ?? '#57606a'))
 
   const commitsTab = (
     <>
@@ -1568,6 +2038,31 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{d.analysisGeneratedAt ? ' · ' + new Date(d.analysisGeneratedAt).toLocaleString() : ''}</span>
                 )}
                 <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadDetail(target, true) }}>{t('cache.regenerate')}</button>
+                <span style={{ flex: 1 }} />
+                <button
+                  style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                  title={t('detail.saveNoteHint')}
+                  onClick={() => {
+                    const sha = target === 'working' ? 'working' : target
+                    void post('/project-control/api/notes', {
+                      title: `${t('detail.saveNoteTitle')}：${(d.commit?.message ?? target).slice(0, 60)}`,
+                      content: [`【改了什么】\n${d.analysis.what}`, `【实现逻辑】\n${d.analysis.logic}`, `【风险点】\n${d.analysis.risk}`].filter((block) => !block.endsWith('】\n')).join('\n\n'),
+                      sha, tags: '核查',
+                    }).then(({ ok }) => { setActionResult(ok ? '✓ 已存为笔记（笔记页可查看）' : '✗ 保存失败') ; if (ok) void loadNotes() })
+                  }}
+                >💾 {t('detail.saveNote')}</button>
+                <button
+                  style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                  title={t('detail.saveMemoryHint')}
+                  onClick={() => {
+                    const sha = target === 'working' ? undefined : target
+                    void post('/project-control/api/memory', {
+                      memoryType: 'risk_hotspot', sourceTag: 'review', basisSha: sha,
+                      title: `核查结论：${(d.commit?.message ?? target).slice(0, 60)}`,
+                      content: [d.analysis.what, d.analysis.risk].filter((part) => part !== '').join('\n---\n'),
+                    }).then(({ ok }) => { setActionResult(ok ? '✓ 已沉淀为记忆（待确认队列）' : '✗ 保存失败'); if (ok) void loadMemories() })
+                  }}
+                >🧠 {t('detail.saveMemory')}</button>
               </div>
             )}
             {d === undefined ? (
@@ -1608,7 +2103,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         <>
                           <tr key={key}>
                             <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{file.path}</td>
-                            <td style={{ ...styles.td, color: '#2da44e', whiteSpace: 'nowrap' }}>+{file.adds}</td>
+                            <td style={{ ...styles.td, color: '#1a7f37', whiteSpace: 'nowrap' }}>+{file.adds}</td>
                             <td style={{ ...styles.td, color: '#cf222e', whiteSpace: 'nowrap' }}>-{file.dels}</td>
                             <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>
                               <button style={styles.secondary} onClick={() => { void loadFileDiff(target, file.path) }}>
@@ -1700,7 +2195,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         )}
                         {entry.impact !== undefined && entry.impact !== '' && (
                           <div style={{ ...styles.what, marginBottom: '6px' }}>
-                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: '#ce9178' }}>{t('impact.funcCallers')}</span>
+                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: themeAwareText('#ce9178') }}>{t('impact.funcCallers')}</span>
                             {entry.impact}
                           </div>
                         )}
@@ -1946,7 +2441,6 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               {changes.map((change) => (
                 <tr key={change.id}>
                   <td style={styles.td}>{change.title}</td>
-                  <td style={styles.td}>{change.type}</td>
                   <td style={styles.td}><span style={styles.badge(change.status === 'completed' ? '#4ec9b0' : '#569cd6')}>{change.status}</span></td>
                   <td style={styles.td}>{formatTime(change.updatedAt)}</td>
                   <td style={styles.td}>
@@ -1975,6 +2469,62 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('exec.createHint')}</div>
       </Card>
       {resultPanel}
+      {planConfirm !== null && (
+        <Card title={t('plan.title')}>
+          <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginBottom: '8px' }}>{t('plan.hint')}</div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={styles.table}>
+              <thead>
+                <tr>{['plan.col.step', 'plan.col.role', 'plan.col.model', 'plan.col.policy', 'plan.col.enabled'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+              </thead>
+              <tbody>
+                {planConfirm.steps.map((step, index) => (
+                  <tr key={step.id} style={{ opacity: step.enabled ? 1 : 0.45 }}>
+                    <td style={{ ...styles.td, minWidth: 220 }}>
+                      <div style={{ fontWeight: 600 }}>{index + 1}. {step.title}</div>
+                      <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{step.description.slice(0, 120)}</div>
+                      {step.targetFiles.length > 0 && (
+                        <div style={{ fontSize: '10px', color: 'var(--dsw-alias-label-secondary, #6b7280)', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)' }}>{step.targetFiles.join(', ').slice(0, 120)}</div>
+                      )}
+                    </td>
+                    <td style={styles.td}>
+                      <select style={{ ...styles.input, width: 'auto', padding: '3px 6px' }} value={step.role}
+                        onChange={(e) => { setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, role: e.target.value } : item) }) }}>
+                        {['analysis', 'planning', 'coding', 'ops', 'verification'].map((role) => <option key={role} value={role}>{ROLE_LABELS[role] ?? role}</option>)}
+                      </select>
+                    </td>
+                    <td style={styles.td}>
+                      <select style={{ ...styles.input, width: 'auto', padding: '3px 6px' }} value={step.modelProvider + '/' + step.modelId}
+                        onChange={(e) => {
+                          const [provider, model] = e.target.value.split('/')
+                          setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, modelProvider: provider ?? '', modelId: model ?? '' } : item) })
+                        }}>
+                        <option value="/">{t('plan.modelDefault')}</option>
+                        {modelOptions.map((option) => <option key={option.provider + '/' + option.id} value={option.provider + '/' + option.id}>{option.provider}/{option.id}</option>)}
+                      </select>
+                    </td>
+                    <td style={styles.td}>
+                      <select style={{ ...styles.input, width: 'auto', padding: '3px 6px' }} value={step.failurePolicy}
+                        onChange={(e) => { setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, failurePolicy: e.target.value } : item) }) }}>
+                        {Object.entries(POLICY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </td>
+                    <td style={styles.td}>
+                      <input type="checkbox" checked={step.enabled}
+                        onChange={(e) => { setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, enabled: e.target.checked } : item) }) }} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+            <button style={styles.button} disabled={planBusy} onClick={() => { void launchPlan(true) }}>{planBusy ? '…' : t('plan.launchEdited')}</button>
+            <button style={styles.secondary} disabled={planBusy} onClick={() => { void launchPlan(false) }}>{t('plan.launchDirect')}</button>
+            <button style={styles.secondary} disabled={planBusy} onClick={() => { setPlanConfirm(null) }}>{t('plan.discard')}</button>
+          </div>
+        </Card>
+      )}
       <Card>
         <div style={styles.row}>
           <span><span style={styles.label}>{t('exec.attempts')}</span>{String(state?.attemptsCount ?? 0)}</span>
@@ -1982,9 +2532,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {runs.length === 0 ? (
           <div style={styles.empty}>{t('state.noRuns')}</div>
         ) : (
+          <div style={{ overflowX: 'auto' }}>
           <table style={styles.table}>
             <thead>
-              <tr>{['exec.col.change', 'exec.col.steps', 'exec.col.status', 'exec.col.started', 'exec.col.cost'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+              <tr>{['exec.col.change', 'exec.col.steps', 'exec.col.status', 'exec.col.started', 'exec.col.cost', 'exec.col.detail'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
             </thead>
             <tbody>
               {runs.map((run) => (
@@ -1992,17 +2543,143 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <td style={styles.td}>{(changes.find((change) => change.id === run.changeId)?.title) ?? run.changeId}</td>
                   <td style={styles.td}>{run.stepsTotal ? (run.stepsDone ?? 0) + '/' + run.stepsTotal : '—'}</td>
                   <td style={styles.td}>
-                    <span style={styles.badge(run.status === 'completed' ? '#4ec9b0' : run.status === 'failed' ? '#f14c4c' : '#dcdcaa')}>{run.status}</span>
+                    <span style={styles.badge(run.status === 'succeeded' || run.status === 'completed' ? '#4ec9b0' : run.status === 'failed' ? '#f14c4c' : run.status === 'paused' ? '#d97706' : '#dcdcaa')}>{RUN_STATUS_LABELS[run.status] ?? run.status}</span>
                     {run.currentStep !== null && run.currentStep !== undefined && run.status === 'running' && (
                       <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.currentStep}</div>
                     )}
                   </td>
                   <td style={styles.td}>{formatTime(run.startedAt)}</td>
                   <td style={styles.td}>{run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'}</td>
+                  <td style={styles.td}>
+                    <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(run.id) }}>{runDetail?.run.id === run.id ? t('plan.refreshDetail') : t('plan.viewDetail')}</button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          </div>
+        )}
+      </Card>
+      {runDetail !== null && (
+        <Card title={t('plan.detailTitle') + ' · ' + runDetail.run.changeTitle}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' }}>
+            <span style={styles.badge(runDetail.run.status === 'succeeded' || runDetail.run.status === 'completed' ? '#4ec9b0' : runDetail.run.status === 'failed' ? '#f14c4c' : runDetail.run.status === 'paused' ? '#d97706' : '#dcdcaa')}>{RUN_STATUS_LABELS[runDetail.run.status] ?? runDetail.run.status}</span>
+            {runDetail.run.error !== null && <span style={{ fontSize: '11px', color: '#d1242f' }}>{runDetail.run.error.message}</span>}
+            <span style={{ flex: 1 }} />
+            <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(runDetail.run.id) }}>{t('plan.refreshDetail')}</button>
+            <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setRunDetail(null) }}>{t('plan.closeDetail')}</button>
+          </div>
+          {runDetail.run.status === 'paused' && runDetail.run.pausePoint !== null && (
+            <div style={{ padding: '8px 12px', borderRadius: '6px', background: 'rgba(217,119,6,0.08)', border: '1px solid rgba(217,119,6,0.35)', marginBottom: '8px' }}>
+              <div style={{ fontWeight: 600, fontSize: '12px' }}>⏸ {t('plan.pausedBanner')}</div>
+              <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{runDetail.run.pausePoint.reason}</div>
+              <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+                <button style={{ ...styles.button, padding: '3px 10px', fontSize: '11px' }} onClick={() => { void resumeRun(runDetail.run.id, 'continue') }}>{t('plan.resumeRetry')}</button>
+                <button style={{ ...styles.secondary, padding: '3px 10px', fontSize: '11px' }} onClick={() => { void resumeRun(runDetail.run.id, 'skip-current') }}>{t('plan.resumeSkip')}</button>
+              </div>
+            </div>
+          )}
+          {(runDetail.run.status === 'failed' || runDetail.run.status === 'interrupted') && (
+            <div style={{ marginBottom: '8px' }}>
+              <button style={{ ...styles.button, padding: '3px 10px', fontSize: '11px' }} onClick={() => { void resumeRun(runDetail.run.id, 'continue') }}>{t('plan.resumeFailed')}</button>
+            </div>
+          )}
+          <div style={{ overflowX: 'auto' }}>
+          <table style={styles.table}>
+            <thead>
+              <tr>{['plan.col.step', 'plan.col.role', 'plan.col.model', 'exec.col.status', 'plan.col.attempts', 'exec.col.cost'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {runDetail.steps.map((step, index) => (
+                <tr key={step.id}>
+                  <td style={styles.td}>
+                    <div>{index + 1}. {step.title}</div>
+                    {step.claimedOutcome !== null && (
+                      <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', maxWidth: 320, whiteSpace: 'normal' }}>{step.claimedOutcome.slice(0, 160)}</div>
+                    )}
+                  </td>
+                  <td style={styles.td}><span style={styles.badge('rgba(86,156,214,0.25)')}>{ROLE_LABELS[step.role] ?? step.role}</span></td>
+                  <td style={{ ...styles.td, fontSize: '11px' }}>{step.model ?? '—'}</td>
+                  <td style={styles.td}><span style={styles.badge(step.verified ? '#4ec9b0' : step.status === 'failed' ? '#f14c4c' : step.status === 'skipped' ? '#8b949e' : '#dcdcaa')}>{STEP_STATUS_LABELS[step.status] ?? step.status}</span></td>
+                  <td style={styles.td}>{String(step.attemptsCount)}</td>
+                  <td style={styles.td}>{step.costUsd > 0 ? '$' + step.costUsd.toFixed(4) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          </div>
+          {runDetail.context !== null && (
+            <div style={{ marginTop: '10px', border: '1px dashed var(--dsw-alias-border-l2, rgba(5,5,5,0.15))', borderRadius: '8px', padding: '8px 12px' }}>
+              <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '4px' }}>{t('plan.contextTitle')}</div>
+              <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                {runDetail.context.projectDigest}
+                {runDetail.context.branch !== null ? ` · ${t('plan.branch')} ${runDetail.context.branch}` : ''}
+                {runDetail.context.headSha !== null ? ` · HEAD ${runDetail.context.headSha.slice(0, 8)}` : ''}
+              </div>
+              {runDetail.context.injectedMemories.length > 0 && (
+                <div style={{ marginTop: '4px', fontSize: '11px' }}>
+                  <span style={{ fontWeight: 600 }}>{t('plan.injectedMemories')}：</span>
+                  {runDetail.context.injectedMemories.map((memory) => <span key={memory.id} style={styles.badge('rgba(78,201,176,0.2)')}>{memory.title}</span>)}
+                </div>
+              )}
+              {runDetail.context.decisionLog.length > 0 && (
+                <div style={{ marginTop: '4px', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                  <span style={{ fontWeight: 600, color: 'inherit' }}>{t('plan.decisionLog')}：</span>
+                  {runDetail.context.decisionLog.slice(-6).map((entry, entryIndex) => (
+                    <div key={entryIndex}>· [{entry.kind}] {entry.detail}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </Card>
+      )}
+      <Card title={t('sched.title')}>
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('sched.formName')} value={schedName} onChange={(e) => { setSchedName(e.target.value) }} />
+          <select style={{ ...styles.input, width: 'auto' }} value={schedType} onChange={(e) => { setSchedType(e.target.value) }}>
+            <option value="review">{t('sched.typeReview')}</option>
+            <option value="summary">{t('sched.typeSummary')}</option>
+            <option value="run">{t('sched.typeRun')}</option>
+          </select>
+          <input style={{ ...styles.input, width: 120 }} placeholder={t('sched.formInterval')} value={schedInterval} onChange={(e) => { setSchedInterval(e.target.value) }} />
+          {schedType === 'run' && (
+            <>
+              <input style={styles.input} placeholder={t('exec.formTitle')} value={schedTitle} onChange={(e) => { setSchedTitle(e.target.value) }} />
+              <textarea style={styles.textarea} rows={2} placeholder={t('exec.formDesc')} value={schedDesc} onChange={(e) => { setSchedDesc(e.target.value) }} />
+            </>
+          )}
+          <button style={styles.button} disabled={schedName.trim() === ''} onClick={() => { void addScheduled() }}>{t('sched.add')}</button>
+        </div>
+        <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginBottom: '8px' }}>{t('sched.hint')}</div>
+        {(scheduledData ?? []).length === 0 ? (
+          <div style={styles.empty}>{t('sched.empty')}</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+          <table style={styles.table}>
+            <thead>
+              <tr>{['sched.col.name', 'sched.col.type', 'sched.col.interval', 'sched.col.next', 'sched.col.lastResult', 'sched.col.actions'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {(scheduledData ?? []).map((task) => (
+                <tr key={task.id} style={{ opacity: task.enabled ? 1 : 0.45 }}>
+                  <td style={styles.td}>{task.name}{task.title !== '' ? <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>（{task.title}）</span> : null}</td>
+                  <td style={styles.td}><span style={styles.badge(task.type === 'review' ? '#569cd6' : task.type === 'summary' ? '#4ec9b0' : '#d7ba7d')}>{task.type === 'review' ? t('sched.typeReview') : task.type === 'summary' ? t('sched.typeSummary') : t('sched.typeRun')}</span></td>
+                  <td style={styles.td}>{task.intervalMinutes >= 1440 ? Math.round(task.intervalMinutes / 1440 * 10) / 10 + t('sched.day') : task.intervalMinutes >= 60 ? Math.round(task.intervalMinutes / 60 * 10) / 10 + t('sched.hour') : task.intervalMinutes + t('sched.minute')}</td>
+                  <td style={styles.td}>{task.enabled ? formatTime(task.nextDueAt) : '—'}</td>
+                  <td style={{ ...styles.td, fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', maxWidth: 220, whiteSpace: 'normal' }}>{task.lastResult || (task.lastRunAt !== null ? formatTime(task.lastRunAt) : '—')}</td>
+                  <td style={styles.td}>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void scheduledAction('update', { id: task.id, enabled: !task.enabled }) }}>{task.enabled ? t('sched.disable') : t('sched.enable')}</button>
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void scheduledAction('run', { id: task.id }) }}>{t('sched.runNow')}</button>
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这个例行任务？', message: '「' + task.name + '」将被永久删除。', danger: true, onConfirm: () => { void scheduledAction('delete', { id: task.id }) } }) }}>✕</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          </div>
         )}
       </Card>
     </>
@@ -2088,6 +2765,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                           title={note.pinned === true ? t('notes.unpin') : t('notes.pin')}
                           onClick={() => { void toggleNotePin(note) }}
                         >📌</button>
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} title={t('notes.toMemoryHint')} onClick={() => { setMemoryTitle(note.title); setMemoryContent(note.content); setActionResult(t('notes.toMemoryDone')) }}>🧠 {t('notes.toMemory')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setEditingNote({ id: note.id, title: note.title, content: note.content, tags: (note.tags ?? []).join(', ') }) }}>{t('notes.edit')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这条笔记？', message: '「' + note.title + '」将被永久删除，不可恢复。', danger: true, onConfirm: () => { void removeNote(note.id) } }) }}>✕</button>
                       </div>
@@ -2105,7 +2783,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         {(note.tags ?? []).map((tag) => (
                           <button
                             key={tag}
-                            style={{ ...styles.badge('rgba(37,99,235,0.12)'), cursor: 'pointer', border: 'none', padding: '1px 8px', borderRadius: '999px', fontSize: '10px' }}
+                            style={{ ...styles.badge('#2563eb'), cursor: 'pointer', border: 'none', padding: '1px 8px', borderRadius: '999px', fontSize: '10px' }}
                             onClick={() => { setNoteSearch(tag) }}
                           >#{tag}</button>
                         ))}
@@ -2128,55 +2806,129 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           })
         })()}
       </Card>
-      <Card title={t('memory.record') + (project !== null ? ' · ' + project.name : '')}>
-        <div style={styles.formRow}>
-          <input style={styles.input} placeholder={t('form.memoryTitle')} value={memoryTitle} onChange={(e) => { setMemoryTitle(e.target.value) }} />
-          <textarea style={styles.textarea} rows={3} placeholder={t('form.memoryContent')} value={memoryContent} onChange={(e) => { setMemoryContent(e.target.value) }} />
-          <button
-            style={styles.button}
-            disabled={busy !== null || memoryTitle === '' || memoryContent === ''}
-            onClick={() => { void runAction('recordMemory', '/project-control/api/memory', { memoryType: 'project_log', title: memoryTitle, content: memoryContent }).then(() => { setMemoryTitle(''); setMemoryContent('') }) }}
-          >{busy === 'recordMemory' ? t('action.running') : t('memory.record')}</button>
+      <Card title={t('memory.zoneTitle') + (project !== null ? ' · ' + project.name : '')}>
+        {/* 同步状态条：基线 + 落后提交数 + 同步按钮 + 同步报告 */}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px', padding: '6px 10px', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))', borderRadius: '8px' }}>
+          <span style={{ fontSize: '11px' }}>🔄 {t('memory.syncBaseline')}：<b>{memoriesData?.baseline?.sha != null ? memoriesData.baseline.sha.slice(0, 8) : t('memory.syncNone')}</b></span>
+          {memoriesData?.branch != null && <span style={styles.badge('#569cd6')}>{memoriesData.branch}</span>}
+          {(memoriesData?.behindCount ?? 0) > 0 && (
+            <span style={{ fontSize: '11px', color: '#d97706' }}>{t('memory.behind').replace('{n}', String(memoriesData?.behindCount ?? 0))}</span>
+          )}
+          <span style={{ flex: 1 }} />
+          <button style={{ ...styles.secondary, padding: '3px 10px', fontSize: '11px' }} disabled={memorySyncing} onClick={() => { void syncMemories() }}>
+            {memorySyncing ? t('memory.syncing') : '🔄 ' + t('memory.sync')}
+          </button>
         </div>
-        {project !== null && (
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap' }}>
-            <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('memory.branchScope')}</span>
-            <select style={{ ...styles.input, width: 'auto', padding: '3px 8px' }} value={memoryBranch} onChange={(e) => { setMemoryBranch(e.target.value) }}>
-              <option value="">{t('memory.branchAll')}</option>
-              {Array.from(new Set(memories.filter((memory) => memory.projectId === project.id).map((memory) => memory.gitBranch).filter((branch): branch is string => branch !== null && branch !== ''))).map((branch) => (
-                <option key={branch} value={branch}>{branch}</option>
-              ))}
-            </select>
+        {syncReport !== null && (
+          <div style={{ marginBottom: '10px', padding: '8px 12px', borderRadius: '8px', background: syncReport.ok === false ? 'rgba(209,36,47,0.06)' : 'rgba(78,201,176,0.06)', border: '1px solid ' + (syncReport.ok === false ? 'rgba(209,36,47,0.3)' : 'rgba(78,201,176,0.3)') }}>
+            <div style={{ fontSize: '12px', fontWeight: 600 }}>{syncReport.ok === false ? '✗ ' + t('memory.syncFailed') : '✓ ' + (syncReport.verdict ?? '')}</div>
+            {syncReport.ok !== false && (syncReport.staleProposals ?? []).length > 0 && (
+              <div style={{ marginTop: '6px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600 }}>{t('memory.staleTitle')}</div>
+                {(syncReport.staleProposals ?? []).map((proposal) => (
+                  <div key={proposal.id} style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '4px', fontSize: '11px' }}>
+                    <span style={{ flex: 1 }}>{proposal.title} —— {proposal.reason}</span>
+                    <button style={{ ...styles.secondary, padding: '1px 8px', fontSize: '10px' }} onClick={() => { void applySync([proposal.id], 'mark-stale') }}>{t('memory.markStale')}</button>
+                    <button style={{ ...styles.secondary, padding: '1px 8px', fontSize: '10px' }} onClick={() => { void applySync([proposal.id], 'archive') }}>{t('memory.archiveBtn')}</button>
+                    <button style={{ ...styles.secondary, padding: '1px 8px', fontSize: '10px' }} onClick={() => { setSyncReport((previous) => previous === null ? null : { ...previous, staleProposals: (previous.staleProposals ?? []).filter((item) => item.id !== proposal.id) }) }}>{t('memory.keepActive')}</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {syncReport.ok !== false && (syncReport.newCandidates ?? []).length > 0 && (
+              <div style={{ marginTop: '6px', fontSize: '11px' }}>
+                <span style={{ fontWeight: 600 }}>{t('memory.newCandidates')}</span>
+                {(syncReport.newCandidates ?? []).map((candidate, index) => <div key={index}>＋ [{candidate.type}] {candidate.title}</div>)}
+              </div>
+            )}
+            <button style={{ ...styles.linkBtn, marginTop: '4px' }} onClick={() => { setSyncReport(null) }}>{t('memory.closeReport')}</button>
           </div>
         )}
-        {memories.length === 0 ? (
-          <div style={styles.empty}>{t('memory.empty')}</div>
-        ) : (
-          <table style={styles.table}>
-            <thead>
-              <tr>{['memory.col.title', 'memory.col.content', 'memory.col.type', 'memory.col.truth', 'memory.col.branch', 'memory.confirm'].map((key) => <th key={key} style={styles.th}>{t(key)}</th>)}</tr>
-            </thead>
-            <tbody>
-              {memories
-                .filter((memory) => project === null || project === undefined || memory.projectId === project.id)
-                .filter((memory) => memoryBranch === '' || memory.gitBranch === memoryBranch)
-                .map((memory) => (
-                <tr key={memory.id}>
-                  <td style={styles.td}>{memory.title}</td>
-                  <td style={{ ...styles.td, fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{memory.content ?? '—'}</td>
-                  <td style={styles.td}>{memory.type}</td>
-                  <td style={styles.td}><span style={styles.badge(memory.isHumanConfirmed ? '#4ec9b0' : '#dcdcaa')}>{memory.isHumanConfirmed ? 'confirmed' : memory.truthLevel}</span></td>
-                  <td style={styles.td}>{memory.gitBranch ?? '—'}</td>
-                  <td style={styles.td}>
-                    {memory.isHumanConfirmed
-                      ? <span style={styles.badge('#4ec9b0')}>✓</span>
-                      : <button style={{ ...styles.button, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void confirmMemory(memory.id) }}>{t('memory.confirm')}</button>}
-                  </td>
-                </tr>
+        {/* 手动添加：标题 / 类型 / 作用域 / 内容 */}
+        <div style={styles.formRow}>
+          <input style={styles.input} placeholder={t('form.memoryTitle')} value={memoryTitle} onChange={(e) => { setMemoryTitle(e.target.value) }} />
+          <select style={{ ...styles.input, width: 'auto' }} value={memoryType} onChange={(e) => { setMemoryType(e.target.value) }}>
+            {Object.entries(MEMORY_TYPE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+          <select style={{ ...styles.input, width: 'auto' }} value={memoryScope} onChange={(e) => { setMemoryScope(e.target.value as 'project' | 'branch') }}>
+            <option value="project">{t('memory.scopeProject')}</option>
+            <option value="branch">{t('memory.scopeBranch')}</option>
+          </select>
+          <textarea style={styles.textarea} rows={3} placeholder={t('form.memoryContent')} value={memoryContent} onChange={(e) => { setMemoryContent(e.target.value) }} />
+          <div>
+            <button style={styles.button} disabled={busy !== null || memoryTitle.trim() === '' || memoryContent.trim() === ''}
+              onClick={() => { void runAction('recordMemory', '/project-control/api/memory', { memoryType, scope: memoryScope, title: memoryTitle.trim(), content: memoryContent.trim() }).then(async () => { setMemoryTitle(''); setMemoryContent(''); await loadMemories() }) }}>
+              {busy === 'recordMemory' ? t('action.running') : t('memory.record')}
+            </button>
+          </div>
+        </div>
+        {(() => {
+          const all = memoriesData?.memories ?? []
+          const pending = all.filter((memory) => !memory.isHumanConfirmed && memory.status === 'active')
+          const active = all.filter((memory) => memory.status === 'active')
+          const grouped = new Map<string, MemoryEntry[]>()
+          for (const memory of active) {
+            const list = grouped.get(memory.type) ?? []
+            list.push(memory)
+            grouped.set(memory.type, list)
+          }
+          return (
+            <>
+              {pending.length > 0 && (
+                <div style={{ marginBottom: '10px' }}>
+                  <div style={{ ...styles.sectionTitle, color: 'var(--dsw-alias-brand-primary, #2563eb)' }}>⏳ {t('memory.pendingQueue')}（{String(pending.length)}）</div>
+                  {pending.map((memory) => (
+                    <div key={memory.id} style={{ ...styles.noteCard, borderColor: 'rgba(37,99,235,0.3)', background: 'rgba(37,99,235,0.03)' }}>
+                      <div style={styles.noteTitleRow}>
+                        <div style={styles.noteTitleText}>{memory.title}</div>
+                        <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                          <button style={{ ...styles.button, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void confirmMemory(memory.id).then(() => { void loadMemories() }) }}>{t('memory.confirm')}</button>
+                          <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void memoryAction('status', { id: memory.id, status: 'archived' }) }}>{t('memory.archiveBtn')}</button>
+                        </div>
+                      </div>
+                      <div style={styles.noteContent}>{memory.content}</div>
+                      <div style={styles.noteMeta}>
+                        <span style={styles.badge('rgba(37,99,235,0.15)')}>{MEMORY_SOURCE_LABELS[memory.sourceTag] ?? memory.sourceTag}</span>
+                        {memory.basisSha !== null && <span style={styles.badge('#8b8b8b')}>{memory.basisSha.slice(0, 8)}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {[...grouped.entries()].map(([type, items]) => (
+                <div key={type} style={{ marginBottom: '10px' }}>
+                  <div style={styles.sectionTitle}>{MEMORY_TYPE_LABELS[type] ?? type}（{String(items.length)}）</div>
+                  {items.map((memory) => (
+                    <div key={memory.id} style={{ ...styles.noteCard, opacity: memory.status === 'active' ? 1 : 0.6 }}>
+                      <div style={styles.noteTitleRow}>
+                        <div style={styles.noteTitleText}>{memory.isHumanConfirmed ? '✅ ' : ''}{memory.title}</div>
+                        <div style={{ display: 'flex', gap: '4px', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                          {!memory.isHumanConfirmed && memory.status === 'active'
+                            ? <button style={{ ...styles.button, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void confirmMemory(memory.id).then(() => { void loadMemories() }) }}>{t('memory.confirm')}</button>
+                            : null}
+                          <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void memoryToNote(memory) }}>📄 {t('memory.toNote')}</button>
+                          {memory.scope === 'branch' && <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void memoryAction('normalize', { id: memory.id }) }}>⇱ {t('memory.normalize')}</button>}
+                          {memory.status === 'active'
+                            ? <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void memoryAction('status', { id: memory.id, status: 'archived' }) }}>{t('memory.archiveBtn')}</button>
+                            : <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void memoryAction('status', { id: memory.id, status: 'active' }) }}>{t('memory.restore')}</button>}
+                        </div>
+                      </div>
+                      <div style={{ ...styles.noteContent, maxHeight: 84, overflow: 'hidden' }}>{memory.content}</div>
+                      <div style={styles.noteMeta}>
+                        {memory.status === 'stale' && <span style={styles.badge('#d97706')}>{t('memory.statusStale')}</span>}
+                        {memory.scope === 'branch' && memory.gitBranch !== null && <span style={styles.badge('#569cd6')}>⎇ {memory.gitBranch}</span>}
+                        <span style={styles.badge('rgba(37,99,235,0.15)')}>{MEMORY_SOURCE_LABELS[memory.sourceTag] ?? memory.sourceTag}</span>
+                        {memory.basisSha !== null && <span style={styles.badge('#8b8b8b')}>{memory.basisSha.slice(0, 8)}</span>}
+                        <span>{new Date(memory.updatedAt).toLocaleString()}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               ))}
-            </tbody>
-          </table>
-        )}
+              {all.length === 0 && <div style={styles.empty}>{t('memory.empty')}</div>}
+            </>
+          )
+        })()}
       </Card>
       <Card title={t('concepts.title')}>
         {concepts.length === 0 ? (
@@ -2233,7 +2985,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   </button>
                 ))}
                 <span style={{ flex: 1 }} />
-                <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{openCount} 待处理 / 共 {all.length}</span>
+                <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                  {openCount} 待处理 / 共 {all.length}
+                  {(state?.resolvedIssueRetentionDays ?? 0) > 0 ? ` · ${t('review.retentionHint').replace('{days}', String(state?.resolvedIssueRetentionDays ?? 7))}` : ''}
+                </span>
                 <select style={{ ...styles.input, width: 'auto', padding: '3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
                   <option value="">{t('review.statusAll')}</option>
                   {Object.entries(ISSUE_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -2253,7 +3008,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     <div style={styles.noteTitleRow}>
                       <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
                         <span style={styles.badge(severityColor(issue.severity))}>{issue.severity}</span>
-                        {issue.category ? <span style={styles.badge('rgba(96,96,128,0.18)')}>{issue.category}</span> : null}
+                        {issue.category ? <span style={styles.badge('#57606a')}>{issue.category}</span> : null}
                         <span style={styles.badge(issue.status === 'open' || issue.status === 'fixing' ? '#dcdcaa' : issue.status === 'resolved' || issue.status === 'accepted' ? '#4ec9b0' : '#8b8b8b')}>
                           {ISSUE_STATUS_LABELS[issue.status] ?? issue.status}
                         </span>
@@ -2278,6 +3033,56 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         ✓ {issue.resolution}
                       </div>
                     ) : null}
+                    {(issue.fixStats != null || Boolean(issue.fixDiff)) && (
+                      <>
+                        <button
+                          style={{ ...styles.linkBtn, marginTop: '4px', display: 'block' }}
+                          onClick={() => { setFixExpanded((previous) => ({ ...previous, [issue.id]: !(previous[issue.id] === true) })) }}
+                        >
+                          🔧 {t('review.fixDetail')}（{String(issue.fixStats?.files ?? 0)} {t('review.fixStatFiles')} · +{String(issue.fixStats?.insertions ?? 0)} −{String(issue.fixStats?.deletions ?? 0)}）{fixExpanded[issue.id] === true ? '▲' : '▼'}
+                        </button>
+                        {fixExpanded[issue.id] === true && (
+                          <div style={{ marginTop: '6px', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))', borderRadius: '6px', padding: '8px 10px' }}>
+                            {(issue.fixFiles ?? []).length > 0 && (
+                              <div style={{ marginBottom: '8px' }}>
+                                <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '3px' }}>{t('review.fixFiles')}</div>
+                                {(issue.fixFiles ?? []).map((file) => (
+                                  <div key={file} style={{ fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)', fontSize: '11px' }}>{file}</div>
+                                ))}
+                              </div>
+                            )}
+                            {(issue.fixImpact ?? []).length > 0 && (
+                              <div style={{ marginBottom: '8px' }}>
+                                <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '3px' }}>{t('review.fixImpact')}</div>
+                                {issue.fixImpact.map((entry) => (
+                                  <div key={entry.symbol} style={{ marginBottom: '5px' }}>
+                                    <div>
+                                      <span style={styles.badge('#0969da')}>{entry.symbol}</span>
+                                      <span style={{ fontSize: '10px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                                        {' '}{t('review.definedIn')} {entry.definedIn} · {String(entry.callers.length)} {t('review.callCount')}
+                                      </span>
+                                    </div>
+                                    {entry.callers.slice(0, 5).map((caller, callerIndex) => (
+                                      <div key={callerIndex} style={{ fontSize: '10px', color: 'var(--dsw-alias-label-secondary, #6b7280)', paddingLeft: '12px' }}>
+                                        {caller.file}:{caller.line} {caller.snippet.slice(0, 80)}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {Boolean(issue.fixDiff) && (
+                              <div>
+                                <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '3px' }}>{t('review.fixDiff')}</div>
+                                <div style={{ background: 'var(--dsw-alias-bg-inset, rgba(5,5,5,0.03))', borderRadius: '6px', padding: '6px 8px', maxHeight: '300px', overflowY: 'auto' }}>
+                                  {renderDiffLines(issue.fixDiff)}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
                     {long && (
                       <button style={styles.linkBtn} onClick={() => { setIssueExpanded({ ...issueExpanded, [issue.id]: !expanded }) }}>
                         {expanded ? t('notes.collapse') : t('notes.expand')}

@@ -29,7 +29,8 @@ export function apply(ctx: any): void {
   const layout = ctx.layout
 
   // ── 1. 项目工作台：遮蔽 details 槽（可逆）───────────────────────────────
-  let workspaceEnabled = true
+  // 新窗口默认不显示工作台（保持官方原生视角），由侧边栏按钮显式打开。
+  let workspaceEnabled = false
   let disposeWorkspace: (() => void) | undefined
 
   const registerWorkspace = (): void => {
@@ -102,7 +103,12 @@ export function apply(ctx: any): void {
             workspaceEnabled = !workspaceEnabled
             try {
               if (workspaceEnabled && disposeWorkspace === undefined) registerWorkspace()
-              else if (!workspaceEnabled) unregisterWorkspace()
+              else if (!workspaceEnabled) {
+                unregisterWorkspace()
+                // 收起右侧轨道：否则官方 DetailsPanel 顶回来，残留空态面板
+                // （「点击消息流中的工具行查看详情」）。
+                layout?.closeDetails?.()
+              }
             } catch (error: unknown) {
               console.warn('[project-control] workspace toggle failed', error)
             }

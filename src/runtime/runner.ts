@@ -25,11 +25,19 @@ export type StepExecutorFunction = (
 }>
 
 export class StepAttemptRunner {
+  /** 重试上限与退避序列（毫秒；缺省为测试友好的紧凑值，运行时由 config 注入真实值）。 */
+  private readonly maxAttempts: number
+  private readonly backoffDelaysMs: number[]
+
   constructor(
     private readonly stepsRepo: DomainRepository<StepRecord, StepId>,
     private readonly attemptsRepo: DomainRepository<AttemptRecord, AttemptId>,
     private readonly executeStep: StepExecutorFunction,
-  ) {}
+    options: { maxAttempts?: number; backoffDelaysMs?: number[] } = {},
+  ) {
+    this.maxAttempts = options.maxAttempts ?? MAX_STEP_ATTEMPTS
+    this.backoffDelaysMs = options.backoffDelaysMs ?? BACKOFF_DELAYS_MS
+  }
 
   /**
    * Run a step with automatic retry and ground-truth verification checks.
@@ -50,7 +58,7 @@ export class StepAttemptRunner {
 
     let lastError = ''
 
-    while (step.attemptsCount < MAX_STEP_ATTEMPTS) {
+    while (step.attemptsCount < this.maxAttempts) {
       step.attemptsCount++
       const attemptNumber = step.attemptsCount
 
@@ -111,7 +119,7 @@ export class StepAttemptRunner {
         await this.stepsRepo.save(step)
 
         // Backoff delay
-        const delay = BACKOFF_DELAYS_MS[attemptNumber] ?? 10
+        const delay = this.backoffDelaysMs[attemptNumber] ?? this.backoffDelaysMs.at(-1) ?? 10
         if (delay > 0) {
           await new Promise(resolve => setTimeout(resolve, delay))
         }
@@ -126,7 +134,7 @@ export class StepAttemptRunner {
     assertStepTransition(step.status, 'failed')
     step.status = 'failed'
     step.verifiedOutcome = false
-    step.claimedOutcome = `Failed after ${MAX_STEP_ATTEMPTS} attempts: ${lastError}`
+    step.claimedOutcome = `Failed after ${this.maxAttempts} attempts: ${lastError}`
     step.updatedAt = Date.now()
     await this.stepsRepo.save(step)
     return step

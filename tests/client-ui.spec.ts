@@ -49,7 +49,8 @@ describe('Client UI & Slot Registration (T7.1 - T7.4)', () => {
     await ctx.plugin(MockLayoutService)
     await ctx.plugin({ name: 'test-client', apply, inject: ['slots', 'locale', 'layout'] })
 
-    expect(registeredSlots).toContain('details')
+    // 新窗口默认不注册 details（保持官方原生视角），工作台由侧边栏按钮显式打开。
+    expect(registeredSlots).not.toContain('details')
     expect(registeredSlots).toContain('sidebar.footer.action')
     expect(registeredSlots).toContain('tool.call.toolview')
   })

@@ -49,6 +49,8 @@ export const coreDomainSpec = defineDomain({
     confirmed: domainTable(recordSchema),
     notes: domainTable(recordSchema),
     plugin_settings: domainTable(recordSchema),
+    run_contexts: domainTable(recordSchema),
+    scheduled_tasks: domainTable(recordSchema),
   },
 })
 
@@ -82,5 +84,6 @@ export const historyDomainSpec = defineDomain({
     verifications: domainTable(recordSchema),
     memories: domainTable(recordSchema),
     concepts: domainTable(recordSchema),
+    memory_baselines: domainTable(recordSchema),
   },
 })

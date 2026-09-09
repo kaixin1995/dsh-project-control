@@ -27,11 +27,14 @@ import { ProjectGraph } from '../analysis/graph.ts'
 import { ProjectService } from '../domain/project.ts'
 import { ChangeService } from '../domain/change.ts'
 import { scanHistory } from '../runtime/history.ts'
+import { generatePlanSteps } from '../runtime/plan-gen.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
 import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
 import type { ConfirmedItemRecord } from './confirmed.ts'
 import { ReviewIssueManager } from '../verification/issues.ts'
-import type { IssueSeverity } from '../domain/models.ts'
+import { DeterministicBuildVerifier, UnitTestVerifier, EvidenceDiffVerifier, LlmReviewVerifier } from '../verification/verifier.ts'
+import { VerificationRunner } from '../verification/service.ts'
+import type { IssueSeverity, ProjectRecord } from '../domain/models.ts'
 import { resolveDeploymentRoute } from '../config.ts'
 import type { ProjectControlService } from './service.ts'
 
@@ -241,31 +244,9 @@ function parseFunctionExplanations(text: string): Record<string, { role: string;
   return result
 }
 
-/** 解析计划 LLM 输出的 JSON 步骤数组；解析失败回落为单步骤（原文即描述）。 */
-function parsePlanSteps(text: string): Array<{ title: string; description: string; targetFiles?: string[] }> {
-  const match = text.match(/\[[\s\S]*\]/)
-  if (match !== null) {
-    try {
-      const parsed: unknown = JSON.parse(match[0])
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed.slice(0, 10).map((item) => {
-          const entry = item as Record<string, unknown>
-          return {
-            title: String(entry['title'] ?? '步骤').slice(0, 80),
-            description: String(entry['description'] ?? '').slice(0, 600),
-            ...(Array.isArray(entry['targetFiles']) ? { targetFiles: (entry['targetFiles'] as unknown[]).map(String).slice(0, 8) } : {}),
-          }
-        })
-      }
-    } catch {
-      // JSON 不合法：回落单步骤。
-    }
-  }
-  return [{ title: '执行变更', description: text.slice(0, 800) }]
-}
-
 /** 读取请求体（JSON，≤1 MiB）。 */
-function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {  return new Promise((resolve, reject) => {
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer) => {
@@ -326,7 +307,7 @@ function sessionCwdOf(service: ProjectControlService, body: Record<string, unkno
  * 3. 已采纳项目；
  * 4. 回落最后一个已持久化项目（重启后首次调用）。
  */
-async function adoptProject(service: ProjectControlService, body: Record<string, unknown> = {}): Promise<{ id: string } | undefined> {
+async function adoptProject(service: ProjectControlService, body: Record<string, unknown> = {}): Promise<ProjectRecord | undefined> {
   // 显式 rootPath 优先（与 /bootstrap 一致的调用方直连方式），其次会话工作目录。
   const explicitRoot = typeof body['rootPath'] === 'string' && body['rootPath'] !== '' ? body['rootPath'] : undefined
   const cwd = explicitRoot ?? sessionCwdOf(service, body)
@@ -390,6 +371,312 @@ interface ReviewIssueEntry {
 }
 
 /**
+ * 确定性扫描补丁的变更符号与全仓库调用点（复检修复证据用，规则与 /impact-scope 一致）。
+ */
+async function scanFixImpact(
+  service: ProjectControlService,
+  cwd: string,
+  patch: string,
+  changedFiles: string[],
+): Promise<Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }>> {
+  const NOISE = /\.(md|txt|json|ya?ml|xml|html?|css|scss|lock|csproj|sln|props|targets)$/i
+  const result: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }> = []
+  for (const symbol of extractChangedSymbols(patch)) {
+    const grep = await service.git.runGit(['grep', '-n', '-F', symbol, '--', '.'], cwd).catch(() => '')
+    const callers: Array<{ file: string; line: string; snippet: string }> = []
+    for (const line of grep.split('\n')) {
+      const first = line.indexOf(':')
+      if (first === -1) continue
+      const file = normalizePath(line.slice(0, first))
+      if (file === '' || NOISE.test(file) || /test|spec/i.test(file)) continue
+      const rest = line.slice(first + 1)
+      const lineNo = rest.split(':')[0] ?? ''
+      const content = rest.slice(rest.indexOf(':') + 1).trim()
+      if (content.length < 5) continue
+      // 定义行本身不算调用方
+      if (new RegExp(`\\b${symbol}\\s*\\(`).test(content) && /\b(public|private|protected|internal|function)\b/.test(content)) continue
+      callers.push({ file, line: lineNo, snippet: content.slice(0, 140) })
+      if (callers.length >= 8) break
+    }
+    if (callers.length > 0) {
+      const definedIn = changedFiles.find((file) => file.includes(symbol)) ?? changedFiles[0] ?? ''
+      result.push({ symbol, definedIn, callers })
+    }
+    if (result.length >= 10) break
+  }
+  return result
+}
+
+/**
+ * 从完整补丁中截取指定文件的差异段（修复证据归因展示用）。
+ * 无匹配文件时返回空串，由调用方回落到整段补丁。
+ */
+function slicePatchByFiles(patch: string, files: string[], maxChars: number): string {
+  if (files.length === 0) return ''
+  const sections = patch.split(/^(?=diff --git )/m).filter((section) => section.trim() !== '')
+  const wanted = sections.filter((section) => {
+    const match = section.match(/^diff --git a\/(\S+) b\/(\S+)/)
+    const path = normalizePath(match?.[2] ?? '')
+    return path !== '' && files.some((file) => path === file || path.endsWith('/' + file) || file.endsWith('/' + path))
+  })
+  return wanted.join('').slice(0, maxChars)
+}
+
+/**
+ * 评审核心（页面 /review 路由与例行任务调度共用）：
+ * 对指定目标（提交 sha / 工作区）执行 LLM 评审并落库，含两层缓存与补写。
+ */
+export async function executeReviewForTarget(
+  ctx: Context,
+  service: ProjectControlService,
+  cwd: string,
+  project: { id: string },
+  target: string,
+  force = false,
+  changeId?: string,
+): Promise<{ issuesFound: number; issues: string; verdict: string; issueList: ReviewIssueEntry[]; cached: boolean; generatedAt?: number; failed?: boolean }> {
+  if (service.store === undefined) {
+    return { issuesFound: 0, issues: '', verdict: 'service not started', issueList: [], cached: false, failed: true }
+  }
+  const reviewSha = target !== 'working' ? target : undefined
+  const diff = reviewSha !== undefined
+    ? await service.git.getDiff(cwd, { from: `${reviewSha}^`, to: reviewSha, maxBytes: 200 * 1024 })
+    : await service.git.getDiff(cwd)
+  if (diff.filesChanged === 0) {
+    return { issuesFound: 0, issues: reviewSha !== undefined ? '该提交无差异内容。' : '工作区无改动，无可评审内容。', verdict: '', issueList: [], cached: false }
+  }
+  const reviewRoute = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+  const reviewStoreKey = `rv:${cwd}|${reviewSha ?? 'working'}|${diff.diffHash}|v${PROMPT_VERSION}|${reviewRoute.provider}/${reviewRoute.model}`
+  // 评审问题落库目标：请求带有效 changeId 时挂靠该变更，否则按评审对象（提交 sha / 工作区）建合成目标。
+  const boundChange = changeId !== undefined && changeId !== ''
+    ? service.store.changes.get(changeId as never)
+    : undefined
+  const issueTarget = boundChange !== undefined ? boundChange.id : `review:${reviewSha ?? 'worktree'}`
+  if (!force) {
+    const storeHit = cacheRead(service, reviewStoreKey)
+    if (storeHit !== undefined) {
+      const cachedList = (storeHit.payload['issueList'] ?? []) as ReviewIssueEntry[]
+      // 缓存命中也保证落库：该目标尚无记录时补写一次（后续命中不再重复写）。
+      if (cachedList.length > 0
+        && service.store.issues.list((issue) => issue.changeId === issueTarget).length === 0) {
+        await persistReviewIssues(service, project.id, issueTarget, cachedList)
+      }
+      return {
+        issuesFound: Number(storeHit.payload['issuesFound'] ?? 0),
+        issues: String(storeHit.payload['issues'] ?? ''),
+        verdict: String(storeHit.payload['verdict'] ?? ''),
+        issueList: cachedList,
+        cached: true,
+        generatedAt: storeHit.createdAt,
+      }
+    }
+  }
+  let analysis: { text: string }
+  try {
+    analysis = await runLlmAnalysis(ctx, {
+      prompt: [
+        'You are an independent code reviewer. Review the diff below for correctness, error handling, concurrency, resource leaks, security, and over-reach.',
+        'Answer with one issue per line in the exact format: SEVERITY | category | title | evidence location | suggested fix',
+        'SEVERITY is one of critical/high/medium/low/info. If the diff is clean, answer exactly: CLEAN',
+        'Write category, title, evidence location and suggested fix in Chinese (keep the SEVERITY keyword in English).',
+        'After the issues (or CLEAN), always append one final line:',
+        'OPTIMALITY: <用中文 1-3 句评价：该改动是否侵入式最小、是否最优实现；若有明显更优方案请指出>',
+        '',
+        'Diff:',
+        diff.patch,
+      ].join('\n'),
+      provider: reviewRoute.provider,
+      model: reviewRoute.model,
+      maxTokens: service.liveConfig.analysisMaxTokens,
+      timeoutMs: service.liveConfig.analysisTimeoutMs,
+      purpose: 'project-control-review',
+    })
+  } catch (error: unknown) {
+    // 评审失败不 500：降级为可见的失败结论，页面保持可用并可重试。
+    const message = error instanceof Error ? error.message : String(error)
+    return { issuesFound: 0, issues: '', verdict: `评审失败：${message}（点「重新生成」可重试）`, issueList: [], cached: false, failed: true }
+  }
+  const verdictMatch = analysis.text.match(/OPTIMALITY[:：]\s*([\s\S]*)/)
+  const verdict = verdictMatch?.[1]?.trim() ?? ''
+  const lines = analysis.text.slice(0, verdictMatch?.index ?? analysis.text.length)
+    .split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
+  const issueList: ReviewIssueEntry[] = lines.map((line) => {
+    const parts = line.split('|').map((part) => part.trim())
+    return {
+      severity: parts[0] ?? 'medium',
+      category: parts[1] ?? '',
+      title: parts[2] ?? line,
+      evidence: parts[3] ?? '',
+      fix: parts[4] ?? '',
+    }
+  })
+  await persistReviewIssues(service, project.id, issueTarget, issueList)
+  const generatedAt = Date.now()
+  cacheWrite(service, reviewStoreKey, 'review', { issuesFound: lines.length, issues: analysis.text, verdict, issueList })
+  return { issuesFound: lines.length, issues: analysis.text, verdict, issueList, cached: false, generatedAt }
+}
+
+/**
+ * 增量 AI 学习总结核心（页面 /notes/ai-summary 路由与例行任务调度共用）：
+ * 上次总结 + 自上次以来的新素材 → 「本次更新」差异节 + 合并完整版；旧总结替换不堆积。
+ */
+export async function runIncrementalAiSummary(
+  ctx: Context,
+  service: ProjectControlService,
+  project: { id: string; name?: string; identity?: { rootPath?: string } },
+): Promise<{ ok: true; id: string; updated: boolean } | { ok: false; error: string }> {
+  if (service.store === undefined) {
+    return { ok: false, error: 'service not started' }
+  }
+  const pid = project.id
+  const allNotes = (service.store.notes?.list() ?? [])
+    .filter((note) => note.projectId === pid)
+  // 上一次总结（sha='summary' 的最新一条）：本次做增量对比的基线。
+  const previousSummaries = allNotes
+    .filter((note) => note.sha === 'summary')
+    .sort((left, right) => right.createdAt - left.createdAt)
+  const previous = previousSummaries[0] ?? null
+  const sinceMs = previous?.createdAt
+  const notes = allNotes
+    .filter((note) => note.sha !== 'summary')
+    .filter((note) => sinceMs === undefined || note.createdAt > sinceMs)
+    .sort((left, right) => right.createdAt - left.createdAt)
+    .slice(0, 30)
+  const memories = (service.store?.memories?.list() ?? [])
+    .filter((memory) => memory.projectId === pid)
+    .filter((memory) => sinceMs === undefined || memory.createdAt > sinceMs)
+    .slice(0, 20)
+    .map((memory) => `- [${memory.isHumanConfirmed ? '已确认' : memory.truthLevel}] ${memory.title}：${String(memory.content ?? '').slice(0, 120)}`)
+  const bootstrap = service.store.checkpoints.list().at(-1) ?? null
+  const recentChanges = (service.store.changes?.list() ?? [])
+    .filter((change) => change.projectId === pid)
+    .filter((change) => sinceMs === undefined || change.updatedAt > sinceMs)
+    .slice(0, 10)
+    .map((change) => `- ${change.title}（${change.status}）`)
+  const reviewIssues = (service.store?.issues.list() ?? [])
+    .filter((issue) => issue.projectId === pid)
+    .filter((issue) => sinceMs === undefined || issue.createdAt > sinceMs)
+    .slice(0, 10)
+    .map((issue) => `- [${issue.severity}] ${issue.title}`)
+  // 真实提交历史：总结的基底素材；有基线时只取上次总结以来的新提交。
+  const cwd = project.identity?.rootPath
+  const commitLines: string[] = []
+  if (cwd !== undefined) {
+    const logArgs = ['log', '--date=short', '--format=- %ad %s']
+    if (sinceMs === undefined) logArgs.push('-n', '12')
+    else { logArgs.push('-n', '40', `--since=${new Date(sinceMs).toISOString()}`) }
+    const log = await service.git.runGit(logArgs, cwd).catch(() => '')
+    for (const line of log.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed !== '') commitLines.push(trimmed)
+    }
+  }
+  const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+  const sinceLabel = sinceMs === undefined ? ''
+    : new Date(sinceMs).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  let summaryText: string
+  try {
+    const llm = await runLlmAnalysis(ctx, {
+      prompt: previous === null
+        ? [
+          '你是学习助理。根据以下项目材料，产出一份结构化的学习总结笔记，供开发者复习、也给 AI 助手日后阅读。',
+          '用 Markdown 风格分节输出（用「## 」做节标题），必须包含以下节：',
+          '## 核心要点（3-6 条，每条一行：这个项目是做什么的、关键结构/模块、当前状态）',
+          '## 关键决策与理由（来自记忆/笔记/提交历史中体现的取舍；没有就写（暂无））',
+          '## 易错点与风险（值得反复提醒的；没有就写（暂无））',
+          '## 近期工作脉络（必填：按提交历史归纳最近在做什么，结合变更记录与笔记）',
+          '全部用中文；内容必须来自给定材料，不要编造；「近期提交」是最权威的工作脉络来源。',
+          '',
+          `项目：${project.name ?? '未知'}（${project.identity?.rootPath ?? ''}）`,
+          `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
+          '',
+          '== 近期提交（git 历史）==',
+          ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
+          '',
+          '== 已确认记忆 ==',
+          ...(memories.length > 0 ? memories : ['（暂无）']),
+          '',
+          '== 已有笔记 ==',
+          ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
+          '',
+          '== 近期变更 ==',
+          ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
+        ].join('\n')
+        : [
+          '你是学习助理。下面有「上一次的学习总结」和「自上次总结以来的新增材料」。请产出更新版总结。',
+          '要求：',
+          '1. 第一节必须是「## 本次更新」：3-6 条列出相对上次的新增与变化（新提交做了什么、新笔记、新记忆、新评审问题）；若新增材料无实质内容，如实写明「自上次总结以来无新增素材」，不要硬凑。',
+          '2. 之后输出完整总结正文（不是差异补丁，而是合并后的完整可独立阅读版本）：保留上次总结中仍然有效的内容，吸收新增材料，合并重复项，删除已被新提交取代的过时项。',
+          '必须包含节：## 本次更新 / ## 核心要点 / ## 关键决策与理由 / ## 易错点与风险 / ## 近期工作脉络',
+          '全部用中文；内容必须来自给定材料，不要编造。',
+          '',
+          `项目：${project.name ?? '未知'}（${project.identity?.rootPath ?? ''}）`,
+          `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
+          `上次总结时间：${sinceLabel}`,
+          '',
+          '== 上一次的学习总结 ==',
+          (previous.content ?? '').slice(0, 4000),
+          '',
+          `== 自上次总结以来的新增提交（${sinceLabel} 起）==`,
+          ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
+          '',
+          '== 新增记忆 ==',
+          ...(memories.length > 0 ? memories : ['（暂无）']),
+          '',
+          '== 新增笔记 ==',
+          ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
+          '',
+          '== 新增/更新的变更 ==',
+          ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
+          '',
+          '== 新增评审问题 ==',
+          ...(reviewIssues.length > 0 ? reviewIssues : ['（暂无）']),
+        ].join('\n'),
+      provider: route.provider,
+      model: route.model,
+      maxTokens: service.liveConfig.analysisMaxTokens,
+      timeoutMs: service.liveConfig.analysisTimeoutMs,
+      purpose: 'project-control-notes-summary',
+    })
+    summaryText = llm.text.trim()
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, error: `AI 总结失败：${message}（可重试）` }
+  }
+  const now = Date.now()
+  const note = {
+    id: `note_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    projectId: pid,
+    sha: 'summary',
+    title: `📖 学习总结 · ${new Date().toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${previous === null ? '' : '（增量更新）'}`,
+    content: summaryText,
+    createdAt: now,
+    updatedAt: now,
+  }
+  // 总结是一份「活文档」：保存新版前移除本项目的旧总结，避免重复雷同的总结堆积。
+  for (const stale of previousSummaries) {
+    if (stale.id !== note.id) await service.store.notes.delete(stale.id)
+  }
+  await service.store.notes.save(note)
+  return { ok: true, id: note.id, updated: previous !== null }
+}
+
+/**
+ * 数据生命周期：清理超期的已解决评审问题（resolved/accepted，按 updatedAt 计龄）。
+ * resolvedIssueRetentionDays=0 表示永久保留。读取问题列表前执行，页面所见即清理后状态。
+ */
+export async function purgeResolvedIssues(service: ProjectControlService): Promise<void> {
+  const retentionDays = service.liveConfig.resolvedIssueRetentionDays ?? 7
+  if (retentionDays <= 0) return
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+  for (const issue of service.store.issues.list()) {
+    if ((issue.status === 'resolved' || issue.status === 'accepted') && issue.updatedAt < cutoff) {
+      await service.store.issues.delete(issue.id)
+    }
+  }
+}
+
+/**
  * 把评审结果落到 issues 表（「Review 问题」板块数据源）：
  * 同一评审目标先清旧记录再写入，重新评审替换而非堆积。
  */
@@ -416,13 +703,13 @@ async function persistReviewIssues(
 }
 
 /** 工作台所需的完整状态快照（来自 storage-domain 真实数据）。 */
-function buildState(service: ProjectControlService): Record<string, unknown> {
+function buildState(service: ProjectControlService, projectOverride?: ProjectRecord): Record<string, unknown> {
   const store = service.store
   if (store === undefined) {
     return { ready: false, reason: 'service not started' }
   }
   const projects = store.projects.list()
-  const project = service.currentProject ?? projects.at(-1) ?? null
+  const project = projectOverride ?? service.currentProject ?? projects.at(-1) ?? null
   // 工作台是项目级视图：所有业务列表按当前项目过滤，跨项目数据不串显。
   const pid = project?.id
   const inProject = <T extends { projectId: string }>(records: T[]): T[] =>
@@ -449,6 +736,7 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
   return {
     ready: true,
     pluginVersion: service.version,
+    resolvedIssueRetentionDays: service.liveConfig.resolvedIssueRetentionDays ?? 7,
     project: project === null ? null : {
       id: project.id,
       name: project.name,
@@ -459,9 +747,7 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
     changes: changes.map((change) => ({
       id: change.id,
       title: change.title,
-      type: change.type,
       status: change.status,
-      source: change.source,
       updatedAt: change.updatedAt,
     })),
     runs: runs.map((run) => {
@@ -486,15 +772,20 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       }
     }),
     attemptsCount: attempts.length,
-    importedChanges: inProject(store.importedChanges?.list() ?? []).slice(-100).map((item) => ({
-      id: item.id,
-      title: item.title,
-      commitCount: item.commitShas.length,
-      firstCommitAt: item.firstCommitAt,
-      lastCommitAt: item.lastCommitAt,
-      confidence: item.confidence,
-      status: item.status,
-    })),
+    importedChanges: (store.importedChanges?.list() ?? [])
+      .filter((item) => pid === undefined || (item as { projectId?: string }).projectId === pid)
+      .slice(-100).map((item) => {
+        const record = item as { id: string; title: string; commitShas: string[]; firstCommitAt: number; lastCommitAt: number; confidence: number; status: string }
+        return {
+          id: record.id,
+          title: record.title,
+          commitCount: record.commitShas.length,
+          firstCommitAt: record.firstCommitAt,
+          lastCommitAt: record.lastCommitAt,
+          confidence: record.confidence,
+          status: record.status,
+        }
+      }),
     issues: inProject(store.issues.list()).slice(-50).map((issue) => ({
       id: issue.id,
       changeId: issue.changeId,
@@ -509,9 +800,9 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       name: verification.name,
       type: verification.type,
       status: verification.status,
-      createdAt: verification.createdAt,
+      createdAt: verification.evaluatedAt,
     })),
-    confirmed: inProject((store.confirmed?.list() ?? []) as ConfirmedItemRecord[])
+    confirmed: inProject((store.confirmed?.list() ?? []) as unknown as ConfirmedItemRecord[])
       .filter((item) => item.status === 'active')
       .map((item) => ({
         id: item.id,
@@ -543,7 +834,7 @@ function buildState(service: ProjectControlService): Record<string, unknown> {
       source: item.source,
       truthLevel: item.truthLevel,
       locator: item.locator,
-      snippet: trimSnippet(item.snippet),
+      snippet: trimSnippet(item.snippet ?? ''),
       createdAt: item.createdAt,
     })),
     bootstrap: checkpoint === null ? null : {
@@ -564,7 +855,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
   // webServer 只存在于挂载了 web 面的 composition：headless / sdk / acp 无此服务，
   // ctx.inject 静默不触发，插件照常激活（不产生 pending）。
   ctx.inject(['webServer'], (scope: Context) => {
-    const webServer = scope.webServer
+    const webServer = (scope as unknown as { webServer?: { register(options: Record<string, unknown>): () => void } }).webServer
     if (webServer === undefined || webServer === null) return
 
     const disposeRoute = webServer.register({
@@ -579,10 +870,24 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
 
         if (req.method === 'GET' && routePath === '/state') {
           try {
-            const body = JSON.stringify(buildState(service))
+            // 视图按会话归属项目解析：请求带 sessionId/rootPath 时与已注册项目按根目录
+            // 匹配（纯内存查询，不跑 git 不建项目），多会话并行互不串显。
+            const query: Record<string, unknown> = {}
+            for (const [key, value] of url.searchParams.entries()) query[key] = value
+            const requestedRoot = sessionCwdOf(service, query)
+              ?? (typeof query['rootPath'] === 'string' && query['rootPath'] !== '' ? query['rootPath'] : undefined)
+            let override: ProjectRecord | undefined
+            if (requestedRoot !== undefined && service.store !== undefined) {
+              const normalized = normalizePath(requestedRoot)
+              override = service.store.projects.list().find(
+                (candidate) => normalizePath(candidate.identity.rootPath) === normalized,
+              )
+              if (override !== undefined) service.currentProject = override
+            }
+            const body = JSON.stringify(buildState(service, override))
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(body)
-          } catch (error) {
+          } catch (error: unknown) {
             ctx.logger?.warn?.(`project-control: state build failed: ${String(error)}`)
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -654,8 +959,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const maxCommits = typeof body['maxCommits'] === 'number' ? Math.min(body['maxCommits'], service.liveConfig.bootstrap.maxCommitsPerRun) : service.liveConfig.bootstrap.defaultMaxCommits
             const cursor = readHistoryCursor(service)
             const imported = resume && cursor.lastCommit !== undefined
-              ? await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, summaries, fromCommit: cursor.lastCommit })
-              : await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, summaries })
+              ? await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, ...(summaries === undefined ? {} : { summaries }), fromCommit: cursor.lastCommit })
+              : await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, ...(summaries === undefined ? {} : { summaries }) })
             importedCount = imported.length
             const lastHash = await service.git.getHeadSha(rootPath)
             if (lastHash !== undefined) writeHistoryCursor(service, lastHash, importedCount)
@@ -757,7 +1062,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const route = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
             const diff = await service.git.getDiff(cwd)
             const evidence = service.evidenceManager.createEvidence({
-              projectId: service.currentProject?.id ?? 'prj_ad_hoc',
+              projectId: (service.currentProject?.id ?? 'prj_ad_hoc') as never,
               source: 'git_diff',
               truthLevel: 'fact',
               locator: 'git:diff:HEAD..worktree',
@@ -908,93 +1213,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
-            const reviewSha = typeof body['sha'] === 'string' && body['sha'] !== '' && body['sha'] !== 'working'
-              ? body['sha'] : undefined
-            const reviewForce = body['force'] === true
-            const diff = reviewSha !== undefined
-              ? await service.git.getDiff(cwd, { from: `${reviewSha}^`, to: reviewSha, maxBytes: 200 * 1024 })
-              : await service.git.getDiff(cwd)
-            if (diff.filesChanged === 0) {
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ issuesFound: 0, issues: reviewSha !== undefined ? '该提交无差异内容。' : '工作区无改动，无可评审内容。', verdict: '', issueList: [], cached: false }))
-              return
-            }
-            const reviewRoute = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
-            const reviewStoreKey = `rv:${cwd}|${reviewSha ?? 'working'}|${diff.diffHash}|v${PROMPT_VERSION}|${reviewRoute.provider}/${reviewRoute.model}`
-            // 评审问题落库目标：请求带有效 changeId 时挂靠该变更，否则按评审对象（提交 sha / 工作区）建合成目标。
-            const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : undefined
-            const boundChange = changeId !== undefined && changeId !== ''
-              ? service.store.changes.get(changeId as never)
-              : undefined
-            const issueTarget = boundChange !== undefined ? boundChange.id : `review:${reviewSha ?? 'worktree'}`
-            if (!reviewForce) {
-              const storeHit = cacheRead(service, reviewStoreKey)
-              if (storeHit !== undefined) {
-                const cachedList = (storeHit.payload['issueList'] ?? []) as ReviewIssueEntry[]
-                // 缓存命中也保证落库：该目标尚无记录时补写一次（后续命中不再重复写）。
-                if (cachedList.length > 0
-                  && service.store.issues.list((issue) => issue.changeId === issueTarget).length === 0) {
-                  await persistReviewIssues(service, project.id, issueTarget, cachedList)
-                }
-                res.writeHead(200, { 'content-type': 'application/json' })
-                res.end(JSON.stringify({
-                  issuesFound: Number(storeHit.payload['issuesFound'] ?? 0),
-                  issues: String(storeHit.payload['issues'] ?? ''),
-                  verdict: String(storeHit.payload['verdict'] ?? ''),
-                  issueList: cachedList,
-                  cached: true,
-                  generatedAt: storeHit.createdAt,
-                }))
-                return
-              }
-            }
-            const route = reviewRoute
-            let analysis: { text: string }
-            try {
-              analysis = await runLlmAnalysis(ctx, {
-                prompt: [
-                  'You are an independent code reviewer. Review the diff below for correctness, error handling, concurrency, resource leaks, security, and over-reach.',
-                  'Answer with one issue per line in the exact format: SEVERITY | category | title | evidence location | suggested fix',
-                  'SEVERITY is one of critical/high/medium/low/info. If the diff is clean, answer exactly: CLEAN',
-                  'Write category, title, evidence location and suggested fix in Chinese (keep the SEVERITY keyword in English).',
-                  'After the issues (or CLEAN), always append one final line:',
-                  'OPTIMALITY: <用中文 1-3 句评价：该改动是否侵入式最小、是否最优实现；若有明显更优方案请指出>',
-                  '',
-                  'Diff:',
-                  diff.patch,
-                ].join('\n'),
-                provider: route.provider,
-                model: route.model,
-                maxTokens: service.liveConfig.analysisMaxTokens,
-                timeoutMs: service.liveConfig.analysisTimeoutMs,
-                purpose: 'project-control-review',
-              })
-            } catch (error: unknown) {
-              // 评审失败不 500：降级为可见的失败结论，页面保持可用并可重试。
-              const message = error instanceof Error ? error.message : String(error)
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ issuesFound: 0, issues: '', verdict: `评审失败：${message}（点「重新生成」可重试）`, issueList: [], cached: false, failed: true }))
-              return
-            }
-            const verdictMatch = analysis.text.match(/OPTIMALITY[:：]\s*([\s\S]*)/)
-            const verdict = verdictMatch?.[1]?.trim() ?? ''
-            const lines = analysis.text.slice(0, verdictMatch?.index ?? analysis.text.length)
-              .split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && line !== 'CLEAN')
-            const issueList: ReviewIssueEntry[] = lines.map((line) => {
-              const parts = line.split('|').map((part) => part.trim())
-              return {
-                severity: parts[0] ?? 'medium',
-                category: parts[1] ?? '',
-                title: parts[2] ?? line,
-                evidence: parts[3] ?? '',
-                fix: parts[4] ?? '',
-              }
-            })
-            await persistReviewIssues(service, project.id, issueTarget, issueList)
-            const generatedAt = Date.now()
-            cacheWrite(service, reviewStoreKey, 'review', { issuesFound: lines.length, issues: analysis.text, verdict, issueList })
+            const target = typeof body['sha'] === 'string' && body['sha'] !== '' && body['sha'] !== 'working' ? body['sha'] : 'working'
+            const outcome = await executeReviewForTarget(
+              ctx, service, cwd, project, target,
+              body['force'] === true,
+              typeof body['changeId'] === 'string' ? body['changeId'] : undefined,
+            )
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ issuesFound: lines.length, issues: analysis.text, verdict, issueList, cached: false, generatedAt }))
+            res.end(JSON.stringify(outcome))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -1002,7 +1228,6 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           return
         }
 
-        // 验收当前改动（确定性命令按配置；changeId 提供时落验收记录）。
         if (req.method === 'POST' && routePath === '/verify') {
           if (service.store === undefined) {
             res.writeHead(503, { 'content-type': 'application/json' })
@@ -1114,7 +1339,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             for (const reference of evidence.references) {
               if (reference.filePath === '') continue
               graph.addNode({ id: reference.filePath, type: 'file', label: reference.filePath, filePath: reference.filePath })
-              graph.addEdge({ source: reference.filePath, target: filePath, type: 'references', evidenceId: undefined })
+              graph.addEdge({ source: reference.filePath, target: filePath, type: 'references', evidenceId: undefined as never })
             }
             const engine = new ImpactEngine()
             const impact = engine.computeImpact([filePath || symbolName], graph)
@@ -1163,8 +1388,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               ['log', '-n', String(limit), '--date-order', '--format=%H%x1f%h%x1f%an%x1f%at%x1f%s%x1e', '--numstat'],
               cwd,
             )
-            const commits: Array<Record<string, unknown>> = []
-            let current: Record<string, unknown> | undefined
+            interface CommitDraft { sha: string; shortHash: string; author: string; date: number; subject: string; files: Array<{ path: string; adds: number; dels: number }> }
+            const commits: CommitDraft[] = []
+            let current: CommitDraft | undefined
             for (const line of raw.split('\n')) {
               if (line.includes('\x1f')) {
                 const [hash, shortHash, authorName, dateStr, subject] = line.split('\x1e')[0]!.split('\x1f')
@@ -1381,7 +1607,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 for (const importer of matches) {
                   if (importer === target) continue
                   graph.addNode({ id: importer, type: 'file', label: importer, filePath: importer })
-                  graph.addEdge({ source: importer, target, type: 'references', evidenceId: undefined })
+                  graph.addEdge({ source: importer, target, type: 'references', evidenceId: undefined as never })
                   if (!nextHop.includes(importer)) nextHop.push(importer)
                 }
               }
@@ -1490,7 +1716,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                   commitAnalysisCache.delete(commitAnalysisCache.keys().next().value as string)
                 }
               }
-              for (const fi of functionImpact) {
+              for (const fi of (functionImpact as unknown as Array<{ symbol: string } & Record<string, unknown>>)) {
                 const explain = explanations[fi.symbol]
                 if (explain !== undefined) {
                   fi.role = explain.role
@@ -1585,6 +1811,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
         }
 
         // 页面一键启动执行：创建变更 → LLM 生成计划 → 无会话 owner agent 后台执行。
+
         if (req.method === 'POST' && routePath === '/runs/start') {
           if (service.store === undefined || service.orchestrator === undefined) {
             res.writeHead(503, { 'content-type': 'application/json' })
@@ -1609,55 +1836,186 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             }
             const changeService = new ChangeService(service.store.changes, service.git, service.evidenceManager)
             const change = await changeService.createChange(project.id as never, title, description, cwd)
-            // LLM 生成执行计划（严格 JSON 数组；解析失败回落单步骤）。
-            const planRoute = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
             const bootstrap = service.store.checkpoints.list().at(-1)
-            // .at(-1) 空数组返回 undefined：null/undefined 都要挡住，否则未初始化的项目执行必炸。
             const stackHint = bootstrap != null ? `仓库技术栈：${bootstrap.techStack.join(', ') || '未知'}` : ''
-            const llm = await runLlmAnalysis(ctx, {
-              prompt: [
-                '你是技术负责人。为以下变更生成执行计划，输出严格的 JSON 数组、不要任何多余文字：',
-                '[{"title":"步骤标题","description":"该步骤要做什么与验收标准","targetFiles":["相关文件路径"]}]',
-                '3 到 6 个步骤，按执行顺序排列；第一步可以是梳理/分析，最后一步是构建与测试验证。全部用中文。',
-                stackHint,
-                '',
-                `变更标题：${title}`,
-                `需求与背景：${description}`,
-              ].filter((line) => line !== '').join('\n'),
-              provider: planRoute.provider,
-              model: planRoute.model,
-              maxTokens: service.liveConfig.analysisMaxTokens,
-              timeoutMs: service.liveConfig.analysisTimeoutMs,
-              purpose: 'project-control-plan',
-            })
-            let steps = parsePlanSteps(llm.text)
-            if (steps.length === 1 && steps[0]!.title === '执行变更') {
-              // 解析失败回落发生了：带更强格式指令重试一次，仍失败才接受单步骤降级。
-              try {
-                const retry = await runLlmAnalysis(ctx, {
-                  prompt: [
-                    '上一次输出不是合法 JSON。这次只输出 JSON 数组本身：不要 Markdown 代码块、不要任何解释文字。',
-                    '格式：[{"title":"步骤标题","description":"做什么与验收标准","targetFiles":["相关文件"]}]，3 到 6 步，全部中文。',
-                    '',
-                    '变更标题：' + title,
-                    '需求与背景：' + description,
-                  ].join('\n'),
-                  provider: planRoute.provider,
-                  model: planRoute.model,
-                  maxTokens: service.liveConfig.analysisMaxTokens,
-                  timeoutMs: service.liveConfig.analysisTimeoutMs,
-                  purpose: 'project-control-plan-retry',
-                })
-                steps = parsePlanSteps(retry.text)
-              } catch {
-                // 重试失败：维持单步骤降级
-              }
+            const steps = await generatePlanSteps(ctx, service, title, description, stackHint)
+            const plan = await service.orchestrator.createPlan(change, `${title} · 计划`, steps)
+            // 默认停在计划确认（页面展示编排、可调整模型/策略后 launch）；
+            // autoStart=true（调度器/兼容路径）跳过确认直接执行。
+            if (body['autoStart'] === true) {
+              const runId = await service.orchestrator.startRun(undefined, change)
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: true, runId, changeId: change.id, steps: steps.length, autoStarted: true }))
+              return
             }
-            await service.orchestrator.createPlan(change, `${title} · 计划`, steps)
-            // 页面触发的执行没有聊天会话：owner 传 undefined → 分离后台执行，取消走 cancelRun。
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, changeId: change.id, planId: plan.id, steps: plan.steps.map((step) => ({ id: step.id, title: step.title, description: step.description, targetFiles: step.targetFiles ?? [], role: step.role ?? 'coding', acceptance: step.acceptance ?? '', failurePolicy: step.failurePolicy ?? 'retry-escalate', enabled: step.enabled !== false })) }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 计划确认页保存编辑：新版本计划（角色/模型/验收/策略/启停），旧版本永不覆盖。
+        if (req.method === 'POST' && routePath === '/runs/plan/update') {
+          if (service.store === undefined || service.orchestrator === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : ''
+            const change = changeId === '' ? undefined : service.store.changes.get(changeId as never)
+            if (change === undefined) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'change not found' }))
+              return
+            }
+            const rawSteps = Array.isArray(body['steps']) ? body['steps'] : []
+            const steps = rawSteps
+              .filter((entry: unknown): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null && typeof (entry as Record<string, unknown>)['title'] === 'string' && (entry as Record<string, unknown>)['title'] !== '')
+              .map((entry: Record<string, unknown>) => ({
+                title: String(entry['title']),
+                description: typeof entry['description'] === 'string' ? entry['description'] : '',
+                targetFiles: Array.isArray(entry['targetFiles']) ? entry['targetFiles'].filter((file): file is string => typeof file === 'string') : undefined,
+                ...(entry['role'] !== undefined && ['analysis', 'planning', 'coding', 'ops', 'verification'].includes(String(entry['role'])) ? { role: entry['role'] as never } : {}),
+                ...(typeof entry['acceptance'] === 'string' && entry['acceptance'] !== '' ? { acceptance: entry['acceptance'] as string } : {}),
+                ...(entry['failurePolicy'] !== undefined && ['retry-escalate', 'retry-fallback', 'skip', 'ask'].includes(String(entry['failurePolicy'])) ? { failurePolicy: entry['failurePolicy'] as never } : {}),
+                enabled: entry['enabled'] !== false,
+                ...(typeof entry['modelProvider'] === 'string' && entry['modelProvider'] !== '' && typeof entry['modelId'] === 'string' && entry['modelId'] !== ''
+                  ? { modelOverride: { provider: String(entry['modelProvider']), model: String(entry['modelId']) } }
+                  : {}),
+              }))
+            if (steps.length === 0) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'steps must be a non-empty array' }))
+              return
+            }
+            const plan = await service.orchestrator.createPlan(change, `${change.title} · 计划`, steps)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, planId: plan.id, steps: plan.steps.length }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 确认后启动执行。
+        if (req.method === 'POST' && routePath === '/runs/launch') {
+          if (service.store === undefined || service.orchestrator === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : ''
+            const change = changeId === '' ? undefined : service.store.changes.get(changeId as never)
+            if (change === undefined) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'change not found' }))
+              return
+            }
             const runId = await service.orchestrator.startRun(undefined, change)
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ ok: true, runId, changeId: change.id, steps: steps.length }))
+            res.end(JSON.stringify({ ok: true, runId }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // Run 详情：步骤时间线（角色/模型/尝试/状态）+ 任务工作记忆摘要。
+        if (req.method === 'GET' && routePath === '/runs/detail') {
+          const query: Record<string, unknown> = {}
+          for (const [key, value] of url.searchParams.entries()) query[key] = value
+          const id = typeof query['id'] === 'string' ? query['id'] : ''
+          const run = id === '' ? undefined : service.store?.runs.get(id as never)
+          if (run === undefined) {
+            res.writeHead(404, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'run not found' }))
+            return
+          }
+          const change = service.store?.changes.get(run.changeId)
+          const plan = change?.currentPlanId === undefined ? undefined : service.store?.plans.get(change.currentPlanId)
+          const stepByPlanId = new Map((plan?.steps ?? []).map((definition) => [definition.id, definition]))
+          const costTracker = new CostTracker()
+          const steps = (service.store?.steps.list((step) => step.runId === run.id) ?? [])
+            .sort((left, right) => left.createdAt - right.createdAt)
+            .map((step) => {
+              const definition = stepByPlanId.get(step.planStepId)
+              const attempts = (service.store?.attempts.list((attempt) => attempt.stepId === step.id) ?? [])
+              let costUsd = 0
+              for (const attempt of attempts) {
+                if (attempt.tokenUsage === undefined) continue
+                costUsd += costTracker.calculateCost(attempt.model ?? 'deepseek-chat', {
+                  input: attempt.tokenUsage.input,
+                  output: attempt.tokenUsage.output,
+                  total: attempt.tokenUsage.total,
+                }).costUsd
+              }
+              const lastAttempt = attempts.at(-1)
+              return {
+                id: step.id,
+                title: definition?.title ?? step.planStepId,
+                role: definition?.role ?? 'coding',
+                model: lastAttempt?.model ?? null,
+                status: step.status,
+                attemptsCount: step.attemptsCount,
+                claimedOutcome: step.claimedOutcome ?? null,
+                verified: step.verifiedOutcome === true,
+                costUsd: Number(costUsd.toFixed(4)),
+              }
+            })
+          const runContext = service.store?.runContexts.get(run.id)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            run: {
+              id: run.id,
+              changeId: run.changeId,
+              changeTitle: change?.title ?? run.changeId,
+              status: run.status,
+              pausePoint: run.pausePoint ?? null,
+              error: run.error ?? null,
+              startedAt: run.startedAt ?? null,
+              finishedAt: run.finishedAt ?? null,
+            },
+            steps,
+            context: runContext === undefined ? null : {
+              projectDigest: runContext.projectDigest,
+              branch: runContext.branch ?? null,
+              headSha: runContext.headSha ?? null,
+              injectedMemories: runContext.injectedMemories,
+              stepSummaries: runContext.stepSummaries,
+              decisionLog: runContext.decisionLog,
+            },
+          }))
+          return
+        }
+
+        // 恢复暂停/中断/失败的 Run：continue=重试暂停点；skip-current=跳过继续。
+        if (req.method === 'POST' && routePath === '/runs/resume') {
+          if (service.store === undefined || service.orchestrator === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const runId = typeof body['runId'] === 'string' ? body['runId'] : ''
+            const action = body['action'] === 'skip-current' ? 'skip-current' : 'continue'
+            if (runId === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'runId is required' }))
+              return
+            }
+            await service.orchestrator.resumeRun(runId as never, action as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, action }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -1796,8 +2154,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
         }
 
         // 笔记：人工/AI 的核查批注，可关联提交。
-        // ── Review 问题板块（独立页签数据源）：全量、按严重度排序。 ──────────────
+        // ── Review 问题板块（独立页签数据源）：全量、按严重度排序；读取前清理超期已解决项。 ──
         if (req.method === 'GET' && routePath === '/issues') {
+          if (service.store !== undefined) await purgeResolvedIssues(service).catch(() => undefined)
           const query: Record<string, unknown> = {}
           for (const [key, value] of url.searchParams.entries()) query[key] = value
           const project = await adoptProject(service, query)
@@ -1817,6 +2176,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               description: issue.description ?? '',
               status: issue.status,
               resolution: issue.resolution ?? '',
+              fixStats: issue.fixStats ?? null,
+              fixFiles: issue.fixFiles ?? [],
+              fixImpact: issue.fixImpact ?? [],
+              fixDiff: issue.fixDiff ?? '',
               createdAt: issue.createdAt,
               updatedAt: issue.updatedAt,
             }))
@@ -1903,7 +2266,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 prompt: [
                   '你是代码评审复检员。下面是「此前评审发现且尚未解决的问题清单」和「当前代码相对评审基线的完整差异」。',
                   '任务一（修复确认）：逐条判断每个问题在当前代码中是否已修复，每行输出：',
-                  'FIXED | 问题序号 | 一句话依据（引用差异中的具体变化）',
+                  'FIXED | 问题序号 | 一句话依据（引用差异中的具体变化） | 修复涉及文件: 相对路径1, 相对路径2（修复该问题涉及的文件，无法归因则此列留空）',
                   '或 NOT_FIXED | 问题序号 | 一句话说明当前代码为何仍存在该问题',
                   '任务二（新问题扫描）：对当前差异做一次完整复审——正确性、错误处理、并发、资源泄漏、安全、侵入式是否最小、实现是否最优；每个新问题一行：',
                   'NEW | SEVERITY | category | title | evidence location | suggested fix',
@@ -1940,26 +2303,21 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const existingTitles = new Set(openIssues.map((issue) => issue.title.trim().toLowerCase()))
             const newIssues: Array<{ severity: string; title: string }> = []
             const issuesManager = new ReviewIssueManager(service.store.issues)
+            // 第一阶段：解析判定（问题序号 → FIXED/NOT_FIXED + 归因文件）与新问题。
+            const verdicts = new Map<number, { fixed: boolean; reason: string; files: string[] }>()
             for (const rawLine of verifyLines.split('\n')) {
               const line = rawLine.trim()
               if (line.startsWith('FIXED |') || line.startsWith('NOT_FIXED |')) {
                 const parts = line.split('|').map((part) => part.trim())
                 const index = Number.parseInt((parts[1] ?? '').replace('#', ''), 10)
-                const issue = Number.isInteger(index) ? openIssues[index - 1] : undefined
-                if (issue === undefined) continue
-                const reason = parts.slice(2).join('：') || '复检未给出依据'
-                if (line.startsWith('FIXED |')) {
-                  issue.status = 'resolved'
-                  issue.resolution = `复检通过（${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}）：${reason.slice(0, 300)}`
-                  issue.updatedAt = now
-                  await service.store.issues.save(issue)
-                  resolved.push(issue.title)
-                } else {
-                  issue.description = `${issue.description}\n[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${reason.slice(0, 200)}`
-                  issue.updatedAt = now
-                  await service.store.issues.save(issue)
-                  stillOpen.push({ title: issue.title, reason })
-                }
+                if (!Number.isInteger(index) || index < 1 || index > openIssues.length) continue
+                const files = (parts[3] ?? '').replace(/^修复涉及文件[:：]?/i, '')
+                  .split(/[,，]/).map((file) => normalizePath(file)).filter((file) => file !== '')
+                verdicts.set(index, {
+                  fixed: line.startsWith('FIXED |'),
+                  reason: parts[2] || '复检未给出依据',
+                  files,
+                })
               } else if (line.startsWith('NEW |') && !line.startsWith('NEW | CLEAN')) {
                 const parts = line.split('|').map((part) => part.trim())
                 if (parts.length < 4) continue
@@ -1975,6 +2333,39 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                   description: `证据：${parts[4] ?? ''}${(parts[5] ?? '') === '' ? '' : `；建议：${parts[5]}`}`,
                 })
                 newIssues.push({ severity: parts[1] ?? '', title })
+              }
+            }
+            // 第二阶段：有判 FIXED 的问题时快照修复证据（基线以来的文件/统计/符号调用点/归因差异）。
+            const hasFixed = [...verdicts.values()].some((entry) => entry.fixed)
+            let fixChangedFiles: string[] = []
+            let fixImpact: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }> = []
+            if (hasFixed) {
+              const numstat = await service.git.runGit(
+                ['diff', '--no-color', '--numstat', ...(baseSha !== undefined ? [baseSha] : [])],
+                cwd,
+              ).catch(() => '')
+              fixChangedFiles = parseNumstat(numstat).map((file) => normalizePath(file.path))
+              fixImpact = await scanFixImpact(service, cwd, diff.patch, fixChangedFiles)
+            }
+            for (const [index, entry] of verdicts) {
+              const issue = openIssues[index - 1]!
+              if (entry.fixed) {
+                issue.status = 'resolved'
+                issue.resolution = `复检通过（${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}）：${entry.reason.slice(0, 300)}`
+                if (hasFixed) {
+                  issue.fixStats = { files: fixChangedFiles.length, insertions: diff.insertions, deletions: diff.deletions }
+                  issue.fixFiles = entry.files.length > 0 ? entry.files : fixChangedFiles
+                  issue.fixImpact = fixImpact
+                  issue.fixDiff = slicePatchByFiles(diff.patch, entry.files, 16_000) || diff.patch.slice(0, 16_000)
+                }
+                issue.updatedAt = now
+                await service.store.issues.save(issue)
+                resolved.push(issue.title)
+              } else {
+                issue.description = `${issue.description}\n[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${entry.reason.slice(0, 200)}`
+                issue.updatedAt = now
+                await service.store.issues.save(issue)
+                stillOpen.push({ title: issue.title, reason: entry.reason })
               }
             }
             res.writeHead(200, { 'content-type': 'application/json' })
@@ -2018,7 +2409,6 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const note = {
               id: `note_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
               projectId: project?.id ?? 'prj_ad_hoc',
-              sha: typeof body['sha'] === 'string' && body['sha'] !== '' ? body['sha'] : undefined,
               title,
               content,
               tags: parseTags(body['tags']),
@@ -2026,6 +2416,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               createdAt: now,
               updatedAt: now,
             }
+            if (typeof body['sha'] === 'string' && body['sha'] !== '') note.sha = body['sha']
             await service.store.notes.save(note)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true, id: note.id }))
@@ -2045,140 +2436,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const project = await adoptProject(service, body)
-            const pid = project?.id
-            const allNotes = (service.store.notes?.list() ?? [])
-              .filter((note) => pid === undefined || note.projectId === pid)
-            // 上一次总结（sha='summary' 的最新一条）：本次做增量对比的基线。
-            const previousSummaries = allNotes
-              .filter((note) => note.sha === 'summary')
-              .sort((left, right) => right.createdAt - left.createdAt)
-            const previous = previousSummaries[0] ?? null
-            const sinceMs = previous?.createdAt
-            const notes = allNotes
-              .filter((note) => note.sha !== 'summary')
-              .filter((note) => sinceMs === undefined || note.createdAt > sinceMs)
-              .sort((left, right) => right.createdAt - left.createdAt)
-              .slice(0, 30)
-            const memories = (service.store?.memories?.list() ?? [])
-              .filter((memory) => pid === undefined || memory.projectId === pid)
-              .filter((memory) => sinceMs === undefined || memory.createdAt > sinceMs)
-              .slice(0, 20)
-              .map((memory) => `- [${memory.isHumanConfirmed ? '已确认' : memory.truthLevel}] ${memory.title}：${String(memory.content ?? '').slice(0, 120)}`)
-            const bootstrap = service.store.checkpoints.list().at(-1) ?? null
-            const recentChanges = (service.store.changes?.list() ?? [])
-              .filter((change) => pid === undefined || change.projectId === pid)
-              .filter((change) => sinceMs === undefined || change.updatedAt > sinceMs)
-              .slice(0, 10)
-              .map((change) => `- ${change.title}（${change.status}）`)
-            const reviewIssues = (service.store?.issues.list() ?? [])
-              .filter((issue) => pid === undefined || issue.projectId === pid)
-              .filter((issue) => sinceMs === undefined || issue.createdAt > sinceMs)
-              .slice(0, 10)
-              .map((issue) => `- [${issue.severity}] ${issue.title}`)
-            // 真实提交历史：总结的基底素材；有基线时只取上次总结以来的新提交。
-            const cwd = project?.identity?.rootPath
-            const commitLines: string[] = []
-            if (cwd !== undefined) {
-              const logArgs = ['log', '--date=short', '--format=- %ad %s']
-              if (sinceMs === undefined) logArgs.push('-n', '12')
-              else { logArgs.push('-n', '40', `--since=${new Date(sinceMs).toISOString()}`) }
-              const log = await service.git.runGit(logArgs, cwd).catch(() => '')
-              for (const line of log.split('\n')) {
-                const trimmed = line.trim()
-                if (trimmed !== '') commitLines.push(trimmed)
-              }
-            }
-            const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
-            const sinceLabel = sinceMs === undefined ? ''
-              : new Date(sinceMs).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-            let summaryText: string
-            try {
-              const llm = await runLlmAnalysis(ctx, {
-                prompt: previous === null
-                  ? [
-                    '你是学习助理。根据以下项目材料，产出一份结构化的学习总结笔记，供开发者复习、也给 AI 助手日后阅读。',
-                    '用 Markdown 风格分节输出（用「## 」做节标题），必须包含以下节：',
-                    '## 核心要点（3-6 条，每条一行：这个项目是做什么的、关键结构/模块、当前状态）',
-                    '## 关键决策与理由（来自记忆/笔记/提交历史中体现的取舍；没有就写（暂无））',
-                    '## 易错点与风险（值得反复提醒的；没有就写（暂无））',
-                    '## 近期工作脉络（必填：按提交历史归纳最近在做什么，结合变更记录与笔记）',
-                    '全部用中文；内容必须来自给定材料，不要编造；「近期提交」是最权威的工作脉络来源。',
-                    '',
-                    `项目：${project?.name ?? '未知'}（${project?.identity?.rootPath ?? ''}）`,
-                    `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
-                    '',
-                    '== 近期提交（git 历史）==',
-                    ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
-                    '',
-                    '== 已确认记忆 ==',
-                    ...(memories.length > 0 ? memories : ['（暂无）']),
-                    '',
-                    '== 已有笔记 ==',
-                    ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
-                    '',
-                    '== 近期变更 ==',
-                    ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
-                  ].join('\n')
-                  : [
-                    '你是学习助理。下面有「上一次的学习总结」和「自上次总结以来的新增材料」。请产出更新版总结。',
-                    '要求：',
-                    '1. 第一节必须是「## 本次更新」：3-6 条列出相对上次的新增与变化（新提交做了什么、新笔记、新记忆、新评审问题）；若新增材料无实质内容，如实写明「自上次总结以来无新增素材」，不要硬凑。',
-                    '2. 之后输出完整总结正文（不是差异补丁，而是合并后的完整可独立阅读版本）：保留上次总结中仍然有效的内容，吸收新增材料，合并重复项，删除已被新提交取代的过时项。',
-                    '必须包含节：## 本次更新 / ## 核心要点 / ## 关键决策与理由 / ## 易错点与风险 / ## 近期工作脉络',
-                    '全部用中文；内容必须来自给定材料，不要编造。',
-                    '',
-                    `项目：${project?.name ?? '未知'}（${project?.identity?.rootPath ?? ''}）`,
-                    `技术栈：${bootstrap?.techStack.join(', ') || '未知'}`,
-                    `上次总结时间：${sinceLabel}`,
-                    '',
-                    '== 上一次的学习总结 ==',
-                    (previous.content ?? '').slice(0, 4000),
-                    '',
-                    `== 自上次总结以来的新增提交（${sinceLabel} 起）==`,
-                    ...(commitLines.length > 0 ? commitLines : ['（暂无）']),
-                    '',
-                    '== 新增记忆 ==',
-                    ...(memories.length > 0 ? memories : ['（暂无）']),
-                    '',
-                    '== 新增笔记 ==',
-                    ...(notes.length > 0 ? notes.map((note) => `- ${note.title}：${(note.content ?? '').slice(0, 200)}`) : ['（暂无）']),
-                    '',
-                    '== 新增/更新的变更 ==',
-                    ...(recentChanges.length > 0 ? recentChanges : ['（暂无）']),
-                    '',
-                    '== 新增评审问题 ==',
-                    ...(reviewIssues.length > 0 ? reviewIssues : ['（暂无）']),
-                  ].join('\n'),
-                provider: route.provider,
-                model: route.model,
-                maxTokens: service.liveConfig.analysisMaxTokens,
-                timeoutMs: service.liveConfig.analysisTimeoutMs,
-                purpose: 'project-control-notes-summary',
-              })
-              summaryText = llm.text.trim()
-            } catch (error: unknown) {
-              const message = error instanceof Error ? error.message : String(error)
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ ok: false, error: `AI 总结失败：${message}（可重试）` }))
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
-            const now = Date.now()
-            const note = {
-              id: `note_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-              projectId: project?.id ?? 'prj_ad_hoc',
-              sha: 'summary',
-              title: `📖 学习总结 · ${new Date().toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${previous === null ? '' : '（增量更新）'}`,
-              content: summaryText,
-              createdAt: now,
-              updatedAt: now,
-            }
-            // 总结是一份「活文档」：保存新版前移除本项目的旧总结，避免重复雷同的总结堆积。
-            for (const stale of previousSummaries) {
-              if (stale.id !== note.id) await service.store.notes.delete(stale.id)
-            }
-            await service.store.notes.save(note)
+            const outcome = await runIncrementalAiSummary(ctx, service, project)
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ ok: true, id: note.id, updated: previous !== null }))
+            res.end(JSON.stringify(outcome))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -2205,7 +2470,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const content = typeof body['content'] === 'string' ? body['content'].trim() : ''
             if (title !== '') note.title = title
             if (content !== '') note.content = content
-            if (body['tags'] !== undefined) note.tags = parseTags(body['tags'])
+            if (body['tags'] !== undefined) { const t = parseTags(body['tags']); if (t !== undefined) note.tags = t }
             if (body['pinned'] !== undefined) note.pinned = body['pinned'] === true
             note.updatedAt = Date.now()
             await service.store.notes.save(note)
@@ -2258,17 +2523,409 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const branch = cwd === undefined
               ? undefined
               : await service.git.getStatus(cwd).then((status) => status.branch).catch(() => undefined)
-            const memory = await service.memoryService.recordMemory({
+            const memoryParams = {
               projectId: (project?.id ?? service.currentProject?.id ?? 'prj_ad_hoc') as never,
               type: (typeof body['memoryType'] === 'string' ? body['memoryType'] : 'project_log') as never,
-              truthLevel: 'analysis',
+              truthLevel: 'inferred' as never,
               title,
               content,
-              gitBranch: branch,
               relatedFiles: Array.isArray(body['relatedFiles']) ? body['relatedFiles'] as string[] : undefined,
-            })
+              scope: body['scope'] === 'branch' ? 'branch' : 'project',
+              sourceTag: (['run', 'review', 'sync', 'chat', 'manual'].includes(String(body['sourceTag']))
+                ? body['sourceTag'] : 'manual') as never,
+            }
+            if (branch !== undefined) memoryParams.gitBranch = branch
+            if (typeof body['basisSha'] === 'string' && body['basisSha'] !== '') memoryParams.basisSha = body['basisSha']
+            const memory = await service.memoryService.recordMemory(memoryParams)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true, memoryId: memory.id, truthLevel: memory.truthLevel, branch: branch ?? null }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // ── 记忆面板数据源：全量字段 + 同步基线 + 分支清单。 ──────────────
+        if (req.method === 'GET' && routePath === '/memories') {
+          const query: Record<string, unknown> = {}
+          for (const [key, value] of url.searchParams.entries()) query[key] = value
+          const project = await adoptProject(service, query)
+          const pid = project?.id
+          const cwd = project?.identity?.rootPath
+          const branch = cwd === undefined
+            ? undefined
+            : await service.git.getStatus(cwd).then((status) => status.branch).catch(() => undefined)
+          const all = (service.store?.memories.list() ?? [])
+            .filter((memory) => pid === undefined || memory.projectId === pid)
+            .sort((left, right) => right.updatedAt - left.updatedAt)
+          const memories = all.map((memory) => ({
+            id: memory.id,
+            type: memory.type,
+            title: memory.title,
+            content: memory.content,
+            relatedFiles: memory.relatedFiles ?? [],
+            isHumanConfirmed: memory.isHumanConfirmed,
+            gitBranch: memory.gitBranch ?? null,
+            scope: memory.scope ?? 'project',
+            sourceTag: memory.sourceTag ?? 'manual',
+            basisSha: memory.basisSha ?? null,
+            status: memory.status ?? 'active',
+            lastVerifiedSha: memory.lastVerifiedSha ?? null,
+            createdAt: memory.createdAt,
+            updatedAt: memory.updatedAt,
+          }))
+          const baseline = branch === undefined || pid === undefined
+            ? null
+            : (service.store?.memoryBaselines.get(`${pid}|${branch}`) ?? null)
+          const headSha = cwd === undefined ? null : await service.git.getHeadSha(cwd).catch(() => undefined) ?? null
+          const behindCount = baseline?.lastSyncedSha !== undefined && headSha !== null && baseline.lastSyncedSha !== headSha
+            ? await service.git.runGit(['rev-list', '--count', `${baseline.lastSyncedSha}..HEAD`], cwd).then((out) => Number(out.trim())).catch(() => 0)
+            : 0
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            memories,
+            branch: branch ?? null,
+            headSha,
+            baseline: baseline === null ? null : { sha: baseline.lastSyncedSha ?? null, updatedAt: baseline.updatedAt },
+            behindCount,
+          }))
+          return
+        }
+
+        // 拉取同步：基线..HEAD 的提交与 diff 对照记忆清单做三向判定（失效/新增/续命）。
+        if (req.method === 'POST' && routePath === '/memory/sync') {
+          if (service.store === undefined || service.memoryService === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const pid = project.id as string
+            const status = await service.git.getStatus(cwd)
+            const branch = status.branch ?? 'HEAD'
+            const headSha = status.headSha
+            const baselineId = `${pid}|${branch}`
+            const baseline = service.store.memoryBaselines.get(baselineId)
+            const baseSha = baseline?.lastSyncedSha
+            const log = baseSha === undefined
+              ? await service.git.runGit(['log', '-n', '20', '--date=short', '--format=- %ad %h %s'], cwd).catch(() => '')
+              : await service.git.runGit(['log', `${baseSha}..HEAD`, '--date=short', '--format=- %ad %h %s'], cwd).catch(() => '')
+            const commitLines = log.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+            const diff = baseSha === undefined
+              ? await service.git.getDiff(cwd, { maxBytes: 120 * 1024 })
+              : await service.git.getDiff(cwd, { from: baseSha, maxBytes: 120 * 1024 })
+            if (headSha === undefined || commitLines.length === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: true, behindCount: 0, staleProposals: [], renewed: 0, newCandidates: [], verdict: '基线以来无新提交，无需同步。' }))
+              return
+            }
+            const activeMemories = service.store.memories.list(
+              (memory) => memory.projectId === pid && (memory.status ?? 'active') === 'active',
+            )
+            const route = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
+            let analysis: { text: string }
+            try {
+              analysis = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是项目记忆同步员。以下是「当前生效的项目记忆清单」和「自上次同步以来的代码变更」。做三向判定：',
+                  '1. 对每条可能失效的记忆输出一行：STALE | 记忆ID | 一句话依据（哪个文件/哪部分被改动使其疑似过时）',
+                  '2. 对改动引入的值得长期记住的新知识输出一行：NEW | type | 标题 | 内容（1-3 句；type 为 architecture_decision/pattern_rule/risk_hotspot）',
+                  '3. 其余记忆无需输出（视为仍然有效）。',
+                  '判定只能依据给定材料；没有把握判失效就不要输出 STALE。除关键字外全部用中文。',
+                  '',
+                  '== 当前生效记忆 ==',
+                  ...(activeMemories.length > 0
+                    ? activeMemories.map((memory) => `ID=${memory.id} [${memory.type}] ${memory.title}：${String(memory.content).slice(0, 160)}${(memory.relatedFiles ?? []).length > 0 ? `（关联：${memory.relatedFiles.join(',')}）` : ''}`)
+                    : ['（无）']),
+                  '',
+                  '== 自上次同步以来的提交 ==',
+                  ...commitLines,
+                  '',
+                  '== 变更差异（节选）==',
+                  diff.patch.slice(0, 60_000),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-memory-sync',
+              })
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : String(error)
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: `同步判定失败：${message}（可重试）` }))
+              return
+            }
+            const staleProposals: Array<{ id: string; title: string; reason: string }> = []
+            const newCandidates: Array<{ type: string; title: string; content: string }> = []
+            for (const rawLine of analysis.text.split('\n')) {
+              const line = rawLine.trim()
+              if (line.startsWith('STALE |')) {
+                const parts = line.split('|').map((part) => part.trim())
+                const id = parts[1] ?? ''
+                if (activeMemories.some((memory) => memory.id === id)) {
+                  staleProposals.push({ id, title: activeMemories.find((memory) => memory.id === id)!.title, reason: parts.slice(2).join('：') || '相关代码被改动' })
+                }
+              } else if (line.startsWith('NEW |')) {
+                const parts = line.split('|').map((part) => part.trim())
+                if (parts.length >= 4 && parts[2] !== '') {
+                  newCandidates.push({ type: parts[1] ?? 'project_log', title: parts[2]!, content: parts.slice(3).join('：') })
+                }
+              }
+            }
+            // 自动续命：未被判定失效的记忆刷新验证基线（fact 级判定，无需人工确认）。
+            const renewedIds = activeMemories.filter((memory) => !staleProposals.some((proposal) => proposal.id === memory.id)).map((memory) => memory.id as never)
+            const renewed = await service.memoryService.renewBaseline(renewedIds, headSha)
+            for (const candidate of newCandidates.slice(0, 5)) {
+              await service.memoryService.recordMemory({
+                projectId: pid as never,
+                type: (['architecture_decision', 'pattern_rule', 'risk_hotspot'].includes(candidate.type) ? candidate.type : 'project_log') as never,
+                truthLevel: 'inferred' as never,
+                title: candidate.title,
+                content: candidate.content,
+                sourceTag: 'sync',
+                basisSha: headSha,
+                gitBranch: branch,
+                tags: ['sync'],
+              })
+            }
+            const now = Date.now()
+            await service.store.memoryBaselines.save({ id: baselineId, projectId: pid as never, branch, lastSyncedSha: headSha, updatedAt: now } as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              ok: true,
+              behindCount: commitLines.length,
+              staleProposals,
+              renewed,
+              newCandidates: newCandidates.slice(0, 5),
+              verdict: `同步完成：${commitLines.length} 个新提交；${staleProposals.length} 条疑似过期待复核；新增 ${Math.min(newCandidates.length, 5)} 条候选；${renewed} 条自动续命。`,
+            }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 同步报告的后续动作：把确认的疑似过时项落为 stale / 归档。
+        if (req.method === 'POST' && routePath === '/memory/sync/apply') {
+          if (service.memoryService === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'memory service unavailable' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const action = body['action'] === 'archive' ? 'archive' : 'mark-stale'
+            const ids = Array.isArray(body['ids']) ? body['ids'].filter((id): id is string => typeof id === 'string') : []
+            for (const id of ids) {
+              await service.memoryService.updateStatus(id as never, action === 'archive' ? 'archived' : 'stale')
+            }
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, applied: ids.length, action }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 记忆状态管理（归档/恢复生效）与分支归一。
+        if (req.method === 'POST' && routePath === '/memory/status') {
+          if (service.memoryService === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'memory service unavailable' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const status = typeof body['status'] === 'string' ? body['status'] : ''
+            if (id === '' || !['active', 'stale', 'superseded', 'archived'].includes(status)) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'id and a valid status are required' }))
+              return
+            }
+            await service.memoryService.updateStatus(id as never, status as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'POST' && routePath === '/memory/normalize') {
+          if (service.memoryService === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'memory service unavailable' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            if (id === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'id is required' }))
+              return
+            }
+            await service.memoryService.normalizeToProject(id as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // ── 例行任务 CRUD 与立即执行 ─────────────────────────────────────
+        if (req.method === 'GET' && routePath === '/scheduled') {
+          const query: Record<string, unknown> = {}
+          for (const [key, value] of url.searchParams.entries()) query[key] = value
+          const project = await adoptProject(service, query)
+          const pid = project?.id
+          const tasks = (service.store?.scheduledTasks.list() ?? [])
+            .filter((task) => pid === undefined || task.projectId === pid)
+            .sort((left, right) => left.createdAt - right.createdAt)
+            .map((task) => ({
+              id: task.id,
+              name: task.name,
+              type: task.type,
+              title: task.title ?? '',
+              description: task.description ?? '',
+              intervalMinutes: task.intervalMinutes,
+              enabled: task.enabled,
+              lastRunAt: task.lastRunAt ?? null,
+              lastResult: task.lastResult ?? '',
+              nextDueAt: (task.lastRunAt ?? task.createdAt) + task.intervalMinutes * 60_000,
+            }))
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ tasks }))
+          return
+        }
+        if (req.method === 'POST' && routePath === '/scheduled') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
+            const type = typeof body['type'] === 'string' && ['run', 'review', 'summary'].includes(body['type']) ? body['type'] : ''
+            const intervalMinutes = Number(body['intervalMinutes'])
+            if (name === '' || type === '' || !Number.isFinite(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 43200) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'name, type(run|review|summary), intervalMinutes(1-43200) are required' }))
+              return
+            }
+            const now = Date.now()
+            const task = {
+              id: `sch_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+              projectId: project.id,
+              name,
+              type,
+              title: typeof body['title'] === 'string' ? body['title'] : undefined,
+              description: typeof body['description'] === 'string' ? body['description'] : undefined,
+              intervalMinutes: Math.floor(intervalMinutes),
+              enabled: true,
+              createdAt: now,
+              updatedAt: now,
+            }
+            await service.store.scheduledTasks.save(task as never)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, id: task.id }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'POST' && routePath === '/scheduled/update') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const task = id === '' ? undefined : service.store.scheduledTasks.get(id)
+            if (task === undefined) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'task not found' }))
+              return
+            }
+            if (body['enabled'] !== undefined) task.enabled = body['enabled'] === true
+            if (typeof body['intervalMinutes'] === 'number' && Number.isFinite(body['intervalMinutes'])) {
+              task.intervalMinutes = Math.max(1, Math.floor(body['intervalMinutes']))
+            }
+            task.updatedAt = Date.now()
+            await service.store.scheduledTasks.save(task)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'POST' && routePath === '/scheduled/delete') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const removed = id === '' ? false : await service.store.scheduledTasks.delete(id)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: removed }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'POST' && routePath === '/scheduled/run') {
+          if (service.store === undefined || service.scheduler === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const task = id === '' ? undefined : service.store.scheduledTasks.get(id)
+            if (task === undefined) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'task not found' }))
+              return
+            }
+            const result = await service.scheduler.executeTask(task)
+            task.lastRunAt = Date.now()
+            task.lastResult = String(result).slice(0, 300)
+            task.updatedAt = Date.now()
+            await service.store.scheduledTasks.save(task)
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, result }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))

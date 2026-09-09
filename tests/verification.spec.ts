@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { purgeResolvedIssues } from '../src/plugin/api-route.ts'
 import { Context } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
@@ -146,5 +147,49 @@ describe('Review & Verification Engine (T6.1 - T6.4)', () => {
     expect(issueManager.hasBlockingIssues(changeId)).toBe(false)
 
     await close()
+  })
+})
+
+describe('Resolved issue retention purge', () => {
+  function makeIssuesRepo(records: Array<Record<string, unknown>>) {
+    return {
+      list: (filter?: (item: unknown) => boolean) => (filter === undefined ? [...records] : records.filter((item) => filter(item))),
+      get: (id: string) => records.find((item) => item.id === id),
+      delete: async (id: string) => {
+        const index = records.findIndex((item) => item.id === id)
+        if (index < 0) return false
+        records.splice(index, 1)
+        return true
+      },
+    }
+  }
+
+  function makeService(records: Array<Record<string, unknown>>, retentionDays: number) {
+    return {
+      liveConfig: { resolvedIssueRetentionDays: retentionDays },
+      store: { issues: makeIssuesRepo(records) },
+    }
+  }
+
+  const day = 24 * 60 * 60 * 1000
+  const now = Date.now()
+  const records = () => [
+    { id: 'old-resolved', projectId: 'p1', changeId: 'c1', status: 'resolved', updatedAt: now - 8 * day },
+    { id: 'new-resolved', projectId: 'p1', changeId: 'c1', status: 'resolved', updatedAt: now - 2 * day },
+    { id: 'old-accepted', projectId: 'p1', changeId: 'c1', status: 'accepted', updatedAt: now - 9 * day },
+    { id: 'old-open', projectId: 'p1', changeId: 'c1', status: 'open', updatedAt: now - 30 * day },
+  ]
+
+  it('deletes resolved/accepted issues older than the retention window and keeps the rest', async () => {
+    const service = makeService(records(), 7)
+    await purgeResolvedIssues(service as never)
+    const remaining = service.store.issues.list().map((issue: { id: string }) => issue.id)
+    expect(remaining).toEqual(['new-resolved', 'old-open'])
+  })
+
+  it('keeps everything when retention is 0 (permanent)', async () => {
+    const service = makeService(records(), 0)
+    await purgeResolvedIssues(service as never)
+    expect(service.store.issues.list()).toHaveLength(4)
   })
 })
