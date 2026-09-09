@@ -90,7 +90,8 @@ export class StepAttemptRunner {
           assertStepTransition(step.status, 'succeeded')
           step.status = 'succeeded'
           step.verifiedOutcome = true
-          step.claimedOutcome = 'Success verified by checks'
+          // 保留 executeAttempt 已写入的真实总结（Run 详情时间线展示）；仅缺省时兜底。
+          step.claimedOutcome ??= 'Success verified by checks'
           step.updatedAt = Date.now()
           await this.stepsRepo.save(step)
           return step

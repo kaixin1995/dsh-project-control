@@ -20,10 +20,10 @@ export class ScheduledTaskRunner {
     private readonly service: ProjectControlService,
   ) {}
 
-  /** 启动周期扫描（ctx.effect 托管清理）。 */
+  /** 启动周期扫描（ctx.effect 托管清理；cordis Context 无 setInterval，用 Node 原生定时器）。 */
   start(): void {
     this.ctx.effect(() => {
-      const timer = this.ctx.setInterval(() => { void this.tick() }, 60_000)
+      const timer = setInterval(() => { void this.tick() }, 60_000)
       return () => clearInterval(timer)
     }, 'project-control: scheduled task runner')
   }

@@ -169,7 +169,12 @@ export class ProjectControlService {
 
     // 例行任务调度器：每分钟扫描到期任务（run/review/summary）。
     this.scheduler = new ScheduledTaskRunner(this.ctx, this)
-    this.scheduler.start()
+    // 调度器独立容错：故障不拖垮服务启动，但必须留下日志。
+    try {
+      this.scheduler.start()
+    } catch (error) {
+      this.ctx?.logger?.warn?.(`project-control: scheduler start failed: ${String(error)}`)
+    }
   }
 
   /**

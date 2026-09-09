@@ -306,15 +306,28 @@ function darkenForWhiteBackground(r: number, g: number, b: number): string {
   return `rgb(${red}, ${green}, ${blue})`
 }
 
+/** 提亮颜色直到深底（#151517）对比度 ≥4.5:1（每步向 #f0f6fc 混合 20%，至多 12 步）。 */
+function lightenForDarkBackground(r: number, g: number, b: number): string {
+  let red = r
+  let green = g
+  let blue = b
+  for (let step = 0; step < 12 && relativeLuminance(red, green, blue) < 0.214; step += 1) {
+    red = Math.round(red * 0.8 + 0xf0 * 0.2)
+    green = Math.round(green * 0.8 + 0xf6 * 0.2)
+    blue = Math.round(blue * 0.8 + 0xfc * 0.2)
+  }
+  return `rgb(${red}, ${green}, ${blue})`
+}
+
 /**
- * 主题自适应文字色：深色主题原样返回（亮色可读），浅色主题深化到白底 ≥4.5:1。
- * 徽章、风险数字、符号高亮等所有强调色文本统一走这里，杜绝淡字压白底。
+ * 主题自适应文字色：浅色主题深化到白底 ≥4.5:1；深色主题提亮到深底 ≥4.5:1
+ * （深色字如 #57606a 直接放深底同样不可读）。所有强调色文本统一走这里。
  */
 function themeAwareText(color: string): string {
   const rgb = parseColor(color)
   if (rgb === null) return color
   if (typeof document !== 'undefined' && document.body?.hasAttribute?.('data-ds-dark-theme') === true) {
-    return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`
+    return lightenForDarkBackground(rgb[0], rgb[1], rgb[2])
   }
   return darkenForWhiteBackground(rgb[0], rgb[1], rgb[2])
 }
@@ -460,11 +473,27 @@ export const WORKSPACE_DICT = {
     'exec.start': '开始执行',
     'exec.starting': '正在启动…',
     'exec.createHint': '创建变更并自动生成计划，随后由 AI 子代理逐步执行；进度在下方实时刷新，无需去聊天。',
+    'exec.modelDefault': '执行模型（角色默认：分析/操作=快，开发=标准，规划=推理，验收=验收级）',
+    'badge.running': '{n} 个任务运行中，点击查看',
+    'narrative.title': '工作轮次叙事',
+    'narrative.generate': '整体解读这轮工作',
+    'narrative.running': '解读生成中…（约 10-30 秒）',
+    'badge.failed': '{n} 个任务需要处理，点击查看',
+    'exec.flowCreate': '填写任务',
+    'exec.flowOrchestrate': '确认编排（每步可改模型/角色/失败策略）',
+    'exec.flowRun': '启动执行（Run 详情看进度与成本）',
+    'exec.flowMemory': '自动提炼记忆（记忆面板确认）',
+    'exec.planning': '编排生成中…（LLM 正在拆解任务，约 10-30 秒）',
     'exec.col.steps': '步骤',
     'notes.edit': '编辑',
     'notes.toMemory': '转记忆',
     'notes.toMemoryHint': '把这条笔记的标题与内容填入下方记忆表单，确认后入库',
     'notes.toMemoryDone': '✓ 已填入记忆表单（在下方「项目记忆」区确认类型后添加）',
+    'notes.copyMd': '复制 MD',
+    'notes.copyMdHint': '把这条笔记复制为 Markdown 到剪贴板',
+    'notes.copyMdDone': '已复制为 Markdown',
+    'notes.digestNever': '尚未生成过 AI 总结',
+    'notes.digestPending': '上次总结后有 {n} 个新提交未消化',
     'detail.saveNote': '存为笔记',
     'detail.saveNoteHint': '把本次核查结论（改了什么/实现逻辑/风险点）一键存为结构化笔记',
     'detail.saveNoteTitle': '核查记录',
@@ -497,6 +526,10 @@ export const WORKSPACE_DICT = {
     'review.verify': '复检',
     'review.verifyRunning': '复检中…',
     'review.verifyHint': '修改代码后点击：自动检测问题是否修复、改动是否最优/最小侵入、有无新问题；全部通过才自动置为已解决',
+    'review.falsePositive': '判定误报',
+    'review.falsePositiveHint': '人工判定该问题为误报并关闭（与复检解决的语义不同）',
+    'review.falsePositiveTitle': '判定为误报？',
+    'review.falsePositiveMsg': '「{title}」将被标记为误报（已拒绝）并从待处理中移除。',
     'review.fixDetail': '修复详情',
     'review.fixStatFiles': '文件',
     'review.fixFiles': '修复涉及文件',
@@ -696,11 +729,27 @@ export const WORKSPACE_DICT = {
     'exec.start': 'Start run',
     'exec.starting': 'Starting…',
     'exec.createHint': 'Creates a change, generates a plan, then AI subagents execute step by step; progress refreshes below.',
+    'exec.modelDefault': 'Execution model (role defaults: analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier)',
+    'badge.running': '{n} runs in progress, click to view',
+    'narrative.title': 'Work-round narrative',
+    'narrative.generate': 'Interpret this round of work',
+    'narrative.running': 'Generating… (~10-30s)',
+    'badge.failed': '{n} runs need attention, click to view',
+    'exec.flowCreate': 'Describe the task',
+    'exec.flowOrchestrate': 'Confirm orchestration (per-step model/role/failure policy)',
+    'exec.flowRun': 'Launch (track progress & cost in run detail)',
+    'exec.flowMemory': 'Auto-distill memories (confirm in memory panel)',
+    'exec.planning': 'Generating orchestration… (LLM is decomposing the task, ~10-30s)',
     'exec.col.steps': 'Steps',
     'notes.edit': 'Edit',
     'notes.toMemory': 'To memory',
     'notes.toMemoryHint': 'Prefill the memory form below with this note',
     'notes.toMemoryDone': '✓ Prefilled the memory form (choose a type in the Project memory zone below, then add)',
+    'notes.copyMd': 'Copy MD',
+    'notes.copyMdHint': 'Copy this note as Markdown to the clipboard',
+    'notes.copyMdDone': 'Copied as Markdown',
+    'notes.digestNever': 'No AI summary generated yet',
+    'notes.digestPending': '{n} new commits since the last summary',
     'detail.saveNote': 'Save as note',
     'detail.saveNoteHint': 'Save this review conclusion (what/logic/risks) as a structured note',
     'detail.saveNoteTitle': 'Review record',
@@ -733,6 +782,10 @@ export const WORKSPACE_DICT = {
     'review.verify': 'Re-verify',
     'review.verifyRunning': 'Verifying…',
     'review.verifyHint': 'After fixing the code, click to re-check: whether issues are fixed, whether the change is optimal and minimally invasive, and whether new issues appeared. Only a passing re-verification marks issues resolved.',
+    'review.falsePositive': 'False positive',
+    'review.falsePositiveHint': 'Human-mark this issue as a false positive and close it (distinct from a verified fix)',
+    'review.falsePositiveTitle': 'Mark as false positive?',
+    'review.falsePositiveMsg': '"{title}" will be marked rejected and removed from the open queue.',
     'review.fixDetail': 'Fix details',
     'review.fixStatFiles': 'files',
     'review.fixFiles': 'Files touched by the fix',
@@ -948,7 +1001,8 @@ const styles: Record<string, React.CSSProperties> = {
   empty: { color: 'var(--dsw-alias-label-secondary, #6b7280)', fontSize: '12px', padding: '10px 4px' },
   button: {
     padding: '5px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer',
-    fontSize: '11px', background: 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
+    // button-info-fill 是宿主两个主题下都为蓝色、白字可读的主操作色（brand-primary 在深色主题是近白色，白字不可读）。
+    fontSize: '11px', background: 'var(--dsw-alias-button-info-fill, #2563eb)', color: '#fff',
     whiteSpace: 'nowrap',
   },
   secondary: {
@@ -964,6 +1018,18 @@ const styles: Record<string, React.CSSProperties> = {
     boxSizing: 'border-box',
   },
   formRow: { display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '8px' },
+  formInline: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' },
+  // select 用系统外观时 Windows 浅色模式下强制白底，深色主题下不可读——自绘外观走主题变量。
+  select: {
+    appearance: 'none', WebkitAppearance: 'none',
+    padding: '6px 26px 6px 10px', borderRadius: '6px', fontSize: '12px',
+    border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
+    background: 'var(--dsw-alias-bg-base, #fff)', color: 'var(--dsw-alias-label-primary, #1f2328)',
+    backgroundImage: 'url("data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2210%22 height=%226%22><path d=%22M1 1l4 4 4-4%22 stroke=%22%23888%22 stroke-width=%221.5%22 fill=%22none%22/></svg>")',
+    backgroundRepeat: 'no-repeat', backgroundPosition: 'right 8px center',
+    cursor: 'pointer', boxSizing: 'border-box', maxWidth: '100%',
+  },
+  actionRow: { display: 'flex', gap: '10px', alignItems: 'center' },
   result: {
     whiteSpace: 'pre-wrap', fontSize: '12px', lineHeight: 1.6,
     background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.08))',
@@ -1221,7 +1287,7 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
             'data-testid': 'pc-confirm-ok',
             style: {
               padding: '7px 18px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 500,
-              background: props.danger ? '#e11d48' : 'var(--dsw-alias-brand-primary, #2563eb)', color: '#fff',
+              background: props.danger ? '#e11d48' : 'var(--dsw-alias-button-info-fill, #2563eb)', color: '#fff',
             },
             onClick: props.onConfirm,
           }, '确认删除'),
@@ -1232,7 +1298,7 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
 }
 
 /** 骨架小卡片。 */
-function Card(props: { title?: string; children?: React.ReactNode }) {
+function Card(props: { title?: React.ReactNode; children?: React.ReactNode }) {
   return React.createElement('div', { style: styles.card },
     props.title === undefined ? null : React.createElement('div', { style: styles.sectionTitle }, props.title),
     props.children)
@@ -1284,6 +1350,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [fixExpanded, setFixExpanded] = useState<Record<string, boolean>>({})
   const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
   const [aiSummarizing, setAiSummarizing] = useState(false)
+  const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number } | null>(null)
+  const [narrativeBusy, setNarrativeBusy] = useState(false)
+  const [narrativeError, setNarrativeError] = useState('')
   const [modelTiers, setModelTiers] = useState<Record<string, { provider: string; model: string }> | null>(null)
   const [modelOptions, setModelOptions] = useState<Array<{ provider: string; id: string; name: string }>>([])
   const [modelSaving, setModelSaving] = useState(false)
@@ -1294,6 +1363,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null)
   const [scheduledData, setScheduledData] = useState<ScheduledTaskEntry[] | null>(null)
   const [schedName, setSchedName] = useState('')
+  const [schedOpen, setSchedOpen] = useState(true)
   const [schedType, setSchedType] = useState('review')
   const [schedTitle, setSchedTitle] = useState('')
   const [schedDesc, setSchedDesc] = useState('')
@@ -1305,6 +1375,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [memoryType, setMemoryType] = useState('architecture_decision')
   const [memorySyncing, setMemorySyncing] = useState(false)
   const [execTitle, setExecTitle] = useState('')
+  const [execModel, setExecModel] = useState('')
   const [execDesc, setExecDesc] = useState('')
 
   const post = async (path: string, body: Record<string, unknown>): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
@@ -1315,6 +1386,26 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     })
     const data: unknown = await response.json()
     return { ok: response.ok, data: (data ?? {}) as Record<string, unknown> }
+  }
+
+  /** 工作轮次叙事：多个选中提交作为一个整体解读（缓存 + 可强制重新生成）。 */
+  const loadNarrative = async (force = false): Promise<void> => {
+    const shas = selectedTargets.filter((target) => target !== 'working')
+    if (shas.length < 2) return
+    setNarrativeBusy(true)
+    setNarrativeError('')
+    try {
+      const { ok, data } = await post('/project-control/api/work-narrative', { shas, force })
+      if (!ok) {
+        setNarrativeError(String(data['error'] ?? 'error'))
+        return
+      }
+      setNarrative({ narrative: String(data['narrative'] ?? ''), cached: data['cached'] === true, generatedAt: data['generatedAt'] })
+    } catch (error: unknown) {
+      setNarrativeError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setNarrativeBusy(false)
+    }
   }
 
   const loadCommits = async (): Promise<void> => {
@@ -1533,7 +1624,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setBusy('startRun')
     setActionResult(null)
     try {
-      const { ok, data } = await post('/project-control/api/runs/start', { title: execTitle.trim(), description: execDesc.trim() })
+      const { ok, data } = await post('/project-control/api/runs/start', {
+        title: execTitle.trim(), description: execDesc.trim(),
+        ...(execModel === '' ? {} : (() => { const [provider, model] = execModel.split('/'); return { defaultModelProvider: provider ?? '', defaultModelId: model ?? '' } })()),
+      })
       if (!ok) {
         setActionResult('✗ ' + String(data['error'] ?? 'error'))
         return
@@ -1802,7 +1896,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // 进入提交/笔记/Review 页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
   useEffect(() => {
     if (tab === 'commits') void loadCommits()
-    if (tab === 'notes') { void loadNotes(); void loadMemories() }
+    if (tab === 'notes') { void loadNotes(); void loadMemories(); if (commitsData === null) void loadCommits() }
     if (tab === 'review') void loadIssues()
     if (tab === 'execution') { void loadScheduled(); if (runDetail !== null) void loadRunDetail(runDetail.run.id) }
     if (tab === 'settings' && modelTiers === null) void loadModelConfig()
@@ -2025,6 +2119,30 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
       {commitsError !== null && <Card><div style={styles.empty}>{t('repo.loadFailed')}: {commitsError}</div></Card>}
       {selectedTargets.length === 0 && <Card><div style={styles.empty}>{t('detail.pick')}</div></Card>}
+
+      {/* 工作轮次叙事：多提交整体解读 */}
+      {selectedTargets.filter((target) => target !== 'working').length >= 2 && (
+        <Card title={'📖 ' + t('narrative.title')}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: narrative === null ? '0' : '8px' }}>
+            <button style={styles.secondary} disabled={narrativeBusy} onClick={() => { void loadNarrative() }}>
+              {narrativeBusy ? t('narrative.running') : '✨ ' + t('narrative.generate')}
+            </button>
+            {narrative !== null && narrative.cached && (
+              <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('cache.hit')}{narrative.generatedAt !== undefined ? ' · ' + new Date(narrative.generatedAt).toLocaleString() : ''}</span>
+            )}
+            {narrative !== null && (
+              <>
+                <span style={{ flex: 1 }} />
+                <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} disabled={narrativeBusy} onClick={() => { void loadNarrative(true) }}>{t('cache.regenerate')}</button>
+              </>
+            )}
+          </div>
+          {narrativeError !== '' && <div style={{ ...styles.empty, color: '#d1242f' }}>{narrativeError}</div>}
+          {narrative !== null && (
+            <div style={{ ...styles.what, whiteSpace: 'pre-wrap' }}>{renderStructuredContent(narrative.narrative)}</div>
+          )}
+        </Card>
+      )}
 
       {/* 每条选中提交的 AI 解读 */}
       {selectedTargets.map((target) => {
@@ -2308,7 +2426,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 <div key={tier.key} style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap' }}>
                   <span style={{ minWidth: 150, fontSize: '12px', fontWeight: 600 }}>{tier.zh}</span>
                   <select
-                    style={{ ...styles.input, width: 240 }}
+                    style={{ ...styles.select, width: 240 }}
                     value={value}
                     onChange={(e) => {
                       const v = e.target.value
@@ -2458,15 +2576,29 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // ── 执行中心页签：页面直接创建并启动执行，聊天只是另一种入口 ──
   const executionTab = (
     <>
+      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '10px', padding: '7px 12px', borderRadius: '8px', background: 'rgba(37,99,235,0.06)', border: '1px solid rgba(37,99,235,0.2)', fontSize: '11px' }}>
+        <b>① {t('exec.flowCreate')}</b><span>→</span>
+        <b>② {t('exec.flowOrchestrate')}</b><span>→</span>
+        <b>③ {t('exec.flowRun')}</b><span>→</span>
+        <b>④ {t('exec.flowMemory')}</b>
+      </div>
       <Card title={t('exec.create')}>
-        <div style={styles.formRow}>
-          <input style={styles.input} placeholder={t('exec.formTitle')} value={execTitle} onChange={(e) => { setExecTitle(e.target.value) }} />
-          <textarea style={styles.textarea} rows={3} placeholder={t('exec.formDesc')} value={execDesc} onChange={(e) => { setExecDesc(e.target.value) }} />
-          <button style={styles.button} disabled={busy !== null || execTitle.trim() === '' || execDesc.trim() === ''} onClick={() => { void startRun() }}>
-            {busy === 'startRun' ? t('exec.starting') : t('exec.start')}
-          </button>
+        <div style={styles.formInline}>
+          <input style={{ ...styles.input, flex: 1, minWidth: 200 }} placeholder={t('exec.formTitle')} value={execTitle} onChange={(e) => { setExecTitle(e.target.value) }} />
+          <select style={{ ...styles.select, width: 'auto' }} value={execModel} onChange={(e) => { setExecModel(e.target.value) }} title={t('plan.modelDefault')}>
+            <option value="">{t('exec.modelDefault')}</option>
+            {(modelOptions ?? []).map((option) => <option key={option.provider + '/' + option.id} value={option.provider + '/' + option.id}>{option.provider}/{option.id}</option>)}
+          </select>
         </div>
-        <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('exec.createHint')}</div>
+        <div style={styles.formRow}>
+          <textarea style={styles.textarea} rows={3} placeholder={t('exec.formDesc')} value={execDesc} onChange={(e) => { setExecDesc(e.target.value) }} />
+          <div style={styles.actionRow}>
+            <button style={styles.button} disabled={busy !== null || execTitle.trim() === '' || execDesc.trim() === ''} onClick={() => { void startRun() }}>
+              {busy === 'startRun' ? t('exec.planning') : t('exec.start')}
+            </button>
+            <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('exec.createHint')}</span>
+          </div>
+        </div>
       </Card>
       {resultPanel}
       {planConfirm !== null && (
@@ -2488,13 +2620,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                       )}
                     </td>
                     <td style={styles.td}>
-                      <select style={{ ...styles.input, width: 'auto', padding: '3px 6px' }} value={step.role}
+                      <select style={{ ...styles.select, width: 'auto', padding: '3px 6px' }} value={step.role}
                         onChange={(e) => { setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, role: e.target.value } : item) }) }}>
                         {['analysis', 'planning', 'coding', 'ops', 'verification'].map((role) => <option key={role} value={role}>{ROLE_LABELS[role] ?? role}</option>)}
                       </select>
                     </td>
                     <td style={styles.td}>
-                      <select style={{ ...styles.input, width: 'auto', padding: '3px 6px' }} value={step.modelProvider + '/' + step.modelId}
+                      <select style={{ ...styles.select, width: 'auto', padding: '3px 6px' }} value={step.modelProvider + '/' + step.modelId}
                         onChange={(e) => {
                           const [provider, model] = e.target.value.split('/')
                           setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, modelProvider: provider ?? '', modelId: model ?? '' } : item) })
@@ -2504,7 +2636,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                       </select>
                     </td>
                     <td style={styles.td}>
-                      <select style={{ ...styles.input, width: 'auto', padding: '3px 6px' }} value={step.failurePolicy}
+                      <select style={{ ...styles.select, width: 'auto', padding: '3px 6px' }} value={step.failurePolicy}
                         onChange={(e) => { setPlanConfirm({ ...planConfirm, steps: planConfirm.steps.map((item, i) => i === index ? { ...item, failurePolicy: e.target.value } : item) }) }}>
                         {Object.entries(POLICY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                       </select>
@@ -2634,10 +2766,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           )}
         </Card>
       )}
-      <Card title={t('sched.title')}>
-        <div style={styles.formRow}>
-          <input style={styles.input} placeholder={t('sched.formName')} value={schedName} onChange={(e) => { setSchedName(e.target.value) }} />
-          <select style={{ ...styles.input, width: 'auto' }} value={schedType} onChange={(e) => { setSchedType(e.target.value) }}>
+      <Card
+        title={
+          <span style={{ cursor: 'pointer', userSelect: 'none' }} onClick={() => { setSchedOpen(!schedOpen) }}>
+            {schedOpen ? '▾ ' : '▸ '}{t('sched.title')}
+            <span style={{ ...styles.label, marginLeft: '8px' }}>{(scheduledData ?? []).length > 0 ? String((scheduledData ?? []).length) + ' 个' : ''}</span>
+          </span>
+        }
+      >
+        {schedOpen && (
+        <>
+        <div style={styles.formInline}>
+          <input style={{ ...styles.input, flex: 1, minWidth: 160 }} placeholder={t('sched.formName')} value={schedName} onChange={(e) => { setSchedName(e.target.value) }} />
+          <select style={{ ...styles.select, width: 'auto' }} value={schedType} onChange={(e) => { setSchedType(e.target.value) }}>
             <option value="review">{t('sched.typeReview')}</option>
             <option value="summary">{t('sched.typeSummary')}</option>
             <option value="run">{t('sched.typeRun')}</option>
@@ -2681,6 +2822,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           </table>
           </div>
         )}
+        </>
+        )}
       </Card>
     </>
   )
@@ -2698,6 +2841,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             onChange={(e) => { setNoteSearch(e.target.value) }}
           />
           <span style={{ flex: 1 }} />
+          {(() => {
+            const lastSummary = notes.filter((note) => note.sha === 'summary').sort((a, b) => b.createdAt - a.createdAt)[0]
+            const newCommits = lastSummary === undefined ? -1
+              : (commitsData?.commits ?? []).filter((commit) => commit.date > lastSummary.createdAt).length
+            if (newCommits === -1) {
+              return <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('notes.digestNever')}</span>
+            }
+            if (newCommits === 0) return null
+            return <span style={{ fontSize: '11px', color: 'var(--dsw-alias-brand-primary, #2563eb)' }}>{t('notes.digestPending').replace('{n}', String(newCommits))}</span>
+          })()}
           <button style={styles.secondary} disabled={aiSummarizing} onClick={() => { void aiSummarize() }}>
             {aiSummarizing ? t('notes.aiSummaryRun') : '✨ ' + t('notes.aiSummary')}
           </button>
@@ -2765,6 +2918,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                           title={note.pinned === true ? t('notes.unpin') : t('notes.pin')}
                           onClick={() => { void toggleNotePin(note) }}
                         >📌</button>
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} title={t('notes.copyMdHint')} onClick={() => {
+                          const md = `# ${note.title}\n\n${note.content}\n`
+                          void navigator.clipboard?.writeText(md).then(() => setActionResult('✓ ' + t('notes.copyMdDone'))).catch(() => setActionResult('✗ 复制失败'))
+                        }}>📋 {t('notes.copyMd')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} title={t('notes.toMemoryHint')} onClick={() => { setMemoryTitle(note.title); setMemoryContent(note.content); setActionResult(t('notes.toMemoryDone')) }}>🧠 {t('notes.toMemory')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setEditingNote({ id: note.id, title: note.title, content: note.content, tags: (note.tags ?? []).join(', ') }) }}>{t('notes.edit')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这条笔记？', message: '「' + note.title + '」将被永久删除，不可恢复。', danger: true, onConfirm: () => { void removeNote(note.id) } }) }}>✕</button>
@@ -2847,10 +3004,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {/* 手动添加：标题 / 类型 / 作用域 / 内容 */}
         <div style={styles.formRow}>
           <input style={styles.input} placeholder={t('form.memoryTitle')} value={memoryTitle} onChange={(e) => { setMemoryTitle(e.target.value) }} />
-          <select style={{ ...styles.input, width: 'auto' }} value={memoryType} onChange={(e) => { setMemoryType(e.target.value) }}>
+          <select style={{ ...styles.select, width: 'auto' }} value={memoryType} onChange={(e) => { setMemoryType(e.target.value) }}>
             {Object.entries(MEMORY_TYPE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
-          <select style={{ ...styles.input, width: 'auto' }} value={memoryScope} onChange={(e) => { setMemoryScope(e.target.value as 'project' | 'branch') }}>
+          <select style={{ ...styles.select, width: 'auto' }} value={memoryScope} onChange={(e) => { setMemoryScope(e.target.value as 'project' | 'branch') }}>
             <option value="project">{t('memory.scopeProject')}</option>
             <option value="branch">{t('memory.scopeBranch')}</option>
           </select>
@@ -2989,7 +3146,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   {openCount} 待处理 / 共 {all.length}
                   {(state?.resolvedIssueRetentionDays ?? 0) > 0 ? ` · ${t('review.retentionHint').replace('{days}', String(state?.resolvedIssueRetentionDays ?? 7))}` : ''}
                 </span>
-                <select style={{ ...styles.input, width: 'auto', padding: '3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
+                <select style={{ ...styles.select, width: 'auto', padding: '3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
                   <option value="">{t('review.statusAll')}</option>
                   {Object.entries(ISSUE_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                 </select>
@@ -3022,6 +3179,20 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                             title={t('review.verifyHint')}
                             onClick={() => { void verifyIssues(issue.changeId) }}
                           >{verifyingTarget === issue.changeId ? t('review.verifyRunning') : '🔍 ' + t('review.verify')}</button>
+                        )}
+                        {(issue.status === 'open' || issue.status === 'fixing') && (
+                          <button
+                            style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                            title={t('review.falsePositiveHint')}
+                            onClick={() => {
+                              setConfirmDialog({
+                                title: t('review.falsePositiveTitle'),
+                                message: t('review.falsePositiveMsg').replace('{title}', issue.title),
+                                danger: false,
+                                onConfirm: () => { void post('/project-control/api/issues/status', { id: issue.id, status: 'rejected' }).then(async ({ ok }) => { if (ok) await loadIssues() }) },
+                              })
+                            }}
+                          >🚫 {t('review.falsePositive')}</button>
                         )}
                       </div>
                     </div>
@@ -3135,6 +3306,23 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {tabs.map((entry) => (
           <button key={entry.key} style={styles.tab(tab === entry.key)} onClick={() => { setTab(entry.key) }}>{entry.label}</button>
         ))}
+        {(() => {
+          const runningCount = runs.filter((entry) => entry.status === 'running' || entry.status === 'queued' || entry.status === 'verifying').length
+          const failedCount = runs.filter((entry) => entry.status === 'failed' || entry.status === 'paused').length
+          if (runningCount === 0 && failedCount === 0) return null
+          return (
+            <span style={{ display: 'flex', gap: '4px', marginLeft: '4px', alignItems: 'center' }}>
+              {runningCount > 0 && (
+                <button style={{ ...styles.badge(themeAwareText('#2563eb')), cursor: 'pointer', border: 'none' }} title={t('badge.running').replace('{n}', String(runningCount))}
+                  onClick={() => { setTab('execution') }}>▶ {String(runningCount)}</button>
+              )}
+              {failedCount > 0 && (
+                <button style={{ ...styles.badge(themeAwareText('#f14c4c')), cursor: 'pointer', border: 'none' }} title={t('badge.failed').replace('{n}', String(failedCount))}
+                  onClick={() => { setTab('execution') }}>✗ {String(failedCount)}</button>
+              )}
+            </span>
+          )
+        })()}
       </div>
       <div style={styles.body}>
         {loadError !== null && <div style={styles.empty}>{t('error.load')}: {loadError}</div>}

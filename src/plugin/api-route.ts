@@ -1197,6 +1197,78 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           return
         }
+        // 工作轮次叙事：多个提交作为一个整体解读（做了什么/分几步/每步对应哪些提交）。
+        if (req.method === 'POST' && routePath === '/work-narrative') {
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const cwd = project?.identity?.rootPath
+            if (project === undefined || cwd === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const shas = Array.isArray(body['shas'])
+              ? (body['shas'] as unknown[]).filter((item): item is string => typeof item === 'string' && item !== '' && item !== 'working')
+              : []
+            if (shas.length < 2) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'at least 2 commits required' }))
+              return
+            }
+            const force = body['force'] === true
+            const orderedShas: string[] = []
+            const allLog = await service.git.runGit(['log', '-n', '200', '--format=%H'], cwd).catch(() => '')
+            for (const sha of allLog.split('\n').map((line) => line.trim())) {
+              if (shas.includes(sha)) orderedShas.push(sha)
+            }
+            if (orderedShas.length < 2) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'commits not found in recent history' }))
+              return
+            }
+            const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+            const storeKey = `wn:${cwd}|${orderedShas.join(',')}|v1|${route.provider}/${route.model}`
+            if (!force) {
+              const hit = cacheRead(service, storeKey)
+              if (hit !== undefined) {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ narrative: String(hit.payload['narrative'] ?? ''), cached: true, generatedAt: hit.createdAt }))
+                return
+              }
+            }
+            const commitBlocks: string[] = []
+            for (const [index, sha] of orderedShas.entries()) {
+              const info = (await service.git.runGit(['log', '-1', '--format=%an|%ad|%s', '--date=short', sha], cwd).catch(() => '')).trim()
+              const stat = await service.git.runGit(['diff', '--no-color', '--stat', `${sha}^..${sha}`], cwd).catch(() => '')
+              commitBlocks.push(`# ${index + 1}. ${sha.slice(0, 8)} ${info}\n${stat.trim().split('\n').slice(0, 15).join('\n')}`)
+            }
+            const llm = await runLlmAnalysis(ctx, {
+              prompt: [
+                '你是代码考古员。以下多个连续提交构成一轮开发工作，请把它们作为一个整体解读：',
+                '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
+                '2. 拆出这轮工作分几个步骤/阶段（如 分析→实现→修 bug→测试），每个步骤列出对应的提交编号；',
+                '3. 指出步骤间的依赖或演进关系（后一步如何建立在前一步之上）。',
+                '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
+                '',
+                ...commitBlocks.map((block) => block + '\n'),
+              ].join('\n'),
+              provider: route.provider,
+              model: route.model,
+              maxTokens: service.liveConfig.analysisMaxTokens,
+              timeoutMs: service.liveConfig.analysisTimeoutMs,
+              purpose: 'project-control-work-narrative',
+            })
+            const narrative = llm.text.trim()
+            cacheWrite(service, storeKey, 'narrative', { narrative })
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ narrative, cached: false, generatedAt: Date.now() }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
         // 独立评审当前改动（Reasoning 级；changeId 提供时落 Issue，否则只返回文本）。
         if (req.method === 'POST' && routePath === '/review') {
           if (service.store === undefined) {
@@ -1839,6 +1911,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const bootstrap = service.store.checkpoints.list().at(-1)
             const stackHint = bootstrap != null ? `仓库技术栈：${bootstrap.techStack.join(', ') || '未知'}` : ''
             const steps = await generatePlanSteps(ctx, service, title, description, stackHint)
+            // 创建表单选择的执行模型：作为本计划所有步骤的默认模型覆盖（计划确认页仍可逐步改）。
+            const defaultModelProvider = typeof body['defaultModelProvider'] === 'string' ? body['defaultModelProvider'] : ''
+            const defaultModelId = typeof body['defaultModelId'] === 'string' ? body['defaultModelId'] : ''
+            if (defaultModelProvider !== '' && defaultModelId !== '') {
+              for (const step of steps) step.modelOverride = { provider: defaultModelProvider, model: defaultModelId }
+            }
             const plan = await service.orchestrator.createPlan(change, `${title} · 计划`, steps)
             // 默认停在计划确认（页面展示编排、可调整模型/策略后 launch）；
             // autoStart=true（调度器/兼容路径）跳过确认直接执行。
