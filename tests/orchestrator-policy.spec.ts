@@ -152,3 +152,42 @@ describe('收尾验收门与失败策略（编排器集成）', () => {
     expect(runContext.decisionLog.some((entry) => entry.kind === 'skipped')).toBe(true)
   })
 })
+
+describe('约束事前注入（composeStepPrompt）', () => {
+  const ctx = { logger: { info: () => {}, warn: () => {} } } as never
+
+  const makeOrchestratorWithConstraints = (constraints: Array<Record<string, unknown>>) => {
+    const store = createInMemoryStore()
+    store.confirmed.save({ id: 'cfm_x', projectId: 'p1', type: 'constraint', text: '核心模块禁改', forbiddenPaths: ['src/core'], status: 'active', createdAt: 1 } as never)
+    void constraints
+    const orchestrator = new RunOrchestrator({
+      ctx,
+      store: store as never,
+      git,
+      config: () => PROJECT_CONTROL_DEFAULTS as never,
+      evidenceManager: new EvidenceManager(),
+    })
+    const run: RunRecord = { id: 'run_c1' as never, changeId: 'chg_c1' as never, planId: 'pln_c1' as never, projectId: 'p1' as never, status: 'running', isolationMode: 'current', workspaceId: 'current', createdAt: 1, updatedAt: 1 }
+    store.runContexts.save({ id: 'run_c1', runId: 'run_c1', projectId: 'p1' as never, projectDigest: 'x', injectedMemories: [], stepSummaries: [], decisionLog: [], updatedAt: 1 })
+    const change: ChangeRecord = { id: 'chg_c1' as never, projectId: 'p1' as never, title: 't', description: 'd', status: 'ready', baseRevision: '', revision: 1, createdAt: 1, updatedAt: 1 }
+    return { orchestrator, run, change }
+  }
+
+  const promptOf = (orchestrator: RunOrchestrator, run: RunRecord, change: ChangeRecord, role: string): string =>
+    (orchestrator as unknown as { composeStepPrompt(r: RunRecord, c: ChangeRecord, d: { title: string; description: string }, role: string, cwd: string): string })
+      .composeStepPrompt(run, change, { title: '写代码', description: '改点东西' }, role, '.')
+
+  it('coding 角色携带禁改清单（事前告知）', () => {
+    const { orchestrator, run, change } = makeOrchestratorWithConstraints([])
+    const prompt = promptOf(orchestrator, run, change, 'coding')
+    expect(prompt).toContain('confirmed_constraints')
+    expect(prompt).toContain('核心模块禁改')
+    expect(prompt).toContain('src/core')
+  })
+
+  it('analysis 只读角色不携带禁改清单', () => {
+    const { orchestrator, run, change } = makeOrchestratorWithConstraints([])
+    const prompt = promptOf(orchestrator, run, change, 'analysis')
+    expect(prompt).not.toContain('confirmed_constraints')
+  })
+})
