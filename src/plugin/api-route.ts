@@ -662,6 +662,128 @@ export async function runIncrementalAiSummary(
 }
 
 /**
+ * 拉取同步核心（/memory/sync 路由与例行任务调度共用）：
+ * 基线..HEAD 三向判定 → 失效提案 + 新候选 + 自动续命 + 基线前移。
+ */
+export async function runMemorySync(
+  ctx: Context,
+  service: ProjectControlService,
+  project: ProjectRecord,
+): Promise<Record<string, unknown>> {
+  if (service.store === undefined || service.memoryService === undefined) {
+    return { ok: false, error: 'service not started' }
+  }
+  const cwd = project.identity?.rootPath
+  if (cwd === undefined) {
+    return { ok: false, error: 'no project root' }
+  }
+  try {
+            const pid = project.id as string
+            const status = await service.git.getStatus(cwd)
+            const branch = status.branch ?? 'HEAD'
+            const headSha = status.headSha
+            const baselineId = `${pid}|${branch}`
+            const baseline = service.store.memoryBaselines.get(baselineId)
+            const baseSha = baseline?.lastSyncedSha
+            const log = baseSha === undefined
+              ? await service.git.runGit(['log', '-n', '20', '--date=short', '--format=- %ad %h %s'], cwd).catch(() => '')
+              : await service.git.runGit(['log', `${baseSha}..HEAD`, '--date=short', '--format=- %ad %h %s'], cwd).catch(() => '')
+            const commitLines = log.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+            const diff = baseSha === undefined
+              ? await service.git.getDiff(cwd, { maxBytes: 120 * 1024 })
+              : await service.git.getDiff(cwd, { from: baseSha, maxBytes: 120 * 1024 })
+            if (headSha === undefined || commitLines.length === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: true, behindCount: 0, staleProposals: [], renewed: 0, newCandidates: [], verdict: '基线以来无新提交，无需同步。' }))
+              return
+            }
+            const activeMemories = service.store.memories.list(
+              (memory) => memory.projectId === pid && (memory.status ?? 'active') === 'active',
+            )
+            const route = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
+            let analysis: { text: string }
+            try {
+              analysis = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是项目记忆同步员。以下是「当前生效的项目记忆清单」和「自上次同步以来的代码变更」。做三向判定：',
+                  '1. 对每条可能失效的记忆输出一行：STALE | 记忆ID | 一句话依据（哪个文件/哪部分被改动使其疑似过时）',
+                  '2. 对改动引入的值得长期记住的新知识输出一行：NEW | type | 标题 | 内容（1-3 句；type 为 architecture_decision/pattern_rule/risk_hotspot）',
+                  '3. 其余记忆无需输出（视为仍然有效）。',
+                  '判定只能依据给定材料；没有把握判失效就不要输出 STALE。除关键字外全部用中文。',
+                  '',
+                  '== 当前生效记忆 ==',
+                  ...(activeMemories.length > 0
+                    ? activeMemories.map((memory) => `ID=${memory.id} [${memory.type}] ${memory.title}：${String(memory.content).slice(0, 160)}${(memory.relatedFiles ?? []).length > 0 ? `（关联：${memory.relatedFiles.join(',')}）` : ''}`)
+                    : ['（无）']),
+                  '',
+                  '== 自上次同步以来的提交 ==',
+                  ...commitLines,
+                  '',
+                  '== 变更差异（节选）==',
+                  diff.patch.slice(0, 60_000),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-memory-sync',
+              })
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : String(error)
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: `同步判定失败：${message}（可重试）` }))
+              return
+            }
+            const staleProposals: Array<{ id: string; title: string; reason: string }> = []
+            const newCandidates: Array<{ type: string; title: string; content: string }> = []
+            for (const rawLine of analysis.text.split('\n')) {
+              const line = rawLine.trim()
+              if (line.startsWith('STALE |')) {
+                const parts = line.split('|').map((part) => part.trim())
+                const id = parts[1] ?? ''
+                if (activeMemories.some((memory) => memory.id === id)) {
+                  staleProposals.push({ id, title: activeMemories.find((memory) => memory.id === id)!.title, reason: parts.slice(2).join('：') || '相关代码被改动' })
+                }
+              } else if (line.startsWith('NEW |')) {
+                const parts = line.split('|').map((part) => part.trim())
+                if (parts.length >= 4 && parts[2] !== '') {
+                  newCandidates.push({ type: parts[1] ?? 'project_log', title: parts[2]!, content: parts.slice(3).join('：') })
+                }
+              }
+            }
+            // 自动续命：未被判定失效的记忆刷新验证基线（fact 级判定，无需人工确认）。
+            const renewedIds = activeMemories.filter((memory) => !staleProposals.some((proposal) => proposal.id === memory.id)).map((memory) => memory.id as never)
+            const renewed = await service.memoryService.renewBaseline(renewedIds, headSha)
+            for (const candidate of newCandidates.slice(0, 5)) {
+              await service.memoryService.recordMemory({
+                projectId: pid as never,
+                type: (['architecture_decision', 'pattern_rule', 'risk_hotspot'].includes(candidate.type) ? candidate.type : 'project_log') as never,
+                truthLevel: 'inferred' as never,
+                title: candidate.title,
+                content: candidate.content,
+                sourceTag: 'sync',
+                basisSha: headSha,
+                gitBranch: branch,
+                tags: ['sync'],
+              })
+            }
+            const now = Date.now()
+            await service.store.memoryBaselines.save({ id: baselineId, projectId: pid as never, branch, lastSyncedSha: headSha, updatedAt: now } as never)
+
+    return {
+      ok: true,
+      behindCount: commitLines.length,
+      staleProposals,
+      renewed,
+      newCandidates: newCandidates.slice(0, 5),
+      verdict: `同步完成：${commitLines.length} 个新提交；${staleProposals.length} 条疑似过期待复核；新增 ${Math.min(newCandidates.length, 5)} 条候选；${renewed} 条自动续命。`,
+    }
+  } catch (error: unknown) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
  * 数据生命周期：清理超期的已解决评审问题（resolved/accepted，按 updatedAt 计龄）。
  * resolvedIssueRetentionDays=0 表示永久保留。读取问题列表前执行，页面所见即清理后状态。
  */
@@ -1198,6 +1320,52 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           return
         }
         // 工作轮次叙事：多个提交作为一个整体解读（做了什么/分几步/每步对应哪些提交）。
+        // peek：查看某文件某行附近的代码上下文（风险点/调用点/问题证据的可点击追溯）。
+        if (req.method === 'POST' && routePath === '/peek') {
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const root = project?.identity?.rootPath
+            if (root === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const rawPath = typeof body['path'] === 'string' ? body['path'].trim() : ''
+            const line = Number(body['line'])
+            if (rawPath === '' || !Number.isInteger(line) || line < 1) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'path and a valid line are required' }))
+              return
+            }
+            // 安全围栏：规范化后必须仍位于项目根内（拒绝 ../ 逃逸与绝对路径注入）。
+            const resolved = resolve(root, rawPath)
+            const normalizedRoot = resolve(root)
+            if (resolved !== normalizedRoot && !resolved.startsWith(normalizedRoot + '\\') && !resolved.startsWith(normalizedRoot + '/')) {
+              res.writeHead(403, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'path escapes the project root' }))
+              return
+            }
+            const { readFile } = await import('node:fs/promises')
+            const content = await readFile(resolved, 'utf8').catch(() => null)
+            if (content === null) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ exists: false }))
+              return
+            }
+            const allLines = content.split('\n')
+            const start = Math.max(1, line - 8)
+            const end = Math.min(allLines.length, line + 8)
+            const lines: Array<{ n: number; text: string }> = []
+            for (let n = start; n <= end; n += 1) lines.push({ n, text: allLines[n - 1] ?? '' })
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ exists: true, path: rawPath, startLine: start, endLine: end, totalLines: allLines.length, lines }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
         if (req.method === 'POST' && routePath === '/work-narrative') {
           try {
             const body = await readJsonBody(req)
@@ -2681,112 +2849,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const project = await adoptProject(service, body)
-            const cwd = project?.identity?.rootPath
-            if (project === undefined || cwd === undefined) {
+            if (project === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
-            const pid = project.id as string
-            const status = await service.git.getStatus(cwd)
-            const branch = status.branch ?? 'HEAD'
-            const headSha = status.headSha
-            const baselineId = `${pid}|${branch}`
-            const baseline = service.store.memoryBaselines.get(baselineId)
-            const baseSha = baseline?.lastSyncedSha
-            const log = baseSha === undefined
-              ? await service.git.runGit(['log', '-n', '20', '--date=short', '--format=- %ad %h %s'], cwd).catch(() => '')
-              : await service.git.runGit(['log', `${baseSha}..HEAD`, '--date=short', '--format=- %ad %h %s'], cwd).catch(() => '')
-            const commitLines = log.split('\n').map((line) => line.trim()).filter((line) => line !== '')
-            const diff = baseSha === undefined
-              ? await service.git.getDiff(cwd, { maxBytes: 120 * 1024 })
-              : await service.git.getDiff(cwd, { from: baseSha, maxBytes: 120 * 1024 })
-            if (headSha === undefined || commitLines.length === 0) {
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ ok: true, behindCount: 0, staleProposals: [], renewed: 0, newCandidates: [], verdict: '基线以来无新提交，无需同步。' }))
-              return
-            }
-            const activeMemories = service.store.memories.list(
-              (memory) => memory.projectId === pid && (memory.status ?? 'active') === 'active',
-            )
-            const route = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
-            let analysis: { text: string }
-            try {
-              analysis = await runLlmAnalysis(ctx, {
-                prompt: [
-                  '你是项目记忆同步员。以下是「当前生效的项目记忆清单」和「自上次同步以来的代码变更」。做三向判定：',
-                  '1. 对每条可能失效的记忆输出一行：STALE | 记忆ID | 一句话依据（哪个文件/哪部分被改动使其疑似过时）',
-                  '2. 对改动引入的值得长期记住的新知识输出一行：NEW | type | 标题 | 内容（1-3 句；type 为 architecture_decision/pattern_rule/risk_hotspot）',
-                  '3. 其余记忆无需输出（视为仍然有效）。',
-                  '判定只能依据给定材料；没有把握判失效就不要输出 STALE。除关键字外全部用中文。',
-                  '',
-                  '== 当前生效记忆 ==',
-                  ...(activeMemories.length > 0
-                    ? activeMemories.map((memory) => `ID=${memory.id} [${memory.type}] ${memory.title}：${String(memory.content).slice(0, 160)}${(memory.relatedFiles ?? []).length > 0 ? `（关联：${memory.relatedFiles.join(',')}）` : ''}`)
-                    : ['（无）']),
-                  '',
-                  '== 自上次同步以来的提交 ==',
-                  ...commitLines,
-                  '',
-                  '== 变更差异（节选）==',
-                  diff.patch.slice(0, 60_000),
-                ].join('\n'),
-                provider: route.provider,
-                model: route.model,
-                maxTokens: service.liveConfig.analysisMaxTokens,
-                timeoutMs: service.liveConfig.analysisTimeoutMs,
-                purpose: 'project-control-memory-sync',
-              })
-            } catch (error: unknown) {
-              const message = error instanceof Error ? error.message : String(error)
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ ok: false, error: `同步判定失败：${message}（可重试）` }))
-              return
-            }
-            const staleProposals: Array<{ id: string; title: string; reason: string }> = []
-            const newCandidates: Array<{ type: string; title: string; content: string }> = []
-            for (const rawLine of analysis.text.split('\n')) {
-              const line = rawLine.trim()
-              if (line.startsWith('STALE |')) {
-                const parts = line.split('|').map((part) => part.trim())
-                const id = parts[1] ?? ''
-                if (activeMemories.some((memory) => memory.id === id)) {
-                  staleProposals.push({ id, title: activeMemories.find((memory) => memory.id === id)!.title, reason: parts.slice(2).join('：') || '相关代码被改动' })
-                }
-              } else if (line.startsWith('NEW |')) {
-                const parts = line.split('|').map((part) => part.trim())
-                if (parts.length >= 4 && parts[2] !== '') {
-                  newCandidates.push({ type: parts[1] ?? 'project_log', title: parts[2]!, content: parts.slice(3).join('：') })
-                }
-              }
-            }
-            // 自动续命：未被判定失效的记忆刷新验证基线（fact 级判定，无需人工确认）。
-            const renewedIds = activeMemories.filter((memory) => !staleProposals.some((proposal) => proposal.id === memory.id)).map((memory) => memory.id as never)
-            const renewed = await service.memoryService.renewBaseline(renewedIds, headSha)
-            for (const candidate of newCandidates.slice(0, 5)) {
-              await service.memoryService.recordMemory({
-                projectId: pid as never,
-                type: (['architecture_decision', 'pattern_rule', 'risk_hotspot'].includes(candidate.type) ? candidate.type : 'project_log') as never,
-                truthLevel: 'inferred' as never,
-                title: candidate.title,
-                content: candidate.content,
-                sourceTag: 'sync',
-                basisSha: headSha,
-                gitBranch: branch,
-                tags: ['sync'],
-              })
-            }
-            const now = Date.now()
-            await service.store.memoryBaselines.save({ id: baselineId, projectId: pid as never, branch, lastSyncedSha: headSha, updatedAt: now } as never)
+            const outcome = await runMemorySync(ctx, service, project)
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({
-              ok: true,
-              behindCount: commitLines.length,
-              staleProposals,
-              renewed,
-              newCandidates: newCandidates.slice(0, 5),
-              verdict: `同步完成：${commitLines.length} 个新提交；${staleProposals.length} 条疑似过期待复核；新增 ${Math.min(newCandidates.length, 5)} 条候选；${renewed} 条自动续命。`,
-            }))
+            res.end(JSON.stringify(outcome))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -2906,7 +2976,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               return
             }
             const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
-            const type = typeof body['type'] === 'string' && ['run', 'review', 'summary'].includes(body['type']) ? body['type'] : ''
+            const type = typeof body['type'] === 'string' && ['run', 'review', 'summary', 'sync'].includes(body['type']) ? body['type'] : ''
             const intervalMinutes = Number(body['intervalMinutes'])
             if (name === '' || type === '' || !Number.isFinite(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 43200) {
               res.writeHead(400, { 'content-type': 'application/json' })

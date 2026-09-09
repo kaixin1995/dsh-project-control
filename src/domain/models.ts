@@ -328,7 +328,7 @@ export interface MemoryBaselineRecord {
 // -----------------------------------------------------------------------------
 // 11. 例行任务：模板 + 定时触发
 // -----------------------------------------------------------------------------
-export type ScheduledTaskType = 'run' | 'review' | 'summary'
+export type ScheduledTaskType = 'run' | 'review' | 'summary' | 'sync'
 
 export interface ScheduledTaskRecord {
   id: string

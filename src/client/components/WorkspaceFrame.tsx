@@ -167,6 +167,19 @@ interface PlanConfirmStep {
   modelId: string
 }
 
+/** POST /peek 的载荷（代码上下文浮层）。 */
+interface PeekPayload {
+  exists: boolean
+  path?: string
+  startLine?: number
+  endLine?: number
+  totalLines?: number
+  lines?: Array<{ n: number; text: string }>
+}
+
+/** 从自由文本中识别 file:line 引用（含 file:line-line 区间取起始行）。 */
+const FILE_LINE_PATTERN = /((?:[\w.-]+[/\\])*[\w.-]+\.[A-Za-z]{1,4}):(\d{1,5})(?:-\d{1,5})?/g
+
 /** GET /runs/detail 的载荷。 */
 interface RunDetail {
   run: { id: string; changeId: string; changeTitle: string; status: string; pausePoint: { stepId: string; reason: string; at: number } | null; error: { message: string } | null; startedAt: number | null; finishedAt: number | null }
@@ -352,10 +365,40 @@ function renderStructuredContent(content: string): React.ReactNode[] {
       )
     }
     if (line.startsWith('- ')) {
-      return <div key={index} style={{ paddingLeft: 14, textIndent: -10 }}>• {line.slice(2)}</div>
+      return <div key={index} style={{ paddingLeft: 14, textIndent: -10 }}>• {renderWithPeek(line.slice(2))}</div>
     }
-    return <div key={index}>{line === '' ? '\u00A0' : line}</div>
+    return <div key={index}>{line === '' ? '\u00A0' : renderWithPeek(line)}</div>
   })
+}
+
+/** peek 点击回调：由 WorkspaceFrame 注入（渲染器保持模块级纯函数）。 */
+let peekOpener: ((path: string, line: number) => void) | undefined
+
+/** 把文本中的 file:line 引用渲染为可点击芯片（点击弹出代码上下文）。 */
+function renderWithPeek(text: string): React.ReactNode {
+  const nodes: React.ReactNode[] = []
+  let last = 0
+  let match: RegExpExecArray | null
+  FILE_LINE_PATTERN.lastIndex = 0
+  while ((match = FILE_LINE_PATTERN.exec(text)) !== null) {
+    if (match.index > last) nodes.push(text.slice(last, match.index))
+    const [full, path, lineStr] = match
+    nodes.push(
+      <button
+        key={`${match.index}-${full}`}
+        style={{
+          background: 'none', border: 'none', padding: '0 1px', cursor: 'pointer',
+          fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)',
+          fontSize: 'inherit', color: 'var(--dsw-alias-brand-primary, #2563eb)', textDecoration: 'underline dotted',
+        }}
+        title="点击查看代码上下文"
+        onClick={() => { peekOpener?.(path, Number(lineStr)) }}
+      >{full}</button>,
+    )
+    last = match.index + full.length
+  }
+  if (last < text.length) nodes.push(text.slice(last))
+  return nodes.length === 1 ? nodes[0] : <span>{nodes}</span>
 }
 
 /**
@@ -1352,6 +1395,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [aiSummarizing, setAiSummarizing] = useState(false)
   const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number } | null>(null)
   const [narrativeBusy, setNarrativeBusy] = useState(false)
+  const [peek, setPeek] = useState<{ path: string; line: number } | null>(null)
+  const [peekData, setPeekData] = useState<PeekPayload | null>(null)
+  const [peekBusy, setPeekBusy] = useState(false)
   const [narrativeError, setNarrativeError] = useState('')
   const [modelTiers, setModelTiers] = useState<Record<string, { provider: string; model: string }> | null>(null)
   const [modelOptions, setModelOptions] = useState<Array<{ provider: string; id: string; name: string }>>([])
@@ -1386,6 +1432,30 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     })
     const data: unknown = await response.json()
     return { ok: response.ok, data: (data ?? {}) as Record<string, unknown> }
+  }
+
+  /** peek：打开某文件某行附近的代码上下文浮层（有界等待 10 秒）。 */
+  peekOpener = (path: string, line: number): void => { void openPeek(path, line) }
+  const openPeek = async (path: string, line: number): Promise<void> => {
+    setPeek({ path, line })
+    setPeekData(null)
+    setPeekBusy(true)
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 10_000)
+      const response = await fetch('/project-control/api/peek', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path, line, sessionId: props.sessionId }),
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      const data: unknown = await response.json()
+      if (response.ok) setPeekData(data as PeekPayload)
+    } catch {
+      setPeekData({ exists: false })
+    } finally {
+      setPeekBusy(false)
+    }
   }
 
   /** 工作轮次叙事：多个选中提交作为一个整体解读（缓存 + 可强制重新生成）。 */
@@ -2207,7 +2277,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 {d.analysis.risks.length > 0 && (
                   <>
                     <div style={{ ...styles.sectionTitle, marginTop: '6px' }}>{t('detail.risk')}</div>
-                    {d.analysis.risks.map((risk, i) => <div key={i} style={styles.riskItem}>⚠ {risk}</div>)}
+                    {d.analysis.risks.map((risk, i) => <div key={i} style={styles.riskItem}>⚠ {renderWithPeek(risk)}</div>)}
                   </>
                 )}
                 {/* 文件清单 + 逐文件高亮对比 */}
@@ -2321,7 +2391,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                           <div key={i} style={{ ...styles.logicStep, marginTop: '3px' }}>
                             <span style={{ color: '#d97706' }}>↳</span>
                             <span style={{ fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>
-                              {caller.file}:{caller.line}
+                              <span style={{ cursor: 'pointer', textDecoration: 'underline dotted' }} onClick={() => { void openPeek(caller.file, Number(caller.line)) }}>{caller.file}:{caller.line}</span>
                             </span>
                             <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>— {caller.snippet.slice(0, 80)}</span>
                           </div>
@@ -2782,6 +2852,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             <option value="review">{t('sched.typeReview')}</option>
             <option value="summary">{t('sched.typeSummary')}</option>
             <option value="run">{t('sched.typeRun')}</option>
+            <option value="sync">{t('sched.typeSync')}</option>
           </select>
           <input style={{ ...styles.input, width: 120 }} placeholder={t('sched.formInterval')} value={schedInterval} onChange={(e) => { setSchedInterval(e.target.value) }} />
           {schedType === 'run' && (
@@ -3197,7 +3268,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                       </div>
                     </div>
                     {description !== '' && (
-                      <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{description}</div>
+                      <div style={{ ...styles.noteContent, ...(long && !expanded ? styles.noteClamp : {}) }}>{renderWithPeek(description)}</div>
                     )}
                     {issue.resolution ? (
                       <div style={{ marginTop: '6px', padding: '6px 10px', borderRadius: '6px', background: 'rgba(78, 201, 176, 0.08)', border: '1px solid rgba(78, 201, 176, 0.35)', fontSize: '11px', color: 'var(--dsw-alias-label-primary, #1f2328)' }}>
@@ -3235,7 +3306,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                                     </div>
                                     {entry.callers.slice(0, 5).map((caller, callerIndex) => (
                                       <div key={callerIndex} style={{ fontSize: '10px', color: 'var(--dsw-alias-label-secondary, #6b7280)', paddingLeft: '12px' }}>
-                                        {caller.file}:{caller.line} {caller.snippet.slice(0, 80)}
+                                        <span style={{ cursor: 'pointer', textDecoration: 'underline dotted' }} onClick={() => { void openPeek(caller.file, Number(caller.line)) }}>{caller.file}:{caller.line}</span> {caller.snippet.slice(0, 80)}
                                       </div>
                                     ))}
                                   </div>
@@ -3342,6 +3413,28 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           onCancel={() => { setConfirmDialog(null) }}
           onConfirm={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }}
         />
+      )}
+      {peek !== null && (
+        <div data-testid="pc-peek-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', backdropFilter: 'blur(2px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => { setPeek(null) }}>
+          <div data-testid="pc-peek-card" style={{ width: 'min(760px, 92vw)', maxHeight: '80vh', overflow: 'hidden', borderRadius: '10px', background: 'var(--dsw-alias-bg-base, #fff)', boxShadow: '0 16px 48px rgba(0,0,0,0.25)', display: 'flex', flexDirection: 'column' }} onClick={(e) => { e.stopPropagation() }}>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))' }}>
+              <span style={{ fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)', fontSize: '12px', fontWeight: 600, wordBreak: 'break-all' }}>{peek.path}:{String(peek.line)}</span>
+              {peekData?.exists === true && <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{String(peekData.startLine)}–{String(peekData.endLine)} / {String(peekData.totalLines)} 行</span>}
+              <span style={{ flex: 1 }} />
+              <button style={{ ...styles.secondary, padding: '2px 10px' }} onClick={() => { setPeek(null) }}>✕</button>
+            </div>
+            <div style={{ overflow: 'auto', padding: '10px 0', background: 'var(--dsw-alias-bg-inset, rgba(5,5,5,0.03))' }}>
+              {peekBusy && <div style={{ ...styles.empty }}>读取中…</div>}
+              {!peekBusy && peekData !== null && peekData.exists === false && <div style={styles.empty}>文件不存在（可能已被删除或移动）</div>}
+              {!peekBusy && peekData?.exists === true && (peekData.lines ?? []).map((entry) => (
+                <div key={entry.n} style={{ display: 'flex', gap: '10px', padding: '0 14px', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)', fontSize: '11.5px', lineHeight: 1.7, background: entry.n === peek.line ? 'rgba(37,99,235,0.08)' : 'transparent' }}>
+                  <span style={{ width: 40, textAlign: 'right', color: 'var(--dsw-alias-label-secondary, #6b7280)', flexShrink: 0 }}>{String(entry.n)}</span>
+                  <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{entry.text === '' ? '\u00A0' : entry.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

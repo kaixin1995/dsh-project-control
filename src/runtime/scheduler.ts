@@ -56,7 +56,7 @@ export class ScheduledTaskRunner {
   async executeTask(task: {
     id: string
     projectId: string
-    type: 'run' | 'review' | 'summary'
+    type: 'run' | 'review' | 'summary' | 'sync'
     title?: string
     description?: string
   }): Promise<string> {
@@ -89,6 +89,11 @@ export class ScheduledTaskRunner {
         total += outcome.issuesFound
       }
       return `已评审 ${shas.length} 个提交，新增问题 ${total} 条`
+    }
+    if (task.type === 'sync') {
+      const { runMemorySync } = await import('../plugin/api-route.ts')
+      const outcome = await runMemorySync(this.ctx, this.service, project)
+      return outcome.ok === true ? String(outcome.verdict ?? '记忆同步完成') : `记忆同步失败：${String(outcome.error ?? '')}`
     }
     const summary = await runIncrementalAiSummary(this.ctx, this.service, project)
     return summary.ok ? `AI 总结完成${summary.updated === true ? '（增量更新）' : ''}` : `AI 总结失败：${summary.error ?? ''}`

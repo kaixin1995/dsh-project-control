@@ -11,6 +11,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { normalize as normalizePosix } from 'node:path'
 import { ProjectControlService, apply as serviceApply } from './plugin/service.ts'
 import { apply as toolsApply, registerTools } from './plugin/tools.ts'
 import { apply as commandsApply, registerCommands } from './plugin/commands.ts'
@@ -76,6 +77,27 @@ export function apply(ctx: Context, config: ProjectControlConfig = {}): void {
       '- For multi-step work, create a plan first; execute it with start_run so progress is tracked and verified.',
       '- Never call confirm_memory yourself: only the developer confirms memory items.',
     ].join('\n'),
+  })
+
+  // 聊天约束事前告知：按会话工作目录匹配项目，把生效的禁改清单注入系统提示
+  // （与执行中心同源同规则；拦截守卫仍是兜底）。AssembleContext 由 dispatch 扩展携带 agent。
+  ctx.systemPrompt?.section?.({
+    name: 'project-control:constraints',
+    order: 3001,
+    text: (context: { agent?: { session?: { header?: { cwd?: string } } } }) => {
+      const cwd = context.agent?.session?.header?.cwd
+      if (typeof cwd !== 'string' || cwd === '' || service.store === undefined) return ''
+      const normalize = (value: string): string => normalizePosix(value).replaceAll('\\', '/').replace(/\/+$/, '')
+      const project = service.store.projects.list().find((candidate) => normalize(candidate.identity.rootPath) === normalize(cwd))
+      if (project === undefined) return ''
+      const active = (service.store.confirmed.list() as Array<{ projectId?: string; status?: string; text?: string; forbiddenPaths?: string[] }>)
+        .filter((item) => item.projectId === project.id && item.status === 'active' && (item.forbiddenPaths ?? []).length > 0)
+      if (active.length === 0) return ''
+      return [
+        'Confirmed constraints (developer-confirmed; writes to these paths WILL BE REJECTED):',
+        ...active.map((item) => `- 「${item.text ?? ''}」禁止修改：${(item.forbiddenPaths ?? []).join(', ')}`),
+      ].join('\n')
+    },
   })
 
   registerTools(ctx)
