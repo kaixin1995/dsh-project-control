@@ -18,7 +18,7 @@
 export function parseColor(color: string): [number, number, number] | null {
   const hex = /^#([0-9a-f]{6})$/i.exec(color)
   if (hex !== null) {
-    const value = Number.parseInt(hex[1], 16)
+    const value = Number.parseInt(hex[1]!, 16)
     return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
   }
   const functional = /^rgba?\(\s*(\d{1,3})[,\s]+(\d{1,3})[,\s]+(\d{1,3})/i.exec(color)

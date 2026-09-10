@@ -470,6 +470,8 @@ export async function executeReviewForTarget(
   const reviewSha = target !== 'working' ? target : undefined
   const diff = reviewSha !== undefined
     ? await service.git.getDiff(cwd, { from: `${reviewSha}^`, to: reviewSha, maxBytes: 200 * 1024 })
+      // 根提交没有父提交：与空树比对。
+      .catch(() => service.git.getDiff(cwd, { from: '4b825dc642cb6eb9a060e54bf8d69288fbee4904', to: reviewSha, maxBytes: 200 * 1024 }))
     : await service.git.getDiff(cwd)
   if (diff.filesChanged === 0) {
     return { issuesFound: 0, issues: reviewSha !== undefined ? '该提交无差异内容。' : '工作区无改动，无可评审内容。', verdict: '', issueList: [], cached: false }
@@ -1731,6 +1733,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const diff = isWorking
               ? await service.git.getDiff(cwd, { from: 'HEAD', maxBytes: 200 * 1024 })
               : await service.git.getDiff(cwd, { from: `${sha}^`, to: sha, maxBytes: 200 * 1024 })
+                // 根提交没有父提交：与空树比对（与上方 numstat 同规则）。
+                .catch(() => service.git.getDiff(cwd, { from: '4b825dc642cb6eb9a060e54bf8d69288fbee4904', to: sha, maxBytes: 200 * 1024 }))
             let commitMeta: { message: string; author: string; date: number } | undefined
             if (!isWorking) {
               const show = await service.git.runGit(['show', '-s', '--format=%an%x1f%at%x1f%s', sha], cwd).catch(() => '')
