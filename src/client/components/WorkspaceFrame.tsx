@@ -1966,6 +1966,14 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       ?.style.setProperty('grid-template-columns', sidebarW + 'px minmax(0, 1fr) ' + chatPx + 'px', 'important')
   }
 
+  /** 收起态模板：第三列（官方详情）0px——工作台关闭后右侧只允许聊天（业主规则）。 */
+  const collapseFrameTemplate = (): void => {
+    const sidebar = document.querySelector('div[class*="sidebarCol"]')
+    const sidebarW = sidebar ? Math.max(56, Math.round(sidebar.getBoundingClientRect().width)) : 280
+    document.querySelector('div[class*="frame"][style*="grid-template-columns"]')
+      ?.style.setProperty('grid-template-columns', sidebarW + 'px minmax(0, 1fr) 0px', 'important')
+  }
+
   // 聊天列宽记忆（官方 layout store 瞬态）：挂载恢复 + 拖拽直写内联模板。
   // 必须写 important——LAYOUT_STYLE 的模板规则也是 important，非 important
   // 内联会被它压制（这就是此前"拖拽生效、刷新后记忆丢失"的原因）。
@@ -1974,11 +1982,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   useEffect(() => {
     const saved = Number(localStorage.getItem('pc.chatWidth') ?? '')
     const apply = (): void => {
-      const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]') as HTMLElement | null
-      // 仅当内联模板不是我们的 important 声明时写入：官方 React 重渲染会把
-      // 内联改回非 important（此时样式表规则接管、聊天宽回落 360），观察器
-      // 随即重写夺回；我们自己的写入保持 important，不再触发下一轮。
-      if (frame === null || frame.style.getPropertyPriority('grid-template-columns') === 'important') return
+      // 挂载/官方重渲染时无条件夺回模板（important 覆写；值相同时官方样式变更
+      // 不会触发新的 mutation，无回环）。工作台开着 = 右列聊天固定宽。
       const chatW = Number.isFinite(saved) && saved >= 280 ? saved : 360
       frameTemplateSet(chatW)
     }
@@ -1986,7 +1991,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     const frame = document.querySelector('div[class*="frame"][style*="grid-template-columns"]')
     const observer = new MutationObserver(() => { apply() })
     if (frame !== null) observer.observe(frame, { attributes: true, attributeFilter: ['style'] })
-    return () => { observer.disconnect() }
+    return () => {
+      observer.disconnect()
+      // 工作台卸载：写入收起态模板（第三列 0px）——业主规则：工作台关 → 右侧只允许
+      // 聊天。不能删除内联属性（官方 React 不会主动补写，会导致主区空白）；
+      // 官方「详情」面板虽回到该列但 0 宽不可见（0.1.2 实测回归）。
+      collapseFrameTemplate()
+    }
   }, [])
 
   /** 分隔条拖拽：调整聊天列宽（工作台吸收剩余空间），写入 localStorage 记忆。 */

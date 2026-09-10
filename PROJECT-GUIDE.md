@@ -1,7 +1,7 @@
 # dsh-project-control 项目全量指南（新会话必读）
 
 > **目的**：新 AI 会话打开本文件即可完整接手项目——背景、铁律、架构、函数级地图、数据模型、API 清单、构建/测试/发布流程、已验证事实、未完成事项，全部在此。
-> **最后更新**：2026-09-10 · 版本 v0.3.4 · 87/87 测试绿
+> **最后更新**：2026-09-10 · 版本 v0.3.5 · 87/87 测试绿
 
 ---
 
@@ -15,7 +15,7 @@
 代码变化 → 功能变化 → 影响范围 → 方案核查 → 复检闭环 → 执行控制 → 项目记忆 → 学习笔记
 ```
 
-GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开，他人可 `dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.4` 安装）。
+GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开，他人可 `dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.5` 安装）。
 
 ---
 
@@ -71,7 +71,7 @@ GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开
 dsh-project-insight/              ← 独立 git 仓库（peer 于本体 packages）
 ├── cordis.yml                    ← 开发 overlay（file:// 直载 ts 源码，Windows 路径必须 file:// URL）
 ├── cordis.patch.yml              ← 用户 patch 层示例
-├── package.json                  ← v0.3.4；files:[lib,cordis.yml,cordis.patch.yml,README.md]；无 prepare（lib 预构建随仓库）
+├── package.json                  ← v0.3.5；files:[lib,cordis.yml,cordis.patch.yml,README.md]；无 prepare（lib 预构建随仓库）
 ├── build.mjs / build-client.mjs  ← esbuild 构建（host lib/index.js + client lib/client.js，包裹 __ModuleLoader__ 工厂）
 ├── vitest.config.ts              ← alias zod/react 到本体 .pnpm；include tests/**/*.spec.ts
 ├── PROJECT-GUIDE.md              ← 本文件
