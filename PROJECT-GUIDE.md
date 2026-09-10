@@ -1,7 +1,7 @@
 # dsh-project-control 项目全量指南（新会话必读）
 
 > **目的**：新 AI 会话打开本文件即可完整接手项目——背景、铁律、架构、函数级地图、数据模型、API 清单、构建/测试/发布流程、已验证事实、未完成事项，全部在此。
-> **最后更新**：2026-09-10 · 版本 v0.3.1 · 84/84 测试绿
+> **最后更新**：2026-09-10 · 版本 v0.3.2 · 87/87 测试绿
 
 ---
 
@@ -15,7 +15,7 @@
 代码变化 → 功能变化 → 影响范围 → 方案核查 → 复检闭环 → 执行控制 → 项目记忆 → 学习笔记
 ```
 
-GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开，他人可 `dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.1` 安装）。
+GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开，他人可 `dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.2` 安装）。
 
 ---
 
@@ -71,7 +71,7 @@ GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开
 dsh-project-insight/              ← 独立 git 仓库（peer 于本体 packages）
 ├── cordis.yml                    ← 开发 overlay（file:// 直载 ts 源码，Windows 路径必须 file:// URL）
 ├── cordis.patch.yml              ← 用户 patch 层示例
-├── package.json                  ← v0.3.1；files:[lib,cordis.yml,cordis.patch.yml,README.md]；无 prepare（lib 预构建随仓库）
+├── package.json                  ← v0.3.2；files:[lib,cordis.yml,cordis.patch.yml,README.md]；无 prepare（lib 预构建随仓库）
 ├── build.mjs / build-client.mjs  ← esbuild 构建（host lib/index.js + client lib/client.js，包裹 __ModuleLoader__ 工厂）
 ├── vitest.config.ts              ← alias zod/react 到本体 .pnpm；include tests/**/*.spec.ts
 ├── PROJECT-GUIDE.md              ← 本文件
@@ -351,7 +351,7 @@ ConfirmedItemRecord{id,projectId,type,forbiddenPaths[],status,createdAt}   ← �
 ```sh
 cd D:\Code\deepseek-harness\dsh-project-insight
 pnpm run build        # build.mjs(host lib/index.js) + build-client.mjs(lib/client.js)；esbuild 不查类型
-pnpm test             # vitest 26 文件 84 测试（无 key 也全跑；内存库+临时 git 仓）
+pnpm test             # vitest 27 文件 87 测试（无 key 也全跑；内存库+临时 git 仓+真 json 后端）
 pnpm run typecheck    # tsc --noEmit（react/vendor/analysis 三处有既有基线噪音，见 §11）
 ```
 
@@ -393,6 +393,7 @@ node "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/l
 | LLM 网关偶发挂起 | 静默 180s 判停滞进重试；所有等待必须有界（AbortController+固定轮数） |
 | run 终态是 succeeded 不是 completed | UI 双名兼容；写代码用 succeeded |
 | 单写者存储 | 永远单实例；并发实例会损坏数据 |
+| **存储键必须路径安全（json 后端断言 `/^[A-Za-z0-9_-]+$/`）** | LLM 缓存键/记忆基线键曾含 `:` `/` `\|`，写入即 assertSafeKey 抛未捕获异常 fatal 掉整个 dsh（2026-09-10 业主另一台机器崩溃 + 本机潜伏 54 条毒键）。修复：所有复合键经 `safeStorageId()`（sha256 hex，src/store/repository.ts）摘要；`void save()` 一律带 `.catch`。收尾守卫：grep `.save({ id:` 不得出现裸模板键。已中毒的存储文件需停机清理（删键或直接删 analysis 文件——纯可再生缓存） |
 | 验收(verification)角色是只读 | 真值校验豁免（analysis/planning/verification），coding/ops 才要求改码 |
 | 演示用临时仓 | `D:\dev-tmp\pc-e2e-demo`（含两次全绿 Run 与提炼记忆，可给业主演示；不需要可删） |
 
@@ -414,6 +415,6 @@ node "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/l
 
 1. 读本文件 + `AGENTS.md`（工程铁律细节）+ `README.md`（对外说明）
 2. `git -C D:\Code\deepseek-harness status --short | wc -l` 必须为 0（本体零改动）
-3. `pnpm test` 确认 84/84
+3. `pnpm test` 确认 87/87
 4. 业主提需求 → 对照 §3 确认是否已实现 → 开发（补丁方法论 §2.10）→ 构建 → 测试 → **有界**线上验证 → 重启（§10）→ 验证无问题后一次提交（§2.2）
 5. 永远不要：改本体、无限等待、频繁碎提交、:has()、新增会话事件、并发第二实例

@@ -6,6 +6,7 @@
  */
 
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
+import { createHash } from 'node:crypto'
 import type {
   ProjectId,
   ChangeId,
@@ -37,6 +38,19 @@ import type {
 
 export interface EntityWithProject {
   projectId: ProjectId
+}
+
+/**
+ * 存储键安全化：storage-json 后端要求 key 满足 /^[A-Za-z0-9_-]+$/（键会成为
+ * 磁盘文件路径段），不安全键在写入时断言抛异常——而 `void save()` 的未处理
+ * 拒绝会 fatal 掉整个 dsh 进程（2026-09-10 业主另一台机器 + 本机潜伏事故：
+ * LLM 缓存键含 `:` `/` `|`，记忆基线键含 `|`）。
+ * 业务天然键统一经此摘要为 64 位十六进制物理键；原始键随记录体保存（rawKey
+ * 字段）便于排查。所有新增存储键必须先过本函数——收尾守卫：全库 grep
+ * `.save({ id:` 确认无裸模板键。
+ */
+export function safeStorageId(rawKey: string): string {
+  return createHash('sha256').update(rawKey).digest('hex')
 }
 
 export class DomainRepository<T extends { id: string }, ID extends string = string> {

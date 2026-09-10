@@ -36,6 +36,7 @@ import { DeterministicBuildVerifier, UnitTestVerifier, EvidenceDiffVerifier, Llm
 import { VerificationRunner } from '../verification/service.ts'
 import type { IssueSeverity, ProjectRecord } from '../domain/models.ts'
 import { resolveDeploymentRoute } from '../config.ts'
+import { safeStorageId } from '../store/repository.ts'
 import type { ProjectControlService } from './service.ts'
 
 export const name = 'project-control-api'
@@ -225,25 +226,26 @@ function extractChangedSymbols(patch: string): string[] {
  */
 const PROMPT_VERSION = 1
 
-/** 读取一条持久化缓存（不存在返回 undefined）。 */
+/** 读取一条持久化缓存（不存在返回 undefined）。物理键经 safeStorageId 摘要（storage-json 要求路径安全键）。 */
 function cacheRead(service: ProjectControlService, key: string): { payload: Record<string, unknown>; createdAt: number } | undefined {
-  const record = service.store?.snapshots?.get(key)
+  const record = service.store?.snapshots?.get(safeStorageId(key))
   if (record === undefined) return undefined
   return { payload: (record['payload'] ?? {}) as Record<string, unknown>, createdAt: Number(record['createdAt'] ?? 0) }
 }
 
-/** 写入一条持久化缓存并触发容量清理；返回生成时间。 */
+/** 写入一条持久化缓存并触发容量清理；返回生成时间。写入失败只记日志不抛出（防未处理拒绝 fatal 掉 dsh）。 */
 function cacheWrite(service: ProjectControlService, key: string, kind: string, payload: Record<string, unknown>): number {
   if (service.store?.snapshots === undefined) return Date.now()
   const createdAt = Date.now()
-  void service.store.snapshots.save({ id: key, kind, payload, createdAt })
+  void service.store.snapshots.save({ id: safeStorageId(key), key, kind, payload, createdAt })
+    .catch((error: unknown) => console.error('[pc] analysis cache write failed:', error))
   // 淘汰成本取舍：写入频率是"每次 LLM 分析"（分钟级），超限才排序 ≤401 个元素（微秒级），
   // 简单全量排序优于维护时间链表的复杂度。
   const all = service.store.snapshots.list()
   if (all.length > 400) {
     const ordered = [...all].sort((left, right) => Number(left['createdAt'] ?? 0) - Number(right['createdAt'] ?? 0))
     for (const record of ordered.slice(0, all.length - 400)) {
-      void service.store.snapshots.delete(String(record['id'] ?? ''))
+      void service.store.snapshots.delete(String(record['id'] ?? '')).catch(() => {})
     }
   }
   return createdAt
@@ -318,6 +320,7 @@ function readHistoryCursor(service: ProjectControlService): { lastCommit?: strin
 /** 写历史扫描游标。 */
 function writeHistoryCursor(service: ProjectControlService, lastCommit: string, processedCount: number): void {
   void service.store?.historyCursor?.save({ id: 'cursor', lastCommit, processedCount })
+    .catch((error: unknown) => console.error('[pc] history cursor write failed:', error))
 }
 
 /** 从请求体取出会话 id（工作台按钮都会携带），并反查该会话的工作目录。 */
@@ -715,7 +718,7 @@ export async function runMemorySync(
             const status = await service.git.getStatus(cwd)
             const branch = status.branch ?? 'HEAD'
             const headSha = status.headSha
-            const baselineId = `${pid}|${branch}`
+            const baselineId = safeStorageId(`${pid}|${branch}`)
             const baseline = service.store.memoryBaselines.get(baselineId)
             const baseSha = baseline?.lastSyncedSha
             const log = baseSha === undefined
@@ -2891,7 +2894,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }))
           const baseline = branch === undefined || pid === undefined
             ? null
-            : (service.store?.memoryBaselines.get(`${pid}|${branch}`) ?? null)
+            : (service.store?.memoryBaselines.get(safeStorageId(`${pid}|${branch}`)) ?? null)
           const headSha = cwd === undefined ? null : await service.git.getHeadSha(cwd).catch(() => undefined) ?? null
           const behindCount = baseline?.lastSyncedSha !== undefined && headSha !== null && baseline.lastSyncedSha !== headSha
             ? await service.git.runGit(['rev-list', '--count', `${baseline.lastSyncedSha}..HEAD`], cwd).then((out) => Number(out.trim())).catch(() => 0)

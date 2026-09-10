@@ -317,7 +317,7 @@ export interface RunContextRecord {
 // 10. 记忆基线：每项目每分支的拉取同步游标
 // -----------------------------------------------------------------------------
 export interface MemoryBaselineRecord {
-  /** `${projectId}|${branch}`。 */
+  /** safeStorageId(`${projectId}|${branch}`)——物理键必须路径安全（storage-json 断言），原始键见派生处。 */
   id: string
   projectId: ProjectId
   branch: string

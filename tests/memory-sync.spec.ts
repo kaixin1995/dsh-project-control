@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { runMemorySync } from '../src/plugin/api-route.ts'
+import { safeStorageId } from '../src/store/repository.ts'
 import { GitAdapter } from '../src/git/adapter.ts'
 import type { ProjectRecord } from '../src/domain/models.ts'
 import type { ProjectControlService } from '../src/plugin/service.ts'
@@ -35,7 +36,7 @@ describe('runMemorySync 共用核心（早退路径）', () => {
       memoryService: {},
       store: {
         memoryBaselines: {
-          get: (id: string) => id === 'p1|main'
+          get: (id: string) => id === safeStorageId('p1|main')
             ? { id, projectId: 'p1', branch: 'main', lastSyncedSha: headSha, updatedAt: Date.now() }
             : undefined,
         },
