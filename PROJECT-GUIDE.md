@@ -369,7 +369,9 @@ node "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/l
 # 等 /state ready:true
 ```
 
-业主的 `启动DSH.ps1` 会先杀全部 dsh（包括我们的后台实例）——收到 background task failed 通知是**预期**，重启即可。浏览器验证可用 computer-use（Cent Browser pid 变化，地址 127.0.0.1:3080，cookie 已认证），但**不要打扰业主正在用的窗口**。
+业主的 `启动DSH.ps1` 会先杀全部 dsh（包括我们的后台实例）——收到 background task failed 通知是**预期**，重启即可。浏览器验证可用 computer-use（Cent Browser pid 变化，地址 127.0.0.1:3080，cookie 已认证）或 ZCode 内置浏览器（browser-use 技能，自带实例零打扰；IAB 在 localhost 可直接打开），但**不要打扰业主正在用的窗口**。
+
+**0.1.2-rc.1 起 web 面有认证墙**（2026-09-10 升级，业主确认保留）：`GET /` 返回 303「authentication required」；启动日志打印一次性 `http://127.0.0.1:3080/?token=...`（每次启动随机生成）。打开一次该 URL 即换取 **30 天有效、跨重启存活**的 cookie（签名密钥持久，已实测）——业主书签每月开一次新 token URL 即可。命令行验证页面：`curl -c ck.txt "http://127.0.0.1:3080/?token=..." -o /dev/null && curl -b ck.txt http://127.0.0.1:3080/`。注意：`/project-control/api/*` 插件路由**不受**认证墙影响（curl 可直接访问），别把 API 通误判为页面可打开。
 
 ---
 

@@ -75,6 +75,10 @@
 - 本体压缩功能依赖模型 contextWindow 元数据：自定义路由缺 `contextWindow` 时自动压缩静默失效（只 warn 一次），详见本体根 `AGENT_PROJECT_GUIDE.md` 的排错记录。
 - 本体资料总览见 `../AGENT_PROJECT_GUIDE.md`（本体根目录的本地未跟踪文件）。
 
+**0.1.2-rc.1 升级事实（2026-09-10 业主确认保留升级，不回滚）**
+- web 面新增认证墙：`GET /` 303「authentication required」，启动日志打印一次性 `?token=` URL（每次启动随机）；打开一次换 **30 天 cookie，签名密钥持久 → cookie 跨重启有效（实测）**，业主书签每月开一次新 token URL 即可。
+- `/project-control/api/*` 插件路由不受墙影响（curl 直接可用）；验证 web 页面须先 `curl -c ck.txt "?token=..."` 换 cookie。插件 v0.3.0 在 0.1.2-rc.1 验证通过（API ready + client bundle 进启动图）。
+
 **rc.2 全局 CLI 运行时事实（2026-08-30 真机验证）**
 - `ctx.plugin(fn)` 挂载函数子插件时**不识别 fn 的 `inject` 导出**，子 fiber 内读取未声明服务会抛 `cannot get property without inject` 且被静默吞掉 → bundle 入口（index.ts）**内联注册全部能力**，服务经闭包传递；子入口文件的 apply 仅保留给 Loader 行挂载（Loader 行会正常识别 inject）。
 - 0.1.1 起 storage 栈（storage/storage-json/storage-domain）只在 web / sdk 面 mount，headless 没有 → 插件对 storageDomain / webServer 一律用 `ctx.inject([...], cb)` 动态可选注入，静默降级。
