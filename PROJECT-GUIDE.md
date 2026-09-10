@@ -71,6 +71,7 @@ dsh-project-insight/              ← 独立 git 仓库（peer 于本体 package
 ├── build.mjs / build-client.mjs  ← esbuild 构建（host lib/index.js + client lib/client.js，包裹 __ModuleLoader__ 工厂）
 ├── vitest.config.ts              ← alias zod/react 到本体 .pnpm；include tests/**/*.spec.ts
 ├── PROJECT-GUIDE.md              ← 本文件
+├── docs/REQUIREMENTS-LOG.md      ← 业主全部原始需求编年记录（63 条 + 五句关键原话 + 七条规矩）
 ├── docs/                         ← 产品总纲、V1.0 技术设计（工程权威）、design-scope/v04-mapping（历史参考）
 │                                   （development-plan.md 与 SESSION-HANDOFF.md 已按业主要求删除）
 ├── lib/                          ← 预构建产物，随 git 提交（远端机器无法本地构建——vendor 别名是机器本地）
