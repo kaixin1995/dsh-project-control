@@ -1,7 +1,7 @@
 # dsh-project-control 项目全量指南（新会话必读）
 
 > **目的**：新 AI 会话打开本文件即可完整接手项目——背景、铁律、架构、函数级地图、数据模型、API 清单、构建/测试/发布流程、已验证事实、未完成事项，全部在此。
-> **最后更新**：2026-09-10 · 版本 v0.3.0 · 84/84 测试绿
+> **最后更新**：2026-09-10 · 版本 v0.3.1 · 84/84 测试绿
 
 ---
 
@@ -15,7 +15,7 @@
 代码变化 → 功能变化 → 影响范围 → 方案核查 → 复检闭环 → 执行控制 → 项目记忆 → 学习笔记
 ```
 
-GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开，他人可 `dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.0` 安装）。
+GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开，他人可 `dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.1` 安装）。
 
 ---
 
@@ -57,6 +57,7 @@ GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开
 | 17 | 提交自动聚类：核查下拉按「轮次」分组（时间窗口+文件重叠），「选整轮」一键多选，未消化提交圆点标记 | ✅ |
 | 18 | 核查页 LLM 成本展示：解读/影响函数说明/最优性/轮次叙事各带 ≈$ 成本徽标（缓存命中也带生成时成本） | ✅ |
 | 19 | 笔记导出为 .md 文件（浏览器 Blob 下载，文件名按标题清洗） | ✅ |
+| 20 | AI 解读串行队列：多选/整轮批量勾选时逐个分析（不并发打满模型网关），卡片显示排队中；所有请求 180s 超时兜底，服务中断/超时写卡片错误占位而非无限转圈 | ✅ |
 
 **明确不做**：失败自动回滚 git 改动（危险）；聊天区与工作台界面层互通（低性价比）；步骤 DAG 并行、敏感步骤审批门（四期增强，未排期）；npm 发布（GitHub 安装已够用）。
 
@@ -70,7 +71,7 @@ GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开
 dsh-project-insight/              ← 独立 git 仓库（peer 于本体 packages）
 ├── cordis.yml                    ← 开发 overlay（file:// 直载 ts 源码，Windows 路径必须 file:// URL）
 ├── cordis.patch.yml              ← 用户 patch 层示例
-├── package.json                  ← v0.3.0；files:[lib,cordis.yml,cordis.patch.yml,README.md]；无 prepare（lib 预构建随仓库）
+├── package.json                  ← v0.3.1；files:[lib,cordis.yml,cordis.patch.yml,README.md]；无 prepare（lib 预构建随仓库）
 ├── build.mjs / build-client.mjs  ← esbuild 构建（host lib/index.js + client lib/client.js，包裹 __ModuleLoader__ 工厂）
 ├── vitest.config.ts              ← alias zod/react 到本体 .pnpm；include tests/**/*.spec.ts
 ├── PROJECT-GUIDE.md              ← 本文件

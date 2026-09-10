@@ -14,7 +14,7 @@
  * @module dsh-client-project-control/components/WorkspaceFrame
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { parseColor, themeAwareText } from './theme.ts'
 import { clusterIntoRounds } from './commit-rounds.ts'
 
@@ -604,6 +604,8 @@ export const WORKSPACE_DICT = {
     'detail.files': '文件清单',
     'detail.patch': '查看补丁原文',
     'detail.aiLoading': 'AI 解读生成中…（约 10-30 秒）',
+    'detail.queued': '还有 {n} 个解读排队中（自动逐个分析）',
+    'detail.cardQueued': '排队等待 AI 解读（多选时自动逐个进行，避免打满模型并发）',
     'detail.impact': '影响范围分析',
     'detail.impactLoading': '影响扫描中…（引用检索 + 图谱传播）',
     'detail.optimality': '最优性核查',
@@ -876,6 +878,8 @@ export const WORKSPACE_DICT = {
     'detail.files': 'Files',
     'detail.patch': 'Show raw patch',
     'detail.aiLoading': 'Generating AI explanation… (10-30s)',
+    'detail.queued': '{n} analyses queued (one by one)',
+    'detail.cardQueued': 'Waiting in the analysis queue (multi-select runs one by one to respect model limits)',
     'detail.impact': 'Impact scope',
     'detail.impactLoading': 'Scanning impact… (reference search + graph walk)',
     'detail.optimality': 'Optimality review',
@@ -1352,7 +1356,10 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [pickerFilter, setPickerFilter] = useState('')
   const [selectedTargets, setSelectedTargets] = useState<string[]>([])
   const [details, setDetails] = useState<Record<string, CommitDetailPayload>>({})
-  const [detailLoading, setDetailLoading] = useState(false)
+  /** 解读任务状态：queued=排队等串行队列，running=正在请求（多选/整轮时自动逐个分析）。 */
+  const [detailStatus, setDetailStatus] = useState<Record<string, 'queued' | 'running'>>({})
+  const detailQueuedCount = Object.values(detailStatus).filter((status) => status === 'queued').length
+  const detailRunningCount = Object.values(detailStatus).filter((status) => status === 'running').length
   const [impact, setImpact] = useState<ImpactScopePayload | null>(null)
   const [impactLoading, setImpactLoading] = useState(false)
   const [reviews, setReviews] = useState<Record<string, ReviewPayload>>({})
@@ -1404,14 +1411,22 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [execModel, setExecModel] = useState('')
   const [execDesc, setExecDesc] = useState('')
 
-  const post = async (path: string, body: Record<string, unknown>): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
-    const response = await fetch(path, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...body, sessionId: props.sessionId }),
-    })
-    const data: unknown = await response.json()
-    return { ok: response.ok, data: (data ?? {}) as Record<string, unknown> }
+  /** 统一 POST：带超时兜底（LLM 端点服务端 120s 会降级返回，客户端 180s 只兜底真正的网络中断），绝不让请求无限挂起。 */
+  const post = async (path: string, body: Record<string, unknown>, timeoutMs = 180_000): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...body, sessionId: props.sessionId }),
+        signal: controller.signal,
+      })
+      const data: unknown = await response.json()
+      return { ok: response.ok, data: (data ?? {}) as Record<string, unknown> }
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /** peek：打开某文件某行附近的代码上下文浮层（有界等待 10 秒）。 */
@@ -1494,7 +1509,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setImpact(null)
     setReviews({})
     if (!selectedTargets.includes(target)) {
-      await loadDetail(target, false)
+      loadDetail(target, false)
     }
   }
 
@@ -1508,36 +1523,55 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
     const added = shas.filter((sha) => !selectedTargets.includes(sha))
     setSelectedTargets((previous) => Array.from(new Set([...previous, ...shas])))
-    for (const sha of added) void loadDetail(sha, false)
+    for (const sha of added) loadDetail(sha, false)
   }
 
-  /** 拉取单条提交的 AI 解读；force=true 时绕过缓存强制重算。失败写入错误占位（卡片不崩溃）。 */
-  const loadDetail = async (target: string, force: boolean): Promise<void> => {
-    setDetailLoading(true)
+  /** 解读串行队列：模型网关并发有限，多选/整轮批量勾选时逐个出队分析，避免并发打满网关互相拖死。 */
+  const detailQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const loadDetail = (target: string, force: boolean): void => {
+    setDetailStatus((previous) => (previous[target] !== undefined ? previous : { ...previous, [target]: 'queued' }))
+    detailQueueRef.current = detailQueueRef.current
+      .then(() => loadDetailOnce(target, force))
+      .catch(() => {})
+  }
+
+  /** 队列任务体：真正发起解读请求；任何失败（网络中断/超时/服务未运行）都写入卡片错误占位，绝不无限转圈。 */
+  const loadDetailOnce = async (target: string, force: boolean): Promise<void> => {
+    setDetailStatus((previous) => ({ ...previous, [target]: 'running' }))
+    const failPlaceholder = (message: string): CommitDetailPayload =>
+      ({
+        sha: target,
+        isWorking: target === 'working',
+        files: [],
+        insertions: 0,
+        deletions: 0,
+        patchTruncated: false,
+        patch: '',
+        commit: null,
+        analysis: { what: message, logic: [], risks: [] },
+      }) as unknown as CommitDetailPayload
     try {
       const { ok, data } = await post('/project-control/api/commit-detail', { sha: target, force })
       if (!ok) {
         setDetails((previous) => ({
           ...previous,
-          [target]: {
-            sha: target,
-            isWorking: target === 'working',
-            files: [],
-            insertions: 0,
-            deletions: 0,
-            patchTruncated: false,
-            patch: '',
-            commit: null,
-            analysis: { what: 'AI 解读失败：' + String(data['error'] ?? '') + '（点「重新生成」可重试）', logic: [], risks: [] },
-          } as unknown as CommitDetailPayload,
+          [target]: failPlaceholder('AI 解读失败：' + String(data['error'] ?? '') + '（点「重新生成」可重试）'),
         }))
         return
       }
       setDetails((previous) => ({ ...previous, [target]: data as unknown as CommitDetailPayload }))
     } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : String(error))
+      const reason = error instanceof Error ? error.message : String(error)
+      setDetails((previous) => ({
+        ...previous,
+        [target]: failPlaceholder(`AI 解读失败：${reason === 'The user aborted a request.' ? '请求超时或服务中断' : reason}（检查 dsh 是否在运行；点「重新生成」可重试）`),
+      }))
     } finally {
-      setDetailLoading(false)
+      setDetailStatus((previous) => {
+        const next = { ...previous }
+        delete next[target]
+        return next
+      })
     }
   }
 
@@ -2255,7 +2289,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               ● {t('picker.undigestedCount').replace('{n}', String(undigestedCount))}
             </span>
           )}
-          {detailLoading && <span style={styles.badge('#dcdcaa')}>{t('detail.aiLoading')}</span>}
+          {(detailQueuedCount > 0 || detailRunningCount > 0) && (
+            <span style={styles.badge('#dcdcaa')}>
+              {detailRunningCount > 0 ? t('detail.aiLoading') : ''}
+              {detailRunningCount > 0 && detailQueuedCount > 0 ? ' ' : ''}
+              {detailQueuedCount > 0 ? '⏳ ' + t('detail.queued').replace('{n}', String(detailQueuedCount)) : ''}
+            </span>
+          )}
         </div>
       </Card>
 
@@ -2299,7 +2339,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{d.analysisGeneratedAt ? ' · ' + new Date(d.analysisGeneratedAt).toLocaleString() : ''}</span>
                 )}
                 {renderCostBadge(d.analysisCostUsd, t('cost.tooltip') + (d.analysisTokens ? `（in ${d.analysisTokens.input} / out ${d.analysisTokens.output} tokens）` : ''))}
-                <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadDetail(target, true) }}>{t('cache.regenerate')}</button>
+                <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { loadDetail(target, true) }}>{t('cache.regenerate')}</button>
                 <span style={{ flex: 1 }} />
                 <button
                   style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
@@ -2328,7 +2368,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               </div>
             )}
             {d === undefined ? (
-              <div style={styles.empty}>{t('detail.aiLoading')}</div>
+              <div style={styles.empty}>{detailStatus[target] === 'queued' ? '⏳ ' + t('detail.cardQueued') : t('detail.aiLoading')}</div>
             ) : (
               <>
                 {d.commit !== null && <div style={styles.commitMeta}>{d.commit.author} · {new Date(d.commit.date).toLocaleString()} · {d.files.length} {t('detail.files')} · +{d.insertions}/-{d.deletions}</div>}
