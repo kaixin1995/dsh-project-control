@@ -604,8 +604,8 @@ export const WORKSPACE_DICT = {
     'detail.files': '文件清单',
     'detail.patch': '查看补丁原文',
     'detail.aiLoading': 'AI 解读生成中…（约 10-30 秒）',
-    'detail.queued': '还有 {n} 个解读排队中（自动逐个分析）',
-    'detail.cardQueued': '排队等待 AI 解读（多选时自动逐个进行，避免打满模型并发）',
+    'detail.queued': '还有 {n} 个解读排队中（自动并发执行）',
+    'detail.cardQueued': '排队等待 AI 解读（并发上限 3，避免打满模型网关）',
     'detail.impact': '影响范围分析',
     'detail.impactLoading': '影响扫描中…（引用检索 + 图谱传播）',
     'detail.optimality': '最优性核查',
@@ -878,8 +878,8 @@ export const WORKSPACE_DICT = {
     'detail.files': 'Files',
     'detail.patch': 'Show raw patch',
     'detail.aiLoading': 'Generating AI explanation… (10-30s)',
-    'detail.queued': '{n} analyses queued (one by one)',
-    'detail.cardQueued': 'Waiting in the analysis queue (multi-select runs one by one to respect model limits)',
+    'detail.queued': '{n} analyses queued (will run concurrently)',
+    'detail.cardQueued': 'Waiting in the analysis queue (max 3 concurrent to protect the model gateway)',
     'detail.impact': 'Impact scope',
     'detail.impactLoading': 'Scanning impact… (reference search + graph walk)',
     'detail.optimality': 'Optimality review',
@@ -1526,13 +1526,31 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     for (const sha of added) loadDetail(sha, false)
   }
 
-  /** 解读串行队列：模型网关并发有限，多选/整轮批量勾选时逐个出队分析，避免并发打满网关互相拖死。 */
-  const detailQueueRef = useRef<Promise<void>>(Promise.resolve())
+  /** 解读并发池：模型网关并发有限，多选/整轮批量勾选时按上限并发分析（默认最多 3 个同时），超出的排队等待并显示队列数。 */
+  const MAX_DETAIL_CONCURRENCY = 3
+  const detailPoolRef = useRef<{ pending: Array<{ target: string; force: boolean }>; active: number }>({ pending: [], active: 0 })
+  const detailInFlightRef = useRef(new Set<string>())
+
+  const pumpDetailPool = (): void => {
+    const pool = detailPoolRef.current
+    while (pool.active < MAX_DETAIL_CONCURRENCY && pool.pending.length > 0) {
+      const job = pool.pending.shift()!
+      pool.active += 1
+      void loadDetailOnce(job.target, job.force)
+        .catch(() => {})
+        .finally(() => {
+          pool.active -= 1
+          pumpDetailPool()
+        })
+    }
+  }
+
   const loadDetail = (target: string, force: boolean): void => {
-    setDetailStatus((previous) => (previous[target] !== undefined ? previous : { ...previous, [target]: 'queued' }))
-    detailQueueRef.current = detailQueueRef.current
-      .then(() => loadDetailOnce(target, force))
-      .catch(() => {})
+    if (detailInFlightRef.current.has(target)) return
+    detailInFlightRef.current.add(target)
+    setDetailStatus((previous) => ({ ...previous, [target]: 'queued' }))
+    detailPoolRef.current.pending.push({ target, force })
+    pumpDetailPool()
   }
 
   /** 队列任务体：真正发起解读请求；任何失败（网络中断/超时/服务未运行）都写入卡片错误占位，绝不无限转圈。 */
@@ -1567,6 +1585,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         [target]: failPlaceholder(`AI 解读失败：${reason === 'The user aborted a request.' ? '请求超时或服务中断' : reason}（检查 dsh 是否在运行；点「重新生成」可重试）`),
       }))
     } finally {
+      detailInFlightRef.current.delete(target)
       setDetailStatus((previous) => {
         const next = { ...previous }
         delete next[target]
