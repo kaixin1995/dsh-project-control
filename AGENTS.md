@@ -68,7 +68,7 @@
 - `__DSH_BOOT__` 运行时从挂载条目派生，挂载即生效、无需重建 Web 应用。
 - 客户端插件进图 = `package.json` 声明 `dsh.client`（platform web + inject 行）+ `exports['./client']` 指向预构建 `lib/client.js`（惰性 CJS 工厂格式，见"客户端打包格式契约"）。
 - `renderSlot` 有槽位所有权校验（`entry.children?.[key]`）→ **遮蔽 single 槽后无法重托管其子槽**；遮蔽 `conversation` 不可行。
-- **已验证可行的主区域重排方案**：遮蔽 `details` 单槽（priority -10，可逆——卸载即恢复官方 DetailsPanel）+ 组件注入样式表做网格列序视觉交换（`centerCol→order:3` 聊天最右，`detailsCol→order:2` 工作台居中；`[data-details-collapsed]` 无会话落地页恢复原生列序）。已实现于 `src/client/components/WorkspaceFrame.tsx`。
+- **已验证可行的主区域重排方案**：遮蔽 `details` 单槽（priority -10，可逆——卸载即恢复官方 DetailsPanel）+ 组件注入样式表做网格列序视觉交换（`centerCol→order:3` 聊天最右，`detailsCol→order:2` 工作台居中；换列**无条件**（含新会话落地页——0.1.2 的新会话也带 data-details-collapsed，对它豁免会让工作台退回右位，业主明确工作台要么不显示要么居中））。已实现于 `src/client/components/WorkspaceFrame.tsx`。
 - AppFrame 网格列是 CSS Modules 哈希类名 div，可用 `[class*="centerCol"]` 子串选择器定位；`[style*="grid-template-columns"]` 唯一锚定框架 div。
 - Web 聊天的 markdown **不支持 mermaid**；工具的 `presentCall/presentResult` 不被 Web 客户端消费（富卡片必须注册 keyed toolview）。
 - `dsh` CLI 源码启动走 tsx ESM-only 钩子；仓外插件按 ESM 编写即可。

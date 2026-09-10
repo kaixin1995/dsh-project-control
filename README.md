@@ -60,7 +60,7 @@
 ```sh
 # 方式一：从 GitHub 安装（推荐；仓库内置预构建产物，目标机器无需构建）
 dsh plugin --profile web add github:kaixin1995/dsh-project-control            # 跟随 master
-dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.3     # 锁定版本（分享时推荐）
+dsh plugin --profile web add github:kaixin1995/dsh-project-control#v0.3.4     # 锁定版本（分享时推荐）
 
 # 方式二：本地目录
 dsh plugin --profile web add /绝对路径/dsh-project-insight

@@ -355,16 +355,17 @@ function renderWithPeek(text: string): React.ReactNode {
 
 /**
  * 视觉换列样式表：随本组件挂载/卸载（卸载即完全恢复原生布局）。
+ * 换列是无条件的（含新会话落地页）——业主规则：工作台要么不显示、要么居中，
+ * 右侧只允许聊天。0.1.2 新会话页也带 data-details-collapsed，曾因对它豁免
+ * 换列导致工作台在新会话下退回原生右位（2026-09-10 修复）。
  * 注意：禁止用 :has() 做祖先匹配——官方构建产物几十个组件根类都叫 root，
  * 祖先匹配会把整个聊天容器误钳制（历史事故）。此表只保留网格换列与拖拽柄隐藏。
  */
 const LAYOUT_STYLE = `
 div[class*="frame"][style*="grid-template-columns"] > div[class*="centerCol"] { order: 3; }
 div[class*="frame"][style*="grid-template-columns"] > div[class*="detailsCol"] { order: 2; }
-div[class*="frame"][style*="grid-template-columns"][data-details-collapsed] > div[class*="centerCol"],
-div[class*="frame"][style*="grid-template-columns"][data-details-collapsed] > div[class*="detailsCol"] { order: 0; }
 div[class*="handle"][data-side="details"] { display: none !important; }
-div[class*="frame"][style*="grid-template-columns"]:not([data-details-collapsed]) {
+div[class*="frame"][style*="grid-template-columns"] {
   grid-template-columns: auto minmax(0, 1fr) var(--pc-chat-w, 360px) !important;
 }
 `
