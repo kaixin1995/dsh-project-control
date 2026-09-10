@@ -10,3 +10,10 @@ dist/
 # editor
 .vscode/
 .idea/
+
+# 文档过滤：只有项目说明文档入库；其余根目录 md（笔记/交接/临时记录等）一律不提交。
+# 已被 git 跟踪的文件不受 ignore 影响；docs/ 是项目文档整体保留。
+/*.md
+!README.md
+!PROJECT-GUIDE.md
+!AGENTS.md

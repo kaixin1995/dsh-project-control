@@ -96,6 +96,7 @@
 - 官方 `.frame` 网格有 `transition: grid-template-columns`；隐藏标签页（后台节流）里过渡冻结在起点，`getBoundingClientRect` 会读到 0 宽假象——自动化验证时先 `getAnimations().forEach(a => a.finish())` 或确认 `document.visible`，真实浏览器前台不受影响。
 - 覆盖官方内联网格模板必须写 `setProperty(..., 'important')`：样式表 `!important` 会压制非 important 内联（曾致聊天列宽记忆刷新后丢失）。
 - **工作台按钮 API 必须携带 sessionId**：HTTP 路由没有工具执行上下文，服务端按 `ctx.sessions.get(sessionId).header.cwd` 反查会话工作目录作为项目根（ensureProject + 采纳），回落已采纳项目 → 最后持久化项目；否则全新实例上报 `no project root known`（2026-08-31 真机事故 + 修复）。
+- **active 高亮背景一律 button-info-fill，强调色文字必须走 themeAwareText**：brand-primary 在深色主题是近白色，作选中背景配白字 = 文字不可见（2026-09-10 工作台页签白块事故）。对比度引擎唯一实现在 `src/client/components/theme.ts`（浅色深化到白底 ≥4.5:1、深色提亮到深底 ≥4.5:1，须在渲染期调用）；收尾守卫：`grep -rn "background.*brand-primary" src/client/` 必须零命中。
 
 **v2 提交核查台（2026-08-31 第三轮）**
 - 工作台围绕业主六问重构：改了什么/实现逻辑（/commit-detail LLM 解读，key=root|sha|diffHash 进程内 LRU 40）、影响范围（/impact-scope：git grep 引用 token 反查 2 跳 → ProjectGraph → ImpactEngine）、是否最优（/review 支持 sha + OPTIMALITY 结论行）、笔记（core 域 notes 表 + /notes CRUD，可绑定 sha）、提交列表（/commits：--numstat 与 %x1f/%x1e 分隔解析）。

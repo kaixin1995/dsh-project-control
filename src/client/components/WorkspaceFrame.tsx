@@ -15,6 +15,7 @@
  */
 
 import React, { useEffect, useState } from 'react'
+import { parseColor, themeAwareText } from './theme.ts'
 
 /** 宿主 /state 返回的快照形状（与 api-route.ts buildState 对齐）。 */
 export interface WorkspaceState {
@@ -141,10 +142,10 @@ function renderDiffLines(diff: string): React.ReactNode[] {
     if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff --git') || line.startsWith('@@')) {
       style.color = 'var(--dsw-alias-label-secondary, #6b7280)'
     } else if (line.startsWith('+')) {
-      style.color = '#1a7f37'
+      style.color = themeAwareText('#1a7f37')
       style.background = 'rgba(46,160,67,0.08)'
     } else if (line.startsWith('-')) {
-      style.color = '#d1242f'
+      style.color = themeAwareText('#d1242f')
       style.background = 'rgba(209,36,47,0.08)'
     } else {
       style.color = 'var(--dsw-alias-label-secondary, #6b7280)'
@@ -283,67 +284,11 @@ function normalizeIssueSeverity(severity: string): string {
     ? severity : 'minor'
 }
 
-/** 解析 #rrggbb 或 rgb()/rgba() 颜色前三个分量为 [r, g, b]；无法解析返回 null。 */
-function parseColor(color: string): [number, number, number] | null {
-  const hex = /^#([0-9a-f]{6})$/i.exec(color)
-  if (hex !== null) {
-    const value = Number.parseInt(hex[1]!, 16)
-    return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
-  }
-  const functional = /^rgba?\(\s*(\d{1,3})[,\s]+(\d{1,3})[,\s]+(\d{1,3})/i.exec(color)
-  if (functional !== null) {
-    return [Number(functional[1]), Number(functional[2]), Number(functional[3])]
-  }
-  return null
-}
-
-/** WCAG 相对亮度（0=黑，1=白）。 */
-function relativeLuminance(r: number, g: number, b: number): number {
-  const channel = (value: number): number => {
-    const v = value / 255
-    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
-  }
-  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
-}
-
-/** 深化颜色直到白底对比度 ≥4.5:1（每步向 #1f2328 混合 20%，至多 12 步）。 */
-function darkenForWhiteBackground(r: number, g: number, b: number): string {
-  let red = r
-  let green = g
-  let blue = b
-  for (let step = 0; step < 12 && relativeLuminance(red, green, blue) > 0.183; step += 1) {
-    red = Math.round(red * 0.8 + 0x1f * 0.2)
-    green = Math.round(green * 0.8 + 0x23 * 0.2)
-    blue = Math.round(blue * 0.8 + 0x28 * 0.2)
-  }
-  return `rgb(${red}, ${green}, ${blue})`
-}
-
-/** 提亮颜色直到深底（#151517）对比度 ≥4.5:1（每步向 #f0f6fc 混合 20%，至多 12 步）。 */
-function lightenForDarkBackground(r: number, g: number, b: number): string {
-  let red = r
-  let green = g
-  let blue = b
-  for (let step = 0; step < 12 && relativeLuminance(red, green, blue) < 0.214; step += 1) {
-    red = Math.round(red * 0.8 + 0xf0 * 0.2)
-    green = Math.round(green * 0.8 + 0xf6 * 0.2)
-    blue = Math.round(blue * 0.8 + 0xfc * 0.2)
-  }
-  return `rgb(${red}, ${green}, ${blue})`
-}
-
-/**
- * 主题自适应文字色：浅色主题深化到白底 ≥4.5:1；深色主题提亮到深底 ≥4.5:1
- * （深色字如 #57606a 直接放深底同样不可读）。所有强调色文本统一走这里。
- */
-function themeAwareText(color: string): string {
-  const rgb = parseColor(color)
-  if (rgb === null) return color
-  if (typeof document !== 'undefined' && document.body?.hasAttribute?.('data-ds-dark-theme') === true) {
-    return lightenForDarkBackground(rgb[0], rgb[1], rgb[2])
-  }
-  return darkenForWhiteBackground(rgb[0], rgb[1], rgb[2])
-}
+// 主题对比度引擎（parseColor / relativeLuminance / darken/lighten / themeAwareText）
+// 已抽取到 ./theme.ts 统一维护。全文件不变式：
+// 1) 强调色文字必须经 themeAwareText（渲染期调用）；
+// 2) active 高亮背景一律 button-info-fill，禁止 brand-primary 作背景
+//    （深色主题下近白，配白字不可见——「页签白块」事故根因）。
 
 /** 评审目标（changeId）→ 可读标签：合成 review:<sha> 指向提交，chg_* 指向变更，adhoc 为工作区。 */
 function issueTargetLabel(changeId: string): string {
@@ -1025,7 +970,8 @@ const styles: Record<string, React.CSSProperties> = {
     border: 'none',
     cursor: 'pointer',
     fontSize: '12px',
-    background: active ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'transparent',
+    // button-info-fill 两主题都蓝；brand-primary 在深色主题是近白色，白字会被吞掉（页签白块事故）。
+    background: active ? 'var(--dsw-alias-button-info-fill, #2563eb)' : 'transparent',
     color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #6b7280)',
   }),
   body: { flex: 1, overflowY: 'auto', padding: '14px 16px' },
@@ -1094,7 +1040,7 @@ const styles: Record<string, React.CSSProperties> = {
   sectionTitle: { fontWeight: 600, fontSize: '12px', marginBottom: '8px' },
   what: { fontSize: '12px', lineHeight: 1.7, margin: '4px 0 8px' },
   logicStep: { fontSize: '12px', lineHeight: 1.8, display: 'flex', gap: '6px' },
-  riskItem: { fontSize: '12px', lineHeight: 1.7, color: '#9a6700', margin: '2px 0' },
+  riskItem: { fontSize: '12px', lineHeight: 1.7, margin: '2px 0' },
   commitRow: (active: boolean): React.CSSProperties => ({
     padding: '8px 10px',
     borderRadius: '6px',
@@ -1141,7 +1087,8 @@ const styles: Record<string, React.CSSProperties> = {
   chip: (active: boolean): React.CSSProperties => ({
     padding: '2px 10px', borderRadius: '999px', fontSize: '11px', cursor: 'pointer',
     border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))',
-    background: active ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'transparent',
+    // 同 tab：active 填色一律 button-info-fill（两主题都蓝），禁用 brand-primary。
+    background: active ? 'var(--dsw-alias-button-info-fill, #2563eb)' : 'transparent',
     color: active ? '#fff' : 'inherit',
   }),
 }
@@ -1213,8 +1160,8 @@ function ImpactGraph(props: { data: ImpactScopePayload; t: (key: string) => stri
       fill: 'none', stroke: color, strokeWidth: 1.6, opacity: 0.6,
     }))
   }
-  for (const item of indirect.slice(0, 20)) pushEdge(chainStart(item.reason), item.path, '#d97706', `ei-${item.path}`)
-  for (const item of potential.slice(0, 16)) pushEdge(chainStart(item.reason), item.path, '#57606a', `ep-${item.path}`)
+  for (const item of indirect.slice(0, 20)) pushEdge(chainStart(item.reason), item.path, themeAwareText('#d97706'), `ei-${item.path}`)
+  for (const item of potential.slice(0, 16)) pushEdge(chainStart(item.reason), item.path, themeAwareText('#57606a'), `ep-${item.path}`)
 
   return React.createElement('div', null,
     React.createElement('svg', { width: '100%', viewBox: `0 0 1024 ${height}`, style: { maxHeight: 480 } },
@@ -1267,9 +1214,9 @@ function DiffView(props: { patch: string }) {
           : line.startsWith('-') ? 'del' : 'ctx'
     const bg = kind === 'add' ? 'rgba(46,160,67,0.14)' : kind === 'del' ? 'rgba(248,81,73,0.13)' : kind === 'hunk' ? 'rgba(56,139,253,0.1)' : 'transparent'
     const content = kind === 'meta' || kind === 'hunk'
-      ? React.createElement('span', { style: { color: '#0969da', fontWeight: 600 } }, line)
+      ? React.createElement('span', { style: { color: themeAwareText('#0969da'), fontWeight: 600 } }, line)
       : kind === 'add' || kind === 'del'
-        ? React.createElement('span', { style: { color: kind === 'add' ? '#1a7f37' : '#cf222e', fontWeight: 600 } }, line[0])
+        ? React.createElement('span', { style: { color: themeAwareText(kind === 'add' ? '#1a7f37' : '#cf222e'), fontWeight: 600 } }, line[0])
         : null
     return React.createElement('div', { key: i, style: { padding: '0 10px', background: bg, whiteSpace: 'pre-wrap', wordBreak: 'break-all' } },
       content,
@@ -1313,7 +1260,7 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               fontSize: '17px',
               background: props.danger ? 'rgba(244,63,94,0.12)' : 'rgba(37,99,235,0.1)',
-              color: props.danger ? '#e11d48' : '#2563eb',
+              color: props.danger ? themeAwareText('#e11d48') : themeAwareText('#2563eb'),
             },
           }, props.danger ? '!' : '?'),
           React.createElement('div', null,
@@ -2207,7 +2154,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               </>
             )}
           </div>
-          {narrativeError !== '' && <div style={{ ...styles.empty, color: '#d1242f' }}>{narrativeError}</div>}
+          {narrativeError !== '' && <div style={{ ...styles.empty, color: themeAwareText('#d1242f') }}>{narrativeError}</div>}
           {narrative !== null && (
             <div style={{ ...styles.what, whiteSpace: 'pre-wrap' }}>{renderStructuredContent(narrative.narrative)}</div>
           )}
@@ -2234,7 +2181,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     const sha = target === 'working' ? 'working' : target
                     void post('/project-control/api/notes', {
                       title: `${t('detail.saveNoteTitle')}：${(d.commit?.message ?? target).slice(0, 60)}`,
-                      content: [`【改了什么】\n${d.analysis.what}`, `【实现逻辑】\n${d.analysis.logic}`, `【风险点】\n${d.analysis.risk}`].filter((block) => !block.endsWith('】\n')).join('\n\n'),
+                      content: [`【改了什么】\n${d.analysis.what}`, `【实现逻辑】\n${(d.analysis.logic ?? []).join('；')}`, `【风险点】\n${(d.analysis.risks ?? []).join('；')}`].filter((block) => !block.endsWith('】\n')).join('\n\n'),
                       sha, tags: '核查',
                     }).then(({ ok }) => { setActionResult(ok ? '✓ 已存为笔记（笔记页可查看）' : '✗ 保存失败') ; if (ok) void loadNotes() })
                   }}
@@ -2247,7 +2194,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     void post('/project-control/api/memory', {
                       memoryType: 'risk_hotspot', sourceTag: 'review', basisSha: sha,
                       title: `核查结论：${(d.commit?.message ?? target).slice(0, 60)}`,
-                      content: [d.analysis.what, d.analysis.risk].filter((part) => part !== '').join('\n---\n'),
+                      content: [d.analysis.what, (d.analysis.risks ?? []).join('；')].filter((part) => part !== '').join('\n---\n'),
                     }).then(({ ok }) => { setActionResult(ok ? '✓ 已沉淀为记忆（待确认队列）' : '✗ 保存失败'); if (ok) void loadMemories() })
                   }}
                 >🧠 {t('detail.saveMemory')}</button>
@@ -2277,7 +2224,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 {d.analysis.risks.length > 0 && (
                   <>
                     <div style={{ ...styles.sectionTitle, marginTop: '6px' }}>{t('detail.risk')}</div>
-                    {d.analysis.risks.map((risk, i) => <div key={i} style={styles.riskItem}>⚠ {renderWithPeek(risk)}</div>)}
+                    {d.analysis.risks.map((risk, i) => <div key={i} style={{ ...styles.riskItem, color: themeAwareText('#9a6700') }}>⚠ {renderWithPeek(risk)}</div>)}
                   </>
                 )}
                 {/* 文件清单 + 逐文件高亮对比 */}
@@ -2291,8 +2238,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         <>
                           <tr key={key}>
                             <td style={{ ...styles.td, fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{file.path}</td>
-                            <td style={{ ...styles.td, color: '#1a7f37', whiteSpace: 'nowrap' }}>+{file.adds}</td>
-                            <td style={{ ...styles.td, color: '#cf222e', whiteSpace: 'nowrap' }}>-{file.dels}</td>
+                            <td style={{ ...styles.td, color: themeAwareText('#1a7f37'), whiteSpace: 'nowrap' }}>+{file.adds}</td>
+                            <td style={{ ...styles.td, color: themeAwareText('#cf222e'), whiteSpace: 'nowrap' }}>-{file.dels}</td>
                             <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>
                               <button style={styles.secondary} onClick={() => { void loadFileDiff(target, file.path) }}>
                                 {patch === undefined ? t('diff.show') : t('diff.hide')}
@@ -2340,7 +2287,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   {t('impact.risk')}: {impact.riskLevel}（{impact.riskScore}）
                 </span>
                 {impact.keyChangePoints !== undefined && impact.keyChangePoints.length > 0 && (
-                  <span style={{ fontSize: '11px', color: '#9a6700' }}>⚠ {t('impact.keyPoints')}: {impact.keyChangePoints.map((file) => file.split('/').pop()).join('、')}</span>
+                  <span style={{ fontSize: '11px', color: themeAwareText('#9a6700') }}>⚠ {t('impact.keyPoints')}: {impact.keyChangePoints.map((file) => file.split('/').pop()).join('、')}</span>
                 )}
               </div>
               {impact.riskFactors !== undefined && impact.riskFactors.length > 0 && (
@@ -2377,7 +2324,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         )}
                         {entry.change !== undefined && entry.change !== '' && (
                           <div style={{ ...styles.what }}>
-                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: '#9a6700' }}>{t('impact.funcChange')}</span>
+                            <span style={{ ...styles.sectionTitle, display: 'inline', marginInlineEnd: '6px', color: themeAwareText('#9a6700') }}>{t('impact.funcChange')}</span>
                             {entry.change}
                           </div>
                         )}
@@ -2389,7 +2336,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         )}
                         {entry.callers.map((caller, i) => (
                           <div key={i} style={{ ...styles.logicStep, marginTop: '3px' }}>
-                            <span style={{ color: '#d97706' }}>↳</span>
+                            <span style={{ color: themeAwareText('#d97706') }}>↳</span>
                             <span style={{ fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>
                               <span style={{ cursor: 'pointer', textDecoration: 'underline dotted' }} onClick={() => { void openPeek(caller.file, Number(caller.line)) }}>{caller.file}:{caller.line}</span>
                             </span>
@@ -2766,7 +2713,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         <Card title={t('plan.detailTitle') + ' · ' + runDetail.run.changeTitle}>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' }}>
             <span style={styles.badge(runDetail.run.status === 'succeeded' || runDetail.run.status === 'completed' ? '#4ec9b0' : runDetail.run.status === 'failed' ? '#f14c4c' : runDetail.run.status === 'paused' ? '#d97706' : '#dcdcaa')}>{RUN_STATUS_LABELS[runDetail.run.status] ?? runDetail.run.status}</span>
-            {runDetail.run.error !== null && <span style={{ fontSize: '11px', color: '#d1242f' }}>{runDetail.run.error.message}</span>}
+            {runDetail.run.error !== null && <span style={{ fontSize: '11px', color: themeAwareText('#d1242f') }}>{runDetail.run.error.message}</span>}
             <span style={{ flex: 1 }} />
             <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(runDetail.run.id) }}>{t('plan.refreshDetail')}</button>
             <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setRunDetail(null) }}>{t('plan.closeDetail')}</button>
@@ -3040,7 +2987,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           <span style={{ fontSize: '11px' }}>🔄 {t('memory.syncBaseline')}：<b>{memoriesData?.baseline?.sha != null ? memoriesData.baseline.sha.slice(0, 8) : t('memory.syncNone')}</b></span>
           {memoriesData?.branch != null && <span style={styles.badge('#569cd6')}>{memoriesData.branch}</span>}
           {(memoriesData?.behindCount ?? 0) > 0 && (
-            <span style={{ fontSize: '11px', color: '#d97706' }}>{t('memory.behind').replace('{n}', String(memoriesData?.behindCount ?? 0))}</span>
+            <span style={{ fontSize: '11px', color: themeAwareText('#d97706') }}>{t('memory.behind').replace('{n}', String(memoriesData?.behindCount ?? 0))}</span>
           )}
           <span style={{ flex: 1 }} />
           <button style={{ ...styles.secondary, padding: '3px 10px', fontSize: '11px' }} disabled={memorySyncing} onClick={() => { void syncMemories() }}>
