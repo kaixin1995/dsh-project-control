@@ -502,11 +502,11 @@ export async function executeReviewForTarget(
         issueList: cachedList,
         cached: true,
         generatedAt: storeHit.createdAt,
-        costUsd: Number(storeHit.payload['costUsd']) || undefined,
+        ...(Number(storeHit.payload['costUsd']) > 0 ? { costUsd: Number(storeHit.payload['costUsd']) } : {}),
       }
     }
   }
-  let analysis: { text: string }
+  let analysis: { text: string; usage?: unknown }
   try {
     analysis = await runLlmAnalysis(ctx, {
       prompt: [
@@ -1776,7 +1776,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                   analysisCostUsd = Number(storeHit.payload['costUsd']) || undefined
                   analysisTokens = (storeHit.payload['tokens'] ?? undefined) as { input: number; output: number; total: number } | undefined
                   commitAnalysisCache.set(memoryKey, analysis)
-                  commitMetaCache.set(memoryKey, { costUsd: analysisCostUsd, tokens: analysisTokens })
+                  commitMetaCache.set(memoryKey, {
+                    ...(analysisCostUsd === undefined ? {} : { costUsd: analysisCostUsd }),
+                    ...(analysisTokens === undefined ? {} : { tokens: analysisTokens }),
+                  })
                   trimMetaCache()
                 }
               }
@@ -1978,7 +1981,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 explanationsGeneratedAt = storeExplain.createdAt
                 explanationsCostUsd = Number(storeExplain.payload['costUsd']) || undefined
                 commitAnalysisCache.set(cacheKey, explanations as unknown as CommitAnalysis)
-                commitMetaCache.set(cacheKey, { costUsd: explanationsCostUsd })
+                commitMetaCache.set(cacheKey, { ...(explanationsCostUsd === undefined ? {} : { costUsd: explanationsCostUsd }) })
                 trimMetaCache()
               } else {
                 let llmText = ''
@@ -2016,7 +2019,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 const explainMeta = usageMeta(llmUsage, explainRoute.model)
                 explanationsCostUsd = explainMeta.costUsd
                 commitAnalysisCache.set(cacheKey, explanations as unknown as CommitAnalysis)
-                commitMetaCache.set(cacheKey, { costUsd: explanationsCostUsd })
+                commitMetaCache.set(cacheKey, { ...(explainMeta.costUsd === undefined ? {} : { costUsd: explainMeta.costUsd }) })
                 trimMetaCache()
                 cacheWrite(service, cacheKey, 'function-impact', {
                   explanations,
