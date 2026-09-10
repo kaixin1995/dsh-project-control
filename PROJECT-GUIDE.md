@@ -1,7 +1,7 @@
 # dsh-project-control 项目全量指南（新会话必读）
 
 > **目的**：新 AI 会话打开本文件即可完整接手项目——背景、铁律、架构、函数级地图、数据模型、API 清单、构建/测试/发布流程、已验证事实、未完成事项，全部在此。
-> **最后更新**：2026-09-10 · 版本 v0.2.3 · 76/76 测试绿
+> **最后更新**：2026-09-10 · 版本 v0.2.3 · 77/77 测试绿
 
 ---
 
@@ -75,7 +75,7 @@ dsh-project-insight/              ← 独立 git 仓库（peer 于本体 package
 ├── docs/                         ← 产品总纲、V1.0 技术设计（工程权威）、design-scope/v04-mapping（历史参考）
 │                                   （development-plan.md 与 SESSION-HANDOFF.md 已按业主要求删除）
 ├── lib/                          ← 预构建产物，随 git 提交（远端机器无法本地构建——vendor 别名是机器本地）
-├── tests/                        ← 23 spec 文件 76 测试
+├── tests/                        ← 24 spec 文件 77 测试
 └── src/
     ├── index.ts                  ← 插件主入口（见 §5.1）
     ├── config.ts                 ← 全量配置 schema + 默认值 + resolveFullConfig（见 §6）
@@ -341,7 +341,7 @@ ConfirmedItemRecord{id,projectId,type,forbiddenPaths[],status,createdAt}   ← �
 ```sh
 cd D:\Code\deepseek-harness\dsh-project-insight
 pnpm run build        # build.mjs(host lib/index.js) + build-client.mjs(lib/client.js)；esbuild 不查类型
-pnpm test             # vitest 23 文件 76 测试（无 key 也全跑；内存库+临时 git 仓）
+pnpm test             # vitest 24 文件 77 测试（无 key 也全跑；内存库+临时 git 仓）
 pnpm run typecheck    # tsc --noEmit（react/vendor/analysis 三处有既有基线噪音，见 §11）
 ```
 
@@ -405,6 +405,6 @@ node "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/l
 
 1. 读本文件 + `AGENTS.md`（工程铁律细节）+ `README.md`（对外说明）
 2. `git -C D:\Code\deepseek-harness status --short | wc -l` 必须为 0（本体零改动）
-3. `pnpm test` 确认 76/76
+3. `pnpm test` 确认 77/77
 4. 业主提需求 → 对照 §3 确认是否已实现 → 开发（补丁方法论 §2.10）→ 构建 → 测试 → **有界**线上验证 → 重启（§10）→ 验证无问题后一次提交（§2.2）
 5. 永远不要：改本体、无限等待、频繁碎提交、:has()、新增会话事件、并发第二实例

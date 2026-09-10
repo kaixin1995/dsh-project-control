@@ -693,9 +693,7 @@ export async function runMemorySync(
               ? await service.git.getDiff(cwd, { maxBytes: 120 * 1024 })
               : await service.git.getDiff(cwd, { from: baseSha, maxBytes: 120 * 1024 })
             if (headSha === undefined || commitLines.length === 0) {
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ ok: true, behindCount: 0, staleProposals: [], renewed: 0, newCandidates: [], verdict: '基线以来无新提交，无需同步。' }))
-              return
+              return { ok: true, behindCount: 0, staleProposals: [], renewed: 0, newCandidates: [], verdict: '基线以来无新提交，无需同步。' }
             }
             const activeMemories = service.store.memories.list(
               (memory) => memory.projectId === pid && (memory.status ?? 'active') === 'active',
@@ -730,9 +728,7 @@ export async function runMemorySync(
               })
             } catch (error: unknown) {
               const message = error instanceof Error ? error.message : String(error)
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ ok: false, error: `同步判定失败：${message}（可重试）` }))
-              return
+              return { ok: false, error: `同步判定失败：${message}（可重试）` }
             }
             const staleProposals: Array<{ id: string; title: string; reason: string }> = []
             const newCandidates: Array<{ type: string; title: string; content: string }> = []
