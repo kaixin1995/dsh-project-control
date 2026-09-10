@@ -162,6 +162,35 @@ function parseCommitAnalysis(text: string): CommitAnalysis {
 const commitAnalysisCache = new Map<string, CommitAnalysis>()
 
 /**
+ * LLM 调用成本元数据缓存（key 与 commitAnalysisCache 一致）：让缓存命中也带出
+ * 生成时的成本，避免同会话内重复查看时成本信息忽隐忽现。
+ */
+const commitMetaCache = new Map<string, { costUsd?: number; tokens?: { input: number; output: number; total: number } }>()
+
+/** 成本估算器（按 DeepSeek 价目折算；跨网关模型为近似值，展示层标注「估」）。 */
+const llmCostTracker = new CostTracker()
+
+/** 元数据缓存与解读缓存同步淘汰（容量翻倍，保持简单）。 */
+function trimMetaCache(): void {
+  while (commitMetaCache.size > 80) commitMetaCache.delete(commitMetaCache.keys().next().value as string)
+}
+
+/**
+ * 防御性解析 LLM usage（dsh-llm TokenUsage 字段名随版本可能不同，逐一试探）→
+ * tokens + 成本估算；缺 usage 或零 token 返回空对象（调用方按缺省处理）。
+ */
+function usageMeta(usage: unknown, model: string): { costUsd?: number; tokens?: { input: number; output: number; total: number } } {
+  if (usage === null || typeof usage !== 'object') return {}
+  const raw = usage as Record<string, unknown>
+  const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  const input = num(raw['input']) || num(raw['inputTokens']) || num(raw['promptTokens'])
+  const output = num(raw['output']) || num(raw['outputTokens']) || num(raw['completionTokens'])
+  if (input + output === 0) return {}
+  const tokens = { input, output, total: input + output }
+  return { tokens, costUsd: llmCostTracker.calculateCost(model, tokens).costUsd }
+}
+
+/**
  * 从补丁的新增行提取本次修改/新增的符号名（方法、类、函数），
  * 供函数级影响反查。过滤 get/set/if 等无意义短名。
  */
@@ -434,7 +463,7 @@ export async function executeReviewForTarget(
   target: string,
   force = false,
   changeId?: string,
-): Promise<{ issuesFound: number; issues: string; verdict: string; issueList: ReviewIssueEntry[]; cached: boolean; generatedAt?: number; failed?: boolean }> {
+): Promise<{ issuesFound: number; issues: string; verdict: string; issueList: ReviewIssueEntry[]; cached: boolean; generatedAt?: number; costUsd?: number; failed?: boolean }> {
   if (service.store === undefined) {
     return { issuesFound: 0, issues: '', verdict: 'service not started', issueList: [], cached: false, failed: true }
   }
@@ -468,6 +497,7 @@ export async function executeReviewForTarget(
         issueList: cachedList,
         cached: true,
         generatedAt: storeHit.createdAt,
+        costUsd: Number(storeHit.payload['costUsd']) || undefined,
       }
     }
   }
@@ -512,8 +542,9 @@ export async function executeReviewForTarget(
   })
   await persistReviewIssues(service, project.id, issueTarget, issueList)
   const generatedAt = Date.now()
-  cacheWrite(service, reviewStoreKey, 'review', { issuesFound: lines.length, issues: analysis.text, verdict, issueList })
-  return { issuesFound: lines.length, issues: analysis.text, verdict, issueList, cached: false, generatedAt }
+  const costUsd = usageMeta(analysis.usage, reviewRoute.model).costUsd
+  cacheWrite(service, reviewStoreKey, 'review', { issuesFound: lines.length, issues: analysis.text, verdict, issueList, ...(costUsd === undefined ? {} : { costUsd }) })
+  return { issuesFound: lines.length, issues: analysis.text, verdict, issueList, cached: false, generatedAt, ...(costUsd === undefined ? {} : { costUsd }) }
 }
 
 /**
@@ -1397,7 +1428,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               const hit = cacheRead(service, storeKey)
               if (hit !== undefined) {
                 res.writeHead(200, { 'content-type': 'application/json' })
-                res.end(JSON.stringify({ narrative: String(hit.payload['narrative'] ?? ''), cached: true, generatedAt: hit.createdAt }))
+                res.end(JSON.stringify({ narrative: String(hit.payload['narrative'] ?? ''), cached: true, generatedAt: hit.createdAt, costUsd: Number(hit.payload['costUsd']) || undefined }))
                 return
               }
             }
@@ -1424,9 +1455,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               purpose: 'project-control-work-narrative',
             })
             const narrative = llm.text.trim()
-            cacheWrite(service, storeKey, 'narrative', { narrative })
+            const narrativeCostUsd = usageMeta(llm.usage, route.model).costUsd
+            cacheWrite(service, storeKey, 'narrative', { narrative, ...(narrativeCostUsd === undefined ? {} : { costUsd: narrativeCostUsd }) })
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ narrative, cached: false, generatedAt: Date.now() }))
+            res.end(JSON.stringify({ narrative, cached: false, generatedAt: Date.now(), ...(narrativeCostUsd === undefined ? {} : { costUsd: narrativeCostUsd }) }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -1714,11 +1746,16 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             let analysis: CommitAnalysis | undefined
             let analysisCached = false
             let analysisGeneratedAt: number | undefined
+            let analysisCostUsd: number | undefined
+            let analysisTokens: { input: number; output: number; total: number } | undefined
             if (!force) {
               const memoryHit = commitAnalysisCache.get(memoryKey)
               if (memoryHit !== undefined) {
                 analysis = memoryHit
                 analysisCached = true
+                const meta = commitMetaCache.get(memoryKey)
+                analysisCostUsd = meta?.costUsd
+                analysisTokens = meta?.tokens
               } else {
                 const storeHit = cacheRead(service, storeKey)
                 if (storeHit !== undefined) {
@@ -1729,7 +1766,11 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                   }
                   analysisCached = true
                   analysisGeneratedAt = storeHit.createdAt
+                  analysisCostUsd = Number(storeHit.payload['costUsd']) || undefined
+                  analysisTokens = (storeHit.payload['tokens'] ?? undefined) as { input: number; output: number; total: number } | undefined
                   commitAnalysisCache.set(memoryKey, analysis)
+                  commitMetaCache.set(memoryKey, { costUsd: analysisCostUsd, tokens: analysisTokens })
+                  trimMetaCache()
                 }
               }
             }
@@ -1756,13 +1797,22 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 timeoutMs: service.liveConfig.analysisTimeoutMs,
                 purpose: 'project-control-commit-detail',
               })
-              analysis = parseCommitAnalysis(llm.text)
-              analysisGeneratedAt = Date.now()
-              commitAnalysisCache.set(memoryKey, analysis)
-              cacheWrite(service, storeKey, 'commit-detail', { ...analysis })
-              if (commitAnalysisCache.size > 40) {
-                commitAnalysisCache.delete(commitAnalysisCache.keys().next().value as string)
-              }
+                analysis = parseCommitAnalysis(llm.text)
+                analysisGeneratedAt = Date.now()
+                const meta = usageMeta(llm.usage, detailRoute.model)
+                analysisCostUsd = meta.costUsd
+                analysisTokens = meta.tokens
+                commitAnalysisCache.set(memoryKey, analysis)
+                commitMetaCache.set(memoryKey, meta)
+                trimMetaCache()
+                cacheWrite(service, storeKey, 'commit-detail', {
+                  ...analysis,
+                  ...(meta.costUsd === undefined ? {} : { costUsd: meta.costUsd }),
+                  ...(meta.tokens === undefined ? {} : { tokens: meta.tokens }),
+                })
+                if (commitAnalysisCache.size > 40) {
+                  commitAnalysisCache.delete(commitAnalysisCache.keys().next().value as string)
+                }
               } catch (error: unknown) {
                 // LLM 失败不拖垮整个核查卡：降级为可见的错误说明（文件清单/补丁照常可用）。
                 const message = error instanceof Error ? error.message : String(error)
@@ -1780,6 +1830,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               analysisCached,
               analysisGeneratedAt: analysisGeneratedAt ?? null,
               model: modelTag,
+              ...(analysisCostUsd === undefined ? {} : { analysisCostUsd }),
+              ...(analysisTokens === undefined ? {} : { analysisTokens }),
             }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
@@ -1895,6 +1947,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             // 说明文本持久化到 snapshots；调用点本身每次实时重扫，保证关系图新鲜。
             let explanationsCached = false
             let explanationsGeneratedAt: number | undefined
+            let explanationsCostUsd: number | undefined
             if (functionImpact.length > 0) {
               const explainRoute = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
               const explainForce = body['force'] === true
@@ -1910,13 +1963,19 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               if (memoryExplain !== undefined) {
                 explanations = memoryExplain as unknown as Record<string, { role: string; change: string; impact: string }>
                 explanationsCached = true
+                explanationsCostUsd = commitMetaCache.get(cacheKey)?.costUsd
               } else if (storeExplain !== undefined) {
-                explanations = storeExplain.payload as unknown as Record<string, { role: string; change: string; impact: string }>
+                // 新载荷形如 { explanations, costUsd }；旧版直接是 explanations 本体，两态兼容。
+                explanations = (storeExplain.payload['explanations'] ?? storeExplain.payload) as unknown as Record<string, { role: string; change: string; impact: string }>
                 explanationsCached = true
                 explanationsGeneratedAt = storeExplain.createdAt
+                explanationsCostUsd = Number(storeExplain.payload['costUsd']) || undefined
                 commitAnalysisCache.set(cacheKey, explanations as unknown as CommitAnalysis)
+                commitMetaCache.set(cacheKey, { costUsd: explanationsCostUsd })
+                trimMetaCache()
               } else {
                 let llmText = ''
+                let llmUsage: unknown
                 try {
                   const llm = await runLlmAnalysis(ctx, {
                     prompt: [
@@ -1940,14 +1999,22 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                     purpose: 'project-control-function-impact',
                   })
                   llmText = llm.text
+                  llmUsage = llm.usage
                 } catch {
                   // 说明生成失败不影响影响图：函数调用点照常返回，仅说明缺失。
                   llmText = ''
                 }
                 explanations = parseFunctionExplanations(llmText)
                 explanationsGeneratedAt = Date.now()
+                const explainMeta = usageMeta(llmUsage, explainRoute.model)
+                explanationsCostUsd = explainMeta.costUsd
                 commitAnalysisCache.set(cacheKey, explanations as unknown as CommitAnalysis)
-                cacheWrite(service, cacheKey, 'function-impact', { ...explanations })
+                commitMetaCache.set(cacheKey, { costUsd: explanationsCostUsd })
+                trimMetaCache()
+                cacheWrite(service, cacheKey, 'function-impact', {
+                  explanations,
+                  ...(explainMeta.costUsd === undefined ? {} : { costUsd: explainMeta.costUsd }),
+                })
                 if (commitAnalysisCache.size > 40) {
                   commitAnalysisCache.delete(commitAnalysisCache.keys().next().value as string)
                 }
@@ -1994,6 +2061,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               functionImpact,
               explanationsCached,
               generatedAt: explanationsGeneratedAt ?? null,
+              ...(explanationsCostUsd === undefined ? {} : { explanationsCostUsd }),
               levels: impact.impactedItems
                 .filter((item) => item.level !== 'direct')
                 .map((item) => ({

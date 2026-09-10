@@ -113,7 +113,8 @@ export function clusterCommits(facts: CommitFact[], options: HistoryScanOptions)
   }
 
   for (const fact of nonMerge) {
-    const gapBreak = current.length > 0 && fact.committedAt - current[current.length - 1]!.committedAt > options.clusterGapMs
+    // git log 为新→旧顺序：相邻间隔必须取绝对值（符号比较恒为负，时间窗口切断从未生效）。
+    const gapBreak = current.length > 0 && Math.abs(fact.committedAt - current[current.length - 1]!.committedAt) > options.clusterGapMs
     const fileBreak = current.length >= 3 && overlap(fact.files, currentFiles) === 0
     if (gapBreak || fileBreak) {
       clusters.push(current)

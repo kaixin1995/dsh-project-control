@@ -16,6 +16,7 @@
 
 import React, { useEffect, useState } from 'react'
 import { parseColor, themeAwareText } from './theme.ts'
+import { clusterIntoRounds } from './commit-rounds.ts'
 
 /** 宿主 /state 返回的快照形状（与 api-route.ts buildState 对齐）。 */
 export interface WorkspaceState {
@@ -68,6 +69,9 @@ interface CommitDetailPayload {
   analysis: { what: string; logic: string[]; risks: string[] }
   analysisCached?: boolean
   analysisGeneratedAt?: number | null
+  /** 本次解读的 LLM 成本（估，USD）；缓存未带成本/未产生调用时缺省。 */
+  analysisCostUsd?: number
+  analysisTokens?: { input: number; output: number; total: number }
 }
 
 interface ImpactScopePayload {
@@ -90,6 +94,8 @@ interface ImpactScopePayload {
   direct: string[]
   explanationsCached?: boolean
   generatedAt?: number | null
+  /** 函数级说明那次 LLM 调用的成本（估，USD）。 */
+  explanationsCostUsd?: number
 }
 
 export interface ReviewPayload {
@@ -98,6 +104,7 @@ export interface ReviewPayload {
   verdict: string
   cached?: boolean
   generatedAt?: number | null
+  costUsd?: number
   issueList?: Array<{ severity: string; category: string; title: string; evidence: string; fix: string }>
 }
 
@@ -445,6 +452,12 @@ export const WORKSPACE_DICT = {
     'picker.clear': '清空',
     'picker.noMatch': '无匹配提交。',
     'picker.hint': '勾选提交后自动生成 AI 解读；下方可再跑影响范围与最优性核查。',
+    'picker.round': '第 {n} 轮',
+    'picker.roundLatest': '第 {n} 轮（最新）',
+    'picker.roundSelect': '选整轮',
+    'picker.roundClear': '取消本轮',
+    'picker.undigested': '上次 AI 总结之后的新提交，尚未核查消化',
+    'picker.undigestedCount': '{n} 个提交未消化',
     'impact.factors': '风险构成（为什么是这个等级）',
     'impact.points': '影响点明细',
     'impact.keyPoints': '关键组件',
@@ -455,6 +468,7 @@ export const WORKSPACE_DICT = {
     'impact.funcCallers': '对调用方的影响',
     'cache.hit': '来自缓存',
     'cache.regenerate': '重新生成',
+    'cost.tooltip': '本次 AI 调用成本（估算，按 DeepSeek 价目折算）',
     'exec.create': '新建执行',
     'exec.formTitle': '要做什么（一句话）',
     'exec.formDesc': '需求与背景：目标、涉及模块、验收标准',
@@ -480,6 +494,9 @@ export const WORKSPACE_DICT = {
     'notes.copyMd': '复制 MD',
     'notes.copyMdHint': '把这条笔记复制为 Markdown 到剪贴板',
     'notes.copyMdDone': '已复制为 Markdown',
+    'notes.exportMd': '导出 MD',
+    'notes.exportMdHint': '下载为 .md 文件',
+    'notes.exportDone': '已导出为 .md 文件',
     'notes.digestNever': '尚未生成过 AI 总结',
     'notes.digestPending': '上次总结后有 {n} 个新提交未消化',
     'detail.saveNote': '存为笔记',
@@ -701,6 +718,12 @@ export const WORKSPACE_DICT = {
     'picker.clear': 'Clear',
     'picker.noMatch': 'No matching commit.',
     'picker.hint': 'Checking a commit generates its AI explanation; run impact and optimality below.',
+    'picker.round': 'Round {n}',
+    'picker.roundLatest': 'Round {n} (latest)',
+    'picker.roundSelect': 'Select round',
+    'picker.roundClear': 'Clear round',
+    'picker.undigested': 'New commits since the last AI summary (not yet reviewed)',
+    'picker.undigestedCount': '{n} unreviewed commits',
     'impact.factors': 'Risk factors (why this level)',
     'impact.points': 'Impacted points',
     'impact.keyPoints': 'Key components',
@@ -711,6 +734,7 @@ export const WORKSPACE_DICT = {
     'impact.funcCallers': 'Impact on callers',
     'cache.hit': 'from cache',
     'cache.regenerate': 'Regenerate',
+    'cost.tooltip': 'Estimated cost of this AI call (DeepSeek pricing)',
     'exec.create': 'New run',
     'exec.formTitle': 'What to do (one line)',
     'exec.formDesc': 'Requirement: goal, modules, acceptance',
@@ -736,6 +760,9 @@ export const WORKSPACE_DICT = {
     'notes.copyMd': 'Copy MD',
     'notes.copyMdHint': 'Copy this note as Markdown to the clipboard',
     'notes.copyMdDone': 'Copied as Markdown',
+    'notes.exportMd': 'Export MD',
+    'notes.exportMdHint': 'Download as a .md file',
+    'notes.exportDone': 'Exported as .md',
     'notes.digestNever': 'No AI summary generated yet',
     'notes.digestPending': '{n} new commits since the last summary',
     'detail.saveNote': 'Save as note',
@@ -941,6 +968,12 @@ function formatActionResult(data: Record<string, unknown>): string {
   }
   if (lines.length === 1) lines.push('成功')
   return lines.join('\n')
+}
+
+/** LLM 成本（估）徽标：无值（未产生调用 / 旧缓存不带成本）时返回 null 不占位。 */
+function renderCostBadge(usd: number | undefined, title: string): React.ReactNode {
+  if (usd === undefined) return null
+  return <span style={styles.badge('#8b949e')} title={title}>≈${usd.toFixed(4)}</span>
 }
 
 const styles: Record<string, React.CSSProperties> = {
@@ -1340,7 +1373,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [fixExpanded, setFixExpanded] = useState<Record<string, boolean>>({})
   const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
   const [aiSummarizing, setAiSummarizing] = useState(false)
-  const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number } | null>(null)
+  const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number; costUsd?: number } | null>(null)
   const [narrativeBusy, setNarrativeBusy] = useState(false)
   const [peek, setPeek] = useState<{ path: string; line: number } | null>(null)
   const [peekData, setPeekData] = useState<PeekPayload | null>(null)
@@ -1417,7 +1450,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         setNarrativeError(String(data['error'] ?? 'error'))
         return
       }
-      setNarrative({ narrative: String(data['narrative'] ?? ''), cached: data['cached'] === true, generatedAt: data['generatedAt'] })
+      setNarrative({
+        narrative: String(data['narrative'] ?? ''),
+        cached: data['cached'] === true,
+        generatedAt: data['generatedAt'] === undefined ? undefined : Number(data['generatedAt']),
+        costUsd: data['costUsd'] === undefined ? undefined : Number(data['costUsd']),
+      })
     } catch (error: unknown) {
       setNarrativeError(error instanceof Error ? error.message : String(error))
     } finally {
@@ -1458,6 +1496,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     if (!selectedTargets.includes(target)) {
       await loadDetail(target, false)
     }
+  }
+
+  /** 整轮选择：整轮已选时再点 = 取消整轮；新勾选的提交各自拉取 AI 解读。 */
+  const selectRound = (shas: string[]): void => {
+    setImpact(null)
+    setReviews({})
+    if (shas.every((sha) => selectedTargets.includes(sha))) {
+      setSelectedTargets((previous) => previous.filter((sha) => !shas.includes(sha)))
+      return
+    }
+    const added = shas.filter((sha) => !selectedTargets.includes(sha))
+    setSelectedTargets((previous) => Array.from(new Set([...previous, ...shas])))
+    for (const sha of added) void loadDetail(sha, false)
   }
 
   /** 拉取单条提交的 AI 解读；force=true 时绕过缓存强制重算。失败写入错误占位（卡片不崩溃）。 */
@@ -1613,6 +1664,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const toggleNotePin = async (note: NoteEntry): Promise<void> => {
     await post('/project-control/api/notes/update', { id: note.id, pinned: note.pinned !== true })
     await loadNotes()
+  }
+
+  /** 笔记导出为 .md 文件（浏览器端 Blob 下载；文件名按标题清洗，非法字符替换为下划线）。 */
+  const exportNote = (note: NoteEntry): void => {
+    const md = `# ${note.title}\n\n${note.content}\n`
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = (note.title.replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 60) || 'note') + '.md'
+    anchor.click()
+    URL.revokeObjectURL(url)
+    setActionResult('✓ ' + t('notes.exportDone'))
   }
 
   /** AI 学习总结：对比上次总结做增量更新，把笔记+项目档案提炼成一份「活」的总结文档。 */
@@ -1911,8 +1975,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   }, [])
 
   // 进入提交/笔记/Review 页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
+  // 提交页也拉笔记：轮次未消化标记需要「上次 AI 总结时间」。
   useEffect(() => {
-    if (tab === 'commits') void loadCommits()
+    if (tab === 'commits') { void loadCommits(); void loadNotes() }
     if (tab === 'notes') { void loadNotes(); void loadMemories(); if (commitsData === null) void loadCommits() }
     if (tab === 'review') void loadIssues()
     if (tab === 'execution') { void loadScheduled(); if (runDetail !== null) void loadRunDetail(runDetail.run.id) }
@@ -2054,6 +2119,43 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     ? allTargets
     : allTargets.filter((entry) => (entry.label + entry.meta).toLowerCase().includes(pickerFilter.trim().toLowerCase()))
 
+  // ── 轮次聚类与未消化标记 ── 聚类规则与服务端 clusterCommits 一致（时间窗口 +
+  // 文件零重叠，见 commit-rounds.ts）；未消化 = 上次 AI 总结之后的提交。
+  const commitBySha = new Map((commitsData?.commits ?? []).map((commit) => [commit.sha, commit]))
+  const lastSummaryAt = notes
+    .filter((note) => note.sha === 'summary')
+    .sort((left, right) => right.createdAt - left.createdAt)[0]?.createdAt
+  const isUndigested = (date: number): boolean => lastSummaryAt === undefined || date > lastSummaryAt
+  const undigestedCount = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit.date)).length
+  const commitRounds = clusterIntoRounds(commitsData?.commits ?? [])
+
+  /** 下拉框的提交行（含未消化圆点；working 条目不标）。 */
+  const renderPickerRow = (entry: { key: string; label: string; meta: string; sha: string }): React.ReactNode => {
+    const commit = commitBySha.get(entry.sha)
+    const undigested = commit !== undefined && isUndigested(commit.date)
+    return (
+      <div
+        key={entry.key}
+        style={{
+          padding: '7px 12px', cursor: 'pointer', display: 'flex', gap: '8px', alignItems: 'center',
+          background: selectedTargets.includes(entry.sha) ? 'rgba(37,99,235,0.07)' : 'transparent',
+        }}
+        onClick={() => { void toggleTarget(entry.sha) }}
+      >
+        <span style={{ width: '14px', color: 'var(--dsw-alias-brand-primary, #2563eb)', fontWeight: 700 }}>
+          {selectedTargets.includes(entry.sha) ? '✓' : ''}
+        </span>
+        {undigested && (
+          <span title={t('picker.undigested')} style={{ color: themeAwareText('#d97706'), fontSize: '10px', flexShrink: 0 }}>●</span>
+        )}
+        <span style={{ minWidth: 0 }}>
+          <span style={{ display: 'block', fontSize: '12px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.label}</span>
+          <span style={{ display: 'block', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{entry.meta}</span>
+        </span>
+      </div>
+    )
+  }
+
   const impactRiskColor = themeAwareText(impact === null ? '#57606a' : (RISK_COLOR[impact.riskLevel] ?? '#57606a'))
 
   const commitsTab = (
@@ -2104,25 +2206,43 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <button style={styles.secondary} onClick={() => { setSelectedTargets([]) }}>{t('picker.clear')}</button>
                 </div>
                 <div style={{ maxHeight: 420, overflowY: 'auto' }}>
-                  {allTargets.map((entry) => (
-                    <div
-                      key={entry.key}
-                      style={{
-                        padding: '7px 12px', cursor: 'pointer', display: 'flex', gap: '8px', alignItems: 'center',
-                        background: selectedTargets.includes(entry.sha) ? 'rgba(37,99,235,0.07)' : 'transparent',
-                      }}
-                      onClick={() => { void toggleTarget(entry.sha) }}
-                    >
-                      <span style={{ width: '14px', color: 'var(--dsw-alias-brand-primary, #2563eb)', fontWeight: 700 }}>
-                        {selectedTargets.includes(entry.sha) ? '✓' : ''}
-                      </span>
-                      <span style={{ minWidth: 0 }}>
-                        <span style={{ display: 'block', fontSize: '12px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.label}</span>
-                        <span style={{ display: 'block', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{entry.meta}</span>
-                      </span>
-                    </div>
-                  ))}
-                  {filteredTargets.length === 0 && <div style={styles.empty}>{t('picker.noMatch')}</div>}
+                  {pickerFilter.trim() === '' ? (
+                    (() => {
+                      // 浏览视图：working 条目 + 按轮次分组的提交（单提交轮不显示组头，避免噪音）。
+                      const nodes: React.ReactNode[] = []
+                      const working = allTargets.find((entry) => entry.sha === 'working')
+                      if (working !== undefined) nodes.push(renderPickerRow(working))
+                      const bySha = new Map(allTargets.filter((entry) => entry.sha !== 'working').map((entry) => [entry.sha, entry]))
+                      commitRounds.forEach((round, roundIndex) => {
+                        const entries = round.commits
+                          .map((commit) => bySha.get(commit.sha))
+                          .filter((entry): entry is { key: string; label: string; meta: string; sha: string } => entry !== undefined)
+                        if (entries.length === 0) return
+                        if (entries.length === 1) {
+                          nodes.push(renderPickerRow(entries[0]!))
+                          return
+                        }
+                        const shas = entries.map((entry) => entry.sha)
+                        const allSelected = shas.every((sha) => selectedTargets.includes(sha))
+                        nodes.push(
+                          <div key={`round-${roundIndex}`} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 12px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
+                            <span style={{ fontWeight: 600 }}>
+                              🗓 {t(roundIndex === 0 ? 'picker.roundLatest' : 'picker.round').replace('{n}', String(roundIndex + 1))} · {String(entries.length)} {t('repo.commits')} · {new Date(round.firstAt).toLocaleDateString()}–{new Date(round.lastAt).toLocaleDateString()}
+                            </span>
+                            <span style={{ flex: 1 }} />
+                            <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '10px' }} onClick={() => { selectRound(shas) }}>
+                              {allSelected ? t('picker.roundClear') : t('picker.roundSelect')}
+                            </button>
+                          </div>,
+                        )
+                        for (const entry of entries) nodes.push(renderPickerRow(entry))
+                      })
+                      return nodes
+                    })()
+                  ) : (
+                    filteredTargets.map((entry) => renderPickerRow(entry))
+                  )}
+                  {(pickerFilter.trim() === '' ? allTargets : filteredTargets).length === 0 && <div style={styles.empty}>{t('picker.noMatch')}</div>}
                 </div>
               </div>
             </>
@@ -2130,6 +2250,11 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         </div>
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px', alignItems: 'center' }}>
           <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('picker.hint')}</span>
+          {undigestedCount > 0 && (
+            <span title={t('picker.undigested')} style={{ fontSize: '11px', color: themeAwareText('#d97706') }}>
+              ● {t('picker.undigestedCount').replace('{n}', String(undigestedCount))}
+            </span>
+          )}
           {detailLoading && <span style={styles.badge('#dcdcaa')}>{t('detail.aiLoading')}</span>}
         </div>
       </Card>
@@ -2147,6 +2272,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             {narrative !== null && narrative.cached && (
               <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('cache.hit')}{narrative.generatedAt !== undefined ? ' · ' + new Date(narrative.generatedAt).toLocaleString() : ''}</span>
             )}
+            {narrative !== null && renderCostBadge(narrative.costUsd, t('cost.tooltip'))}
             {narrative !== null && (
               <>
                 <span style={{ flex: 1 }} />
@@ -2172,6 +2298,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 {d.analysisCached === true && (
                   <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{d.analysisGeneratedAt ? ' · ' + new Date(d.analysisGeneratedAt).toLocaleString() : ''}</span>
                 )}
+                {renderCostBadge(d.analysisCostUsd, t('cost.tooltip') + (d.analysisTokens ? `（in ${d.analysisTokens.input} / out ${d.analysisTokens.output} tokens）` : ''))}
                 <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadDetail(target, true) }}>{t('cache.regenerate')}</button>
                 <span style={{ flex: 1 }} />
                 <button
@@ -2275,6 +2402,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
               {t('cache.hit')}{impact.generatedAt ? ' · ' + new Date(impact.generatedAt).toLocaleString() : ''}
             </span>
           )}
+          {impact !== null && renderCostBadge(impact.explanationsCostUsd, t('cost.tooltip'))}
           {impact !== null && (
             <button style={{ ...styles.secondary, marginLeft: '8px', padding: '2px 8px', fontSize: '11px' }} disabled={impactLoading} onClick={() => { void loadImpact(true) }}>
               {t('cache.regenerate')}
@@ -2383,6 +2511,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   {r.cached === true && (
                     <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{r.generatedAt ? ' · ' + new Date(r.generatedAt).toLocaleString() : ''}</span>
                   )}
+                  {renderCostBadge(r.costUsd, t('cost.tooltip'))}
                   <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadReviews(true) }}>{t('cache.regenerate')}</button>
                 </div>
                 {r.verdict !== '' && (
@@ -2940,6 +3069,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                           const md = `# ${note.title}\n\n${note.content}\n`
                           void navigator.clipboard?.writeText(md).then(() => setActionResult('✓ ' + t('notes.copyMdDone'))).catch(() => setActionResult('✗ 复制失败'))
                         }}>📋 {t('notes.copyMd')}</button>
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} title={t('notes.exportMdHint')} onClick={() => { exportNote(note) }}>💾 {t('notes.exportMd')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} title={t('notes.toMemoryHint')} onClick={() => { setMemoryTitle(note.title); setMemoryContent(note.content); setActionResult(t('notes.toMemoryDone')) }}>🧠 {t('notes.toMemory')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setEditingNote({ id: note.id, title: note.title, content: note.content, tags: (note.tags ?? []).join(', ') }) }}>{t('notes.edit')}</button>
                         <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setConfirmDialog({ title: '删除这条笔记？', message: '「' + note.title + '」将被永久删除，不可恢复。', danger: true, onConfirm: () => { void removeNote(note.id) } }) }}>✕</button>

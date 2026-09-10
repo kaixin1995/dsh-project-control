@@ -1,7 +1,7 @@
 # dsh-project-control 项目全量指南（新会话必读）
 
 > **目的**：新 AI 会话打开本文件即可完整接手项目——背景、铁律、架构、函数级地图、数据模型、API 清单、构建/测试/发布流程、已验证事实、未完成事项，全部在此。
-> **最后更新**：2026-09-10 · 版本 v0.2.3 · 80/80 测试绿
+> **最后更新**：2026-09-10 · 版本 v0.2.3 · 84/84 测试绿
 
 ---
 
@@ -54,10 +54,13 @@ GitHub 远端：`https://github.com/kaixin1995/dsh-project-control.git`（公开
 | 14 | 工作轮次叙事：多选≥2 提交整体解读（分几步、每步对应哪些提交、演进脉络） | ✅ |
 | 15 | peek：任何 file:line（风险点/调用点/问题证据）可点击弹出代码上下文 | ✅ |
 | 16 | 顶栏运行徽标 ▶N/✗N；AI 总结消化度提示（上次后有 N 新提交未消化） | ✅ |
+| 17 | 提交自动聚类：核查下拉按「轮次」分组（时间窗口+文件重叠），「选整轮」一键多选，未消化提交圆点标记 | ✅ |
+| 18 | 核查页 LLM 成本展示：解读/影响函数说明/最优性/轮次叙事各带 ≈$ 成本徽标（缓存命中也带生成时成本） | ✅ |
+| 19 | 笔记导出为 .md 文件（浏览器 Blob 下载，文件名按标题清洗） | ✅ |
 
 **明确不做**：失败自动回滚 git 改动（危险）；聊天区与工作台界面层互通（低性价比）；步骤 DAG 并行、敏感步骤审批门（四期增强，未排期）；npm 发布（GitHub 安装已够用）。
 
-**已知简化交付**：提交自动聚类（现为手选后解读）；分支合并自动提醒归一（现手动按钮）；笔记导出为 .md 文件（现复制到剪贴板）；核查页单次 LLM 成本展示（现只有执行中心有 Run 成本）。
+**已知简化交付**：分支合并自动提醒归一（现手动按钮）。
 
 ---
 
@@ -75,7 +78,7 @@ dsh-project-insight/              ← 独立 git 仓库（peer 于本体 package
 ├── docs/                         ← 产品总纲、V1.0 技术设计（工程权威）、design-scope/v04-mapping（历史参考）
 │                                   （development-plan.md 与 SESSION-HANDOFF.md 已按业主要求删除）
 ├── lib/                          ← 预构建产物，随 git 提交（远端机器无法本地构建——vendor 别名是机器本地）
-├── tests/                        ← 25 spec 文件 80 测试
+├── tests/                        ← 26 spec 文件 84 测试
 └── src/
     ├── index.ts                  ← 插件主入口（见 §5.1）
     ├── config.ts                 ← 全量配置 schema + 默认值 + resolveFullConfig（见 §6）
@@ -141,6 +144,8 @@ dsh-project-insight/              ← 独立 git 仓库（peer 于本体 package
             ├── theme.ts          ← 主题对比度引擎（唯一实现）：themeAwareText 双向 ≥4.5:1；
             │                       不变式：强调色文字必须经 themeAwareText（渲染期调用），
             │                       active 高亮背景一律 button-info-fill，禁止 brand-primary 作背景
+            ├── commit-rounds.ts  ← 提交轮次聚类（时间窗口+文件重叠，与服务端 clusterCommits 同规则
+            │                       ——两处改动必须同步；核查下拉分组/选整轮/未消化标记用）
             ├── WorkspaceFrame.tsx ← 3400 行主组件（六页签全部 UI，见 §5.5）
             └── ChangeCard.ts      ← analyze_change 聊天卡片（dsw-alias 主题变量）
 ```
@@ -320,7 +325,7 @@ ConfirmedItemRecord{id,projectId,type,forbiddenPaths[],status,createdAt}   ← �
 
 ## 8. HTTP API 全清单（`/project-control/api/*`，45 条）
 
-**核查链**：`POST /commits`(GET 提交列表) · `POST /commit-detail`(WHAT/LOGIC/RISK LLM+缓存) · `POST /impact-scope`(函数级影响+LLM 逐函数说明) · `POST /review`(评审→issueList 落库) · `POST /file-diff`(文件对比) · `POST /work-narrative`(轮次叙事) · `POST /peek`(代码上下文，**路径逃逸 403**)
+**核查链**：`POST /commits`(GET 提交列表) · `POST /commit-detail`(WHAT/LOGIC/RISK LLM+缓存+成本) · `POST /impact-scope`(函数级影响+LLM 逐函数说明+成本) · `POST /review`(评审→issueList 落库，带成本) · `POST /file-diff`(文件对比) · `POST /work-narrative`(轮次叙事，带成本) · `POST /peek`(代码上下文，**路径逃逸 403**)
 
 **执行链**：`POST /runs/start`(建变更+生成编排**不启动**，defaultModelProvider/Id 作全计划默认) · `POST /runs/plan/update`(编辑编排=新版本计划) · `POST /runs/launch` · `GET /runs/detail`(步骤时间线+RunContext) · `POST /runs/resume`(continue|skip-current) · `POST /verify`(验收，真跑 build/test 命令)
 
@@ -345,7 +350,7 @@ ConfirmedItemRecord{id,projectId,type,forbiddenPaths[],status,createdAt}   ← �
 ```sh
 cd D:\Code\deepseek-harness\dsh-project-insight
 pnpm run build        # build.mjs(host lib/index.js) + build-client.mjs(lib/client.js)；esbuild 不查类型
-pnpm test             # vitest 25 文件 80 测试（无 key 也全跑；内存库+临时 git 仓）
+pnpm test             # vitest 26 文件 84 测试（无 key 也全跑；内存库+临时 git 仓）
 pnpm run typecheck    # tsc --noEmit（react/vendor/analysis 三处有既有基线噪音，见 §11）
 ```
 
@@ -394,14 +399,11 @@ node "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/l
 
 ## 12. 遗留事项（下一步可选）
 
-1. **提交自动聚类**（时间+文件重叠自动发现"轮次"，现在手选）
-2. **分支合并自动提醒归一**（现在手动按钮）
-3. **核查页 LLM 成本展示**（现在只有执行中心有）
-4. **笔记导出 .md 文件**（现在复制剪贴板）
-5. **DAG 并行步骤 / 敏感步骤审批门**（四期，未排期）
-6. `src/analysis/` 三个文件的基线 TS 类型噪音（运行正常，从未清）
-7. ops 角色完成协议服从率依赖模型（催促已加，非 100%；skip 策略兜底）
-8. npm 发布（GitHub 安装已可用；如做：npmjs 注册→npm login→npm publish，包名 dsh-project-control 可用）
+1. **分支合并自动提醒归一**（现在手动按钮）
+2. **DAG 并行步骤 / 敏感步骤审批门**（四期，未排期）
+3. `src/analysis/` 三个文件的基线 TS 类型噪音（运行正常，从未清）
+4. ops 角色完成协议服从率依赖模型（催促已加，非 100%；skip 策略兜底）
+5. npm 发布（GitHub 安装已可用；如做：npmjs 注册→npm login→npm publish，包名 dsh-project-control 可用）
 
 ---
 
@@ -409,6 +411,6 @@ node "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/l
 
 1. 读本文件 + `AGENTS.md`（工程铁律细节）+ `README.md`（对外说明）
 2. `git -C D:\Code\deepseek-harness status --short | wc -l` 必须为 0（本体零改动）
-3. `pnpm test` 确认 80/80
+3. `pnpm test` 确认 84/84
 4. 业主提需求 → 对照 §3 确认是否已实现 → 开发（补丁方法论 §2.10）→ 构建 → 测试 → **有界**线上验证 → 重启（§10）→ 验证无问题后一次提交（§2.2）
 5. 永远不要：改本体、无限等待、频繁碎提交、:has()、新增会话事件、并发第二实例
