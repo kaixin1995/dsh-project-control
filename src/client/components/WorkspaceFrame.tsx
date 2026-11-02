@@ -411,12 +411,15 @@ export interface WorkspaceFrameProps {
   t?: (key: string) => string
   /** 当前会话 id（官方 session 标准属性；切换会话时重新撑开工作台轨道）。 */
   sessionId?: string
+  /** 新版宿主由外层加法浮层管理布局，不使用旧版 details 换列。 */
+  layoutMode?: 'legacy' | 'overlay'
 }
 
 /** 工作台文案词典（zh / en）。 */
 export const WORKSPACE_DICT = {
   zh: {
     'workspace.title': '项目核查台',
+    'workspace.selectSession': '请先在左侧选择项目下的会话，工作台才会显示该项目的数据。',
     'tab.commits': '提交核查',
     'tab.overview': '项目总览',
     'tab.execution': '执行中心',
@@ -683,6 +686,7 @@ export const WORKSPACE_DICT = {
   },
   en: {
     'workspace.title': 'Review Desk',
+    'workspace.selectSession': 'Select a session under a workspace on the left to view its project data.',
     'tab.commits': 'Commit Review',
     'tab.overview': 'Overview',
     'tab.execution': 'Execution',
@@ -1337,6 +1341,11 @@ function Card(props: { title?: React.ReactNode; children?: React.ReactNode }) {
  */
 export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const t = props.t ?? fallbackT
+  const activeRef = useRef(true)
+  useEffect(() => {
+    activeRef.current = true
+    return () => { activeRef.current = false }
+  }, [])
   const [tab, setTab] = useState<TabKey>('commits')
   const [state, setState] = useState<WorkspaceState | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -1420,7 +1429,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const response = await fetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...body, sessionId: props.sessionId }),
+        body: JSON.stringify({ ...body, sessionId: props.sessionId ?? '' }),
         signal: controller.signal,
       })
       const data: unknown = await response.json()
@@ -1441,7 +1450,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const timer = setTimeout(() => controller.abort(), 10_000)
       const response = await fetch('/project-control/api/peek', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path, line, sessionId: props.sessionId }),
+        body: JSON.stringify({ path, line, sessionId: props.sessionId ?? '' }),
         signal: controller.signal,
       })
       clearTimeout(timer)
@@ -1479,14 +1488,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
+  const commitsRequestRef = useRef(0)
   const loadCommits = async (): Promise<void> => {
+    const request = ++commitsRequestRef.current
     try {
       const response = await fetch(`/project-control/api/commits?sessionId=${encodeURIComponent(props.sessionId ?? '')}&limit=60`)
       const data: unknown = await response.json()
       if (!response.ok) throw new Error((data as { error?: string }).error ?? `HTTP ${response.status}`)
+      if (!activeRef.current || request !== commitsRequestRef.current) return
       setCommitsData(data as CommitsPayload)
       setCommitsError(null)
     } catch (error: unknown) {
+      if (!activeRef.current || request !== commitsRequestRef.current) return
+      setCommitsData(null)
       setCommitsError(error instanceof Error ? error.message : String(error))
     }
   }
@@ -1534,7 +1548,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   const pumpDetailPool = (): void => {
     const pool = detailPoolRef.current
-    while (pool.active < MAX_DETAIL_CONCURRENCY && pool.pending.length > 0) {
+    while (activeRef.current && pool.active < MAX_DETAIL_CONCURRENCY && pool.pending.length > 0) {
       const job = pool.pending.shift()!
       pool.active += 1
       void loadDetailOnce(job.target, job.force)
@@ -1611,6 +1625,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setReviewLoading(true)
     try {
       for (const target of selectedTargets) {
+        if (!activeRef.current) break
         const { ok, data } = await post('/project-control/api/review', { sha: target, force })
         const payload = data as unknown as ReviewPayload
         setReviews((previous) => ({
@@ -1832,7 +1847,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   /** 加载 Run 详情（步骤时间线 + 任务工作记忆）。 */
   const loadRunDetail = async (id: string): Promise<void> => {
     try {
-      const response = await fetch('/project-control/api/runs/detail?id=' + encodeURIComponent(id))
+      const response = await fetch('/project-control/api/runs/detail?id=' + encodeURIComponent(id) + '&sessionId=' + encodeURIComponent(props.sessionId ?? ''))
       const data: unknown = await response.json()
       if (response.ok) setRunDetail(data as RunDetail)
     } catch {
@@ -1948,6 +1963,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // 构建哈希重注入（幂等，已存在则跳过）。
   const layoutFace = (props as unknown as { layout?: { openDetails?: () => void } }).layout
   useEffect(() => {
+    if (props.layoutMode === 'overlay') return
     applyStatsLineClamp()
     const timer = setInterval(() => {
       if (document.getElementById('pc-stats-clamp') === null) applyStatsLineClamp()
@@ -1956,7 +1972,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       if (width !== -1 && width < 50) layoutFace?.openDetails?.()
     }, 500)
     return () => { clearInterval(timer) }
-  }, [props.sessionId, layoutFace])
+  }, [props.sessionId, props.layoutMode, layoutFace])
 
   /** 以 important 内联样式直接写官方网格模板（最高优先级，任何重渲染不会覆盖）。 */
   const frameTemplateSet = (chatPx: number): void => {
@@ -1980,6 +1996,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // 官方 React 重渲染会改写内联模板，MutationObserver 按当前值守卫重写
   // （值相同不会触发新的 mutation，无回环）。
   useEffect(() => {
+    if (props.layoutMode === 'overlay') return
     const saved = Number(localStorage.getItem('pc.chatWidth') ?? '')
     const apply = (): void => {
       // 挂载/官方重渲染时无条件夺回模板（important 覆写；值相同时官方样式变更
@@ -1998,7 +2015,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       // 官方「详情」面板虽回到该列但 0 宽不可见（0.1.2 实测回归）。
       collapseFrameTemplate()
     }
-  }, [])
+  }, [props.layoutMode])
 
   /** 分隔条拖拽：调整聊天列宽（工作台吸收剩余空间），写入 localStorage 记忆。 */
   const onDividerDown = (e: React.PointerEvent): void => {
@@ -2018,17 +2035,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   useEffect(() => {
     let disposed = false
+    let generation = 0
     const load = async (): Promise<void> => {
+      const request = ++generation
       try {
         const response = await fetch('/project-control/api/state?sessionId=' + encodeURIComponent(props.sessionId ?? ''), { headers: { accept: 'application/json' } })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const data: unknown = await response.json()
-        if (!disposed) {
+        if (!disposed && request === generation) {
           setState(data as WorkspaceState)
           setLoadError(null)
         }
       } catch (error: unknown) {
-        if (!disposed) setLoadError(error instanceof Error ? error.message : String(error))
+        if (!disposed && request === generation) setLoadError(error instanceof Error ? error.message : String(error))
       }
     }
     void load()
@@ -2037,7 +2056,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       disposed = true
       clearInterval(timer)
     }
-  }, [])
+  }, [props.sessionId])
 
   // 进入提交/笔记/Review 页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
   // 提交页也拉笔记：轮次未消化标记需要「上次 AI 总结时间」。
@@ -3511,15 +3530,15 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   return (
     <div style={styles.root} data-testid="project-control-workspace">
-      <style>{LAYOUT_STYLE}</style>
-      <div
+      {props.layoutMode !== 'overlay' && <style>{LAYOUT_STYLE}</style>}
+      {props.layoutMode !== 'overlay' && <div
         data-testid="project-control-divider"
         onPointerDown={onDividerDown}
         style={{
           position: 'absolute', top: 0, bottom: 0, right: -4, width: 8,
           cursor: 'col-resize', zIndex: 20,
         }}
-      />
+      />}
       <div style={styles.nav}>
         <span style={styles.title}>{t('workspace.title')}</span>
         {tabs.map((entry) => (
@@ -3544,14 +3563,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         })()}
       </div>
       <div style={styles.body}>
-        {loadError !== null && <div style={styles.empty}>{t('error.load')}: {loadError}</div>}
-        {state?.ready === false && <div style={styles.empty}>{state.reason ?? ''}</div>}
-        {tab === 'commits' && commitsTab}
-        {tab === 'overview' && overviewTab}
-        {tab === 'execution' && executionTab}
-        {tab === 'review' && reviewTab}
-        {tab === 'notes' && notesTab}
-        {tab === 'settings' && settingsTab}
+        {props.sessionId === undefined || props.sessionId === '' ? <div style={styles.empty}>{t('workspace.selectSession')}</div> : <>
+          {loadError !== null && <div style={styles.empty}>{t('error.load')}: {loadError}</div>}
+          {state?.ready === false && <div style={styles.empty}>{state.reason ?? ''}</div>}
+          {tab === 'commits' && commitsTab}
+          {tab === 'overview' && overviewTab}
+          {tab === 'execution' && executionTab}
+          {tab === 'review' && reviewTab}
+          {tab === 'notes' && notesTab}
+          {tab === 'settings' && settingsTab}
+        </>}
       </div>
       {confirmDialog !== null && (
         <ConfirmDialog

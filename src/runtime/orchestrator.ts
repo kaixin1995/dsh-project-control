@@ -207,7 +207,7 @@ export class RunOrchestrator {
   private async loadRunContext(run: RunRecord, change: ChangeRecord, cwd: string): Promise<RunContextRecord> {
     const existing = this.store.runContexts.get(run.id)
     if (existing !== undefined) return existing
-    const checkpoint = this.store.checkpoints.list().at(-1)
+    const checkpoint = this.store.checkpoints.list((item) => item.projectId === change.projectId).at(-1)
     const project = this.store.projects.get(change.projectId)
     const status = await this.deps.git.getStatus(cwd).catch(() => undefined)
     const branch = status?.branch
@@ -835,7 +835,7 @@ export class RunOrchestrator {
     const memoryBlock = role === 'ops'
       ? ''
       : this.memoryContext?.synthesizeContext(change.projectId, definition.targetFiles ?? [], branch) ?? ''
-    const hotFiles = this.store.checkpoints.list().at(-1)?.hotFiles ?? []
+    const hotFiles = this.store.checkpoints.list((item) => item.projectId === change.projectId).at(-1)?.hotFiles ?? []
     const touchedHot = hotFiles.filter((hot) => (definition.targetFiles ?? []).some((target) => target.includes(hot)))
     const riskHint = touchedHot.length === 0 || role === 'ops'
       ? ''

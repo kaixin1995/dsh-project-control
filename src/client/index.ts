@@ -18,6 +18,7 @@
 import React from 'react'
 import { ChangeCard } from './components/ChangeCard.ts'
 import { WORKSPACE_DICT, WorkspaceFrame } from './components/WorkspaceFrame.tsx'
+import { ModernWorkspace } from './components/ModernWorkspace.tsx'
 
 const NS = 'project-control'
 
@@ -52,7 +53,7 @@ export function apply(ctx: any): void {
           const timer = setTimeout(() => layout?.openDetails?.(), 0)
           return () => { clearTimeout(timer) }
         }, [props.sessionId])
-        return React.createElement(WorkspaceFrame, { ...props, layout })
+        return React.createElement(WorkspaceFrame, { ...props, key: props.sessionId ?? 'landing', layout })
       },
     )
   }
@@ -75,6 +76,29 @@ export function apply(ctx: any): void {
   const fireToggle = (enabled: boolean): void => {
     window.dispatchEvent(new CustomEvent(TOGGLE_EVENT, { detail: enabled }))
   }
+  const dismissModernWorkspace = (): void => {
+    if (!workspaceEnabled) return
+    workspaceEnabled = false
+    fireToggle(false)
+  }
+
+  // 0.2.x 的会话服务可选注入：旧版没有新版布局接口，仍沿用 details 分支。
+  ctx.inject(['uiSession'], (scope: any) => {
+    if (layout.panelInfo === undefined) return
+    const current = scope.uiSession.adapter.current
+    scope.slots.inject('shell.overlay', () => scope.slots.register({
+      name: 'shell.overlay', id: 'project-control-workspace',
+    }, () => {
+      const [enabled, setEnabled] = React.useState(workspaceEnabled)
+      React.useEffect(() => {
+        const handler = (event: Event): void => { setEnabled((event as CustomEvent<boolean>).detail) }
+        window.addEventListener(TOGGLE_EVENT, handler)
+        return () => { window.removeEventListener(TOGGLE_EVENT, handler) }
+      }, [])
+      return React.createElement(ModernWorkspace, { current, panelInfo: layout.panelInfo, enabled, onDismiss: dismissModernWorkspace })
+    }))
+  })
+
   ctx.slots.inject('sidebar.footer.action', () => {
     return ctx.slots.register({
       name: 'sidebar.footer.action',
@@ -102,14 +126,19 @@ export function apply(ctx: any): void {
           onClick: () => {
             workspaceEnabled = !workspaceEnabled
             try {
-              if (workspaceEnabled && disposeWorkspace === undefined) registerWorkspace()
-              else if (!workspaceEnabled) {
-                unregisterWorkspace()
-                // 收起右侧轨道：否则官方 DetailsPanel 顶回来，残留空态面板
-                // （「点击消息流中的工具行查看详情」）。
-                layout?.closeDetails?.()
+              if (typeof layout?.openDetails === 'function') {
+                if (workspaceEnabled && disposeWorkspace === undefined) registerWorkspace()
+                else if (!workspaceEnabled) {
+                  unregisterWorkspace()
+                  layout?.closeDetails?.()
+                }
+              } else if (workspaceEnabled && layout.panelInfo !== undefined) {
+                if (layout.panelInfo.getSnapshot().activePanelId !== null) layout.selectPanel(null)
+                const rightbar = ctx.get('sidebarRight')
+                if (rightbar?.isExpanded()) rightbar.toggleExpanded()
               }
             } catch (error: unknown) {
+              workspaceEnabled = false
               console.warn('[project-control] workspace toggle failed', error)
             }
             fireToggle(workspaceEnabled)
