@@ -1434,7 +1434,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [reviews, setReviews] = useState<Record<string, ReviewPayload>>({})
   const [reviewLoading, setReviewLoading] = useState(false)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string>>({})
-  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; danger?: boolean; onConfirm: () => void } | null>(null)
+  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; danger?: boolean; confirmLabel?: string; alt?: { label: string; onAlt: () => void }; onConfirm: () => void } | null>(null)
   const [notes, setNotes] = useState<NoteEntry[]>([])
   const [noteTitle, setNoteTitle] = useState('')
   const [noteContent, setNoteContent] = useState('')
@@ -3663,7 +3663,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         <button
                           style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
                           title={t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length))}
-                          onClick={() => { setConfirmDialog({ title: t('review.batchVerifyConfirmTitle'), message: t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length)), danger: false, onConfirm: () => { void runBatchVerify(checkedOpenTargets) } }) }}
+                          onClick={() => { setConfirmDialog({ title: t('review.batchVerifyConfirmTitle'), message: t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length)), danger: false, confirmLabel: t('review.batchVerify'), onConfirm: () => { void runBatchVerify(checkedOpenTargets) } }) }}
                         >🔍 {t('review.batchVerify')}({String(checkedOpenTargets.length)})</button>
                       )}
                       {checkedOpen.length > 0 && (
@@ -3719,6 +3719,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                                 title: t('review.falsePositiveTitle'),
                                 message: t('review.falsePositiveMsg').replace('{title}', issue.title),
                                 danger: false,
+                                confirmLabel: t('review.falsePositive'),
                                 onConfirm: () => { void post('/project-control/api/issues/status', { id: issue.id, status: 'rejected' }).then(async ({ ok }) => { if (ok) await loadIssues() }) },
                               })
                             }}
@@ -3878,6 +3879,11 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           title={confirmDialog.title}
           message={confirmDialog.message}
           danger={confirmDialog.danger}
+          confirmLabel={confirmDialog.confirmLabel}
+          alt={confirmDialog.alt === undefined ? undefined : {
+            label: confirmDialog.alt.label,
+            onAlt: () => { confirmDialog.alt!.onAlt(); setConfirmDialog(null) },
+          }}
           onCancel={() => { setConfirmDialog(null) }}
           onConfirm={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }}
         />
