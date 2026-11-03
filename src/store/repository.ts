@@ -34,6 +34,7 @@ import type {
   MemoryBaselineRecord,
   ScheduledTaskRecord,
   ImportedChangeRecord,
+  FixPlanRecord,
 } from '../domain/models.ts'
 
 export interface EntityWithProject {
@@ -139,6 +140,7 @@ export function createInMemoryStore(): ProjectControlStore {
     runs: new DomainRepository<RunRecord, RunId>(createMemoryKvTable<RunRecord>()),
     steps: new DomainRepository<StepRecord, StepId>(createMemoryKvTable<StepRecord>()),
     attempts: new DomainRepository<AttemptRecord, AttemptId>(createMemoryKvTable<AttemptRecord>()),
+    fixPlans: new DomainRepository<FixPlanRecord, string>(createMemoryKvTable<FixPlanRecord>()),
     checkpoints: new DomainRepository<ProjectBootstrapCheckpoint, string>(createMemoryKvTable<ProjectBootstrapCheckpoint>()),
     importedChanges: new DomainRepository<ImportedChangeRecord, string>(createMemoryKvTable<ImportedChangeRecord>()),
     historyCursor: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
@@ -153,6 +155,7 @@ export function createInMemoryStore(): ProjectControlStore {
     pluginSettings: new DomainRepository<Record<string, unknown>, string>(createMemoryKvTable<Record<string, unknown>>()),
     runContexts: new DomainRepository<RunContextRecord, string>(createMemoryKvTable<RunContextRecord>()),
     scheduledTasks: new DomainRepository<ScheduledTaskRecord, string>(createMemoryKvTable<ScheduledTaskRecord>()),
+    fixPlans: new DomainRepository<FixPlanRecord, string>(createMemoryKvTable<FixPlanRecord>()),
     memoryBaselines: new DomainRepository<MemoryBaselineRecord, string>(createMemoryKvTable<MemoryBaselineRecord>()),
   }
 }
@@ -198,6 +201,8 @@ export interface ProjectControlStore {
   runContexts: DomainRepository<RunContextRecord, string>
   /** 例行任务（定时触发模板）。 */
   scheduledTasks: DomainRepository<ScheduledTaskRecord, string>
+  /** 修复方案（方案模式产出，批准后派发子 Agent）。 */
+  fixPlans: DomainRepository<FixPlanRecord, string>
   /** 记忆拉取同步基线（每项目每分支一条）。 */
   memoryBaselines: DomainRepository<MemoryBaselineRecord, string>
 }

@@ -725,7 +725,7 @@ export class RunOrchestrator {
       const prompt = this.composeStepPrompt(run, change, definition, role, cwd)
       handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'project-control' },
+        source: { kind: 'project-control' },
       }))
       // 确定性等待：whenIdle() 在代理尚未进入活动态时会立即返回（followup 竞态），
       // 改为轮询会话事件——完成协议已调用（outcome）或回合静默（有 assistant 输出且
@@ -762,7 +762,7 @@ export class RunOrchestrator {
       if (settled === 'ended' && state.outcome === undefined) {
         handle.agent.followup(createUserMessage({
           content: [{ type: 'text', text: 'You finished your turn WITHOUT calling the project_control_step_complete tool. Report now: call project_control_step_complete exactly once with a faithful summary (and changedFiles if any); set blocked only if the step truly cannot proceed.' }],
-          source: { kind: 'plugin', plugin: 'project-control' },
+          source: { kind: 'project-control' },
         }))
         settled = await waitTurn()
       }

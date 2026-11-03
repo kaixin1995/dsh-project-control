@@ -135,8 +135,22 @@ interface IssueEntry {
   fixFiles: string[]
   fixImpact: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }>
   fixDiff: string
+  /** 待评审/已派发的修复方案（方案模式产出）。 */
+  fixPlan?: { id: string; approach: string; files: string[]; impact: string; benefit: string; risk: string; status: string } | null
   createdAt: number
   updatedAt: number
+}
+
+/** 修复派发任务视图（GET /fix/status）。 */
+interface FixTaskEntry {
+  issueId: string
+  title: string
+  status: 'queued' | 'running' | 'merging' | 'redo' | 'done' | 'conflict' | 'failed' | 'cancelled'
+  attempt: number
+  summary?: string
+  files?: string[]
+  commit?: string
+  error?: string
 }
 
 /** 修复差异的行级着色渲染：+ 绿、- 红、文件头加粗、其余弱化。 */
@@ -578,6 +592,30 @@ export const WORKSPACE_DICT = {
     'review.sendChatNoSession': '请先在左侧打开该项目下的会话，再转聊天复验',
     'review.sendChatDone': '已发送 {n} 条问题到聊天窗口，模型将开始逐条复验。',
     'review.handledDone': '已把 {n} 条问题标记为已处理',
+    'fix.plan': '修复方案',
+    'fix.planApproach': '方案',
+    'fix.planImpact': '影响范围',
+    'fix.planBenefit': '收益',
+    'fix.planRisk': '风险',
+    'fix.dispatch': '🚀 派发修复',
+    'fix.dispatchHint': '把待评审方案全部派发给子 Agent 并发修复（每任务独立 worktree，合并冲突自动基于最新代码重做）',
+    'fix.dispatchDirect': '派发选中（无方案自主修）',
+    'fix.dispatchDone': '已派发 {n} 个修复任务（并发 {c}）',
+    'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案产出）',
+    'fix.status': '修复执行',
+    'fix.stop': '停止',
+    'fix.stopDone': '已停止 {n} 个修复任务',
+    'fix.taskQueued': '排队中',
+    'fix.taskRunning': '运行中',
+    'fix.taskMerging': '合并中',
+    'fix.taskRedo': '重做中',
+    'fix.taskDone': '已完成',
+    'fix.taskConflict': '冲突',
+    'fix.taskFailed': '失败',
+    'fix.taskCancelled': '已停止',
+    'fix.attempt': '第 {n} 次',
+    'fix.modelTitle': '修复并发（子 Agent 池）',
+    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰；修改后立即生效。',
 
     'plan.title': '编排计划确认',
     'plan.hint': '每步的角色决定上下文注入与默认模型（分析/操作=fast，开发=standard，规划=reasoning，验收=verifier）；可调整后再启动。',
@@ -874,6 +912,30 @@ export const WORKSPACE_DICT = {
     'review.sendChatNoSession': 'Open a session of this project on the left before sending to chat',
     'review.sendChatDone': 'Sent {n} issues to chat; the model will verify them one by one.',
     'review.handledDone': '{n} issues marked as handled',
+    'fix.plan': '修复方案',
+    'fix.planApproach': '方案',
+    'fix.planImpact': '影响范围',
+    'fix.planBenefit': '收益',
+    'fix.planRisk': '风险',
+    'fix.dispatch': '🚀 派发修复',
+    'fix.dispatchHint': '把已批准的待评审方案派发给子 Agent 并发修复（每任务独立 worktree，合并冲突自动重做）',
+    'fix.dispatchDirect': '派发选中（无方案自主修）',
+    'fix.dispatchDone': '已派发 {n} 个修复任务（并发 {c}）',
+    'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案）',
+    'fix.status': '修复执行',
+    'fix.stop': '停止',
+    'fix.stopDone': '已停止 {n} 个修复任务',
+    'fix.taskQueued': '排队中',
+    'fix.taskRunning': '运行中',
+    'fix.taskMerging': '合并中',
+    'fix.taskRedo': '重做中',
+    'fix.taskDone': '已完成',
+    'fix.taskConflict': '冲突',
+    'fix.taskFailed': '失败',
+    'fix.taskCancelled': '已停止',
+    'fix.attempt': '第 {n} 次',
+    'fix.modelTitle': '修复并发（子 Agent 池）',
+    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰。',
 
     'plan.title': 'Orchestration plan',
     'plan.hint': 'Each step role drives context injection and the default model (analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier); adjust before launching.',
@@ -1451,6 +1513,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [issueChecked, setIssueChecked] = useState<Record<string, boolean>>({})
   const [batchVerifyState, setBatchVerifyState] = useState<{ done: number; total: number } | null>(null)
   const batchStopRef = useRef(false)
+  const [fixTasks, setFixTasks] = useState<FixTaskEntry[]>([])
+  const [fixConcurrency, setFixConcurrency] = useState('3')
   const [aiSummarizing, setAiSummarizing] = useState(false)
   const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number; costUsd?: number } | null>(null)
   const [narrativeBusy, setNarrativeBusy] = useState(false)
@@ -1769,9 +1833,44 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // Review 页签实时同步：模型在聊天里回写状态（review_issue_update）后，看板 4 秒内跟上。
   useEffect(() => {
     if (tab !== 'review') return
-    const timer = setInterval(() => { void loadIssues() }, 4000)
+    const timer = setInterval(() => { void loadIssues(); void loadFixStatus() }, 4000)
     return () => { clearInterval(timer) }
   }, [tab, props.sessionId])
+
+  /** 拉取修复派发任务状态（Review 页轮询；有活动任务时驱动刷新）。 */
+  const loadFixStatus = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/fix/status?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
+      if (response.ok) {
+        const data: unknown = await response.json()
+        setFixTasks((data as { tasks: FixTaskEntry[] }).tasks ?? [])
+      }
+    } catch {
+      // 状态拉取失败不打断页面。
+    }
+  }
+
+  /** 派发修复：planIds=批准全部待评审方案；issueIds=勾选的无方案问题（自主判定修复）。 */
+  const dispatchFix = async (planIds: string[], issueIds: string[]): Promise<void> => {
+    if (planIds.length === 0 && issueIds.length === 0) {
+      setActionResult('✗ ' + t('fix.dispatchEmpty'))
+      return
+    }
+    const { ok, data } = await post('/project-control/api/fix/dispatch', { planIds, issueIds })
+    if (ok) {
+      setActionResult('✓ ' + t('fix.dispatchDone').replace('{n}', String(data['accepted'] ?? 0)).replace('{c}', String(data['concurrency'] ?? 3)))
+      await loadFixStatus()
+    } else {
+      setActionResult('✗ ' + String(data['error'] ?? 'error'))
+    }
+  }
+
+  /** 停止修复派发：取消排队与运行中的任务。 */
+  const cancelFix = async (): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/fix/cancel', {})
+    if (ok) setActionResult('⏹ ' + t('fix.stopDone').replace('{n}', String(data['stopped'] ?? 0)))
+    await loadFixStatus()
+  }
 
   /** 问题清单导出为 Markdown（按严重度排序；复用笔记导出的下载方式）。 */
   const exportIssuesMd = (issues: IssueEntry[]): void => {
@@ -2298,6 +2397,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const data: unknown = await response.json()
       setModelTiers((data as { tiers: Record<string, { provider: string; model: string }> }).tiers ?? {})
       setModelOptions((data as { options: Array<{ provider: string; id: string; name: string }> }).options ?? [])
+      const concurrency = (data as { fixConcurrency?: number }).fixConcurrency
+      if (typeof concurrency === 'number') setFixConcurrency(String(concurrency))
     } catch {
       // 模型配置加载失败不打断页面
     }
@@ -2308,10 +2409,11 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setModelSaving(true)
     setModelSaved(false)
     try {
+      const concurrency = Number(fixConcurrency)
       const response = await fetch('/project-control/api/model-config', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tiers: modelTiers }),
+        body: JSON.stringify({ tiers: modelTiers, ...(Number.isFinite(concurrency) ? { fixConcurrency: Math.max(1, Math.min(10, Math.trunc(concurrency))) } : {}) }),
       })
       if (response.ok) {
         setModelSaved(true)
@@ -2922,6 +3024,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 </div>
               )
             })}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '8px', padding: '8px 10px', borderRadius: '6px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))' }}>
+              <span style={{ fontSize: '12px', fontWeight: 600 }}>🤖 {t('fix.modelTitle')}</span>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                style={{ ...styles.input, width: 64, textAlign: 'center' }}
+                value={fixConcurrency}
+                onChange={(e) => { setFixConcurrency(e.target.value) }}
+              />
+              <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('fix.modelHint')}</span>
+            </div>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
               <button style={styles.button} disabled={modelSaving} onClick={() => { void saveModelConfig() }}>
                 {modelSaving ? t('action.running') : t('model.save')}
@@ -3622,12 +3736,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     {item.label} · {item.count}
                   </button>
                 ))}
-                <span style={{ flex: 1 }} />
-                <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                <span style={{ marginLeft: '16px', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
                   {openCount} 待处理 / 共 {all.length}
-                  {(state?.resolvedIssueRetentionDays ?? 0) > 0 ? ` · ${t('review.retentionHint').replace('{days}', String(state?.resolvedIssueRetentionDays ?? 7))}` : ''}
                 </span>
-                <select style={{ ...styles.select, width: 'auto', padding: '3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
+                {(state?.resolvedIssueRetentionDays ?? 0) > 0 && (
+                  <span
+                    title={t('review.retentionHint').replace('{days}', String(state?.resolvedIssueRetentionDays ?? 7))}
+                    style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '14px', height: '14px', borderRadius: '50%', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))', fontSize: '10px', lineHeight: 1, color: 'var(--dsw-alias-label-secondary, #6b7280)', cursor: 'help', userSelect: 'none', flexShrink: 0 }}
+                  >?</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' }}>
+                <select style={{ ...styles.select, width: 'auto', padding: '3px 24px 3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
                   <option value="">{t('review.statusAll')}</option>
                   {Object.entries(ISSUE_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                 </select>
@@ -3644,8 +3764,57 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 >{t('review.selectAll')}</button>
                 <button style={styles.secondary} title={t('review.exportMdHint')} onClick={() => { exportIssuesMd(visible) }}>{t('review.exportMd')}</button>
                 <button style={styles.secondary} title={t('review.sendChatHint')} onClick={() => { sendIssuesToChat(visible) }}>{'💬 ' + t('review.sendChat')}</button>
+                {(() => {
+                  const pendingPlans = visible.filter((issue) => issue.fixPlan?.status === 'pending')
+                  return pendingPlans.length > 0 ? (
+                    <button
+                      style={{ ...styles.secondary, fontWeight: 600 }}
+                      title={t('fix.dispatchHint')}
+                      onClick={() => { setConfirmDialog({ title: t('fix.dispatch'), message: `将派发 ${String(pendingPlans.length)} 个已产出的修复方案给子 Agent 并发执行（独立 worktree，消耗模型用量；完成后自动回写并提交）。`, danger: false, confirmLabel: t('fix.dispatch'), onConfirm: () => { void dispatchFix(pendingPlans.map((issue) => issue.fixPlan!.id), []) } }) }}
+                    >🚀 {t('fix.dispatch')}({String(pendingPlans.length)})</button>
+                  ) : null
+                })()}
+                {checkedOpen.length > 0 && (
+                  <button
+                    style={styles.secondary}
+                    title={t('fix.dispatchDirect')}
+                    onClick={() => { setConfirmDialog({ title: t('fix.dispatch'), message: `将派发 ${String(checkedOpen.length)} 条勾选的待处理问题（无预置方案，子 Agent 自主判定并修复，独立 worktree，消耗模型用量）。`, danger: false, confirmLabel: t('fix.dispatch'), onConfirm: () => { void dispatchFix([], checkedOpen.map((issue) => issue.id)) } }) }}
+                  >🚀 {t('fix.dispatchDirect')}({String(checkedOpen.length)})</button>
+                )}
                 <button style={styles.secondary} onClick={() => { void loadIssues() }}>{t('review.refresh')}</button>
               </div>
+              {fixTasks.length > 0 && (() => {
+                const FIX_STATUS_LABELS: Record<string, string> = { queued: t('fix.taskQueued'), running: t('fix.taskRunning'), merging: t('fix.taskMerging'), redo: t('fix.taskRedo'), done: t('fix.taskDone'), conflict: t('fix.taskConflict'), failed: t('fix.taskFailed'), cancelled: t('fix.taskCancelled') }
+                const fixActive = fixTasks.some((task) => task.status === 'queued' || task.status === 'running' || task.status === 'merging' || task.status === 'redo')
+                return (
+                  <Card title={'🤖 ' + t('fix.status')}>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px', fontSize: '11px' }}>
+                      <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                        {String(fixTasks.filter((task) => task.status === 'done').length)}/{String(fixTasks.length)} {t('fix.taskDone')}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      {fixActive && <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void cancelFix() }}>⏹ {t('fix.stop')}</button>}
+                    </div>
+                    {fixTasks.slice().reverse().map((task) => (
+                      <div key={task.issueId} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '6px 4px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
+                        <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
+                          {FIX_STATUS_LABELS[task.status] ?? task.status}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
+                        </span>
+                        <span style={{ minWidth: 0, flex: 1 }}>
+                          <span style={{ display: 'block', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
+                          {task.summary !== undefined && <span style={{ display: 'block', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{task.summary}</span>}
+                          {task.error !== undefined && <span style={{ display: 'block', color: themeAwareText('#d1242f') }}>{task.error}</span>}
+                          {(task.files ?? []).length > 0 && (
+                            <span style={{ display: 'block', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                              {task.files!.slice(0, 4).join(', ')}{task.commit !== undefined ? ` · ${task.commit}` : ''}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                  </Card>
+                )
+              })()}
               {(checkedVisible.length > 0 || batchVerifyState !== null) && (
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', padding: '6px 10px', marginBottom: '10px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))', borderRadius: '6px', fontSize: '11px' }}>
                   {batchVerifyState !== null ? (
@@ -3742,6 +3911,31 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         ✓ {issue.resolution}
                       </div>
                     ) : null}
+                    {issue.fixPlan != null && (() => {
+                      const plan = issue.fixPlan
+                      const planOpen = issueExpanded[`${issue.id}-plan`] === true
+                      return (
+                        <div style={{ marginTop: '6px', borderRadius: '6px', background: 'rgba(37, 99, 235, 0.05)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.12))', fontSize: '11px', overflow: 'hidden' }}>
+                          <button
+                            style={{ ...styles.linkBtn, width: '100%', textAlign: 'left', padding: '5px 10px', display: 'flex', gap: '6px', alignItems: 'center' }}
+                            onClick={() => { setIssueExpanded((previous) => ({ ...previous, [`${issue.id}-plan`]: !(previous[`${issue.id}-plan`] === true) })) }}
+                          >
+                            📄 {t('fix.plan')}
+                            <span style={styles.badge(plan.status === 'pending' ? '#d97706' : '#2563eb')}>{plan.status === 'pending' ? '待评审' : '已派发'}</span>
+                            {plan.files.length > 0 && <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)' }}>{plan.files.slice(0, 3).join(', ')}</span>}
+                            <span style={{ flex: 1 }} />{planOpen ? '▲' : '▼'}
+                          </button>
+                          {planOpen && (
+                            <div style={{ padding: '2px 10px 8px', lineHeight: 1.7 }}>
+                              <div><b>{t('fix.planApproach')}：</b>{plan.approach}</div>
+                              <div><b>{t('fix.planImpact')}：</b>{plan.impact}</div>
+                              <div><b>{t('fix.planBenefit')}：</b>{plan.benefit}</div>
+                              <div><b>{t('fix.planRisk')}：</b>{plan.risk}</div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
                     {(issue.fixStats != null || Boolean(issue.fixDiff)) && (
                       <>
                         <button

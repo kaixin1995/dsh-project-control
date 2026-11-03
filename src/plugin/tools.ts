@@ -769,7 +769,64 @@ ${result.references}` }]
         args.note,
         args.fixFiles,
       )
+      // 转聊天复验冷却的活跃信号：回写成功即证明模型仍在处理这一批。
+      const verifySessionId = exec.agent?.session?.id
+      if (typeof verifySessionId === 'string' && verifySessionId !== '') {
+        const entry = service.chatVerifySessions.get(verifySessionId)
+        if (entry !== undefined) entry.lastToolAt = Date.now()
+      }
       return { issueId: updated.id, status: updated.status, title: updated.title }
+    },
+  })
+
+  // ── 修复方案提交（方案模式闭环）：confirmed 问题先落结构化方案，供批准后派发子 Agent ──
+
+  const reviewFixPlanTool = defineTool({
+    name: 'review_fix_plan',
+    description: 'Submit a structured fix plan for a CONFIRMED Review issue (plan mode). Call this BEFORE review_issue_update(confirmed) for every real, still-present issue. The plan is shown on the Review board for the developer to approve; approved plans are dispatched to isolated sub-agents that apply the fix.',
+    parameters: {
+      issueId: { type: 'string', required: true, description: 'The issue id from the list you were given (format iss_xxx).' },
+      approach: { type: 'string', required: true, description: 'How to fix it, step by step, against the CURRENT code (file + what to change).' },
+      files: { type: 'array', items: { type: 'string' }, description: 'Relative paths the fix will touch (best-effort, informational).' },
+      impact: { type: 'string', required: true, description: 'Blast radius: affected files/APIs/callers; any public behavior change.' },
+      benefit: { type: 'string', required: true, description: 'What risk/pain the fix removes.' },
+      risk: { type: 'string', required: true, description: 'What the fix itself could break / regression surface.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { planId: { type: 'string' } },
+        additionalProperties: false,
+      },
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { planId: string }
+        return [{ type: 'text', text: `Fix plan recorded: ${result.planId} (awaiting developer approval)` }]
+      },
+    },
+    async execute(args: { issueId: string; approach: string; files?: string[]; impact: string; benefit: string; risk: string }, exec: ToolRunContext) {
+      const service = control(ctx)
+      const store = requireStore(ctx)
+      const ensured = await service.ensureCurrentProject(workdir(exec))
+      const issue = store.issues.get(args.issueId as never)
+      if (issue === undefined || issue.projectId !== ensured.project.id) {
+        throw new Error(`review issue "${args.issueId}" not found in the current project`)
+      }
+      const now = Date.now()
+      const plan = {
+        id: `fix_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        projectId: ensured.project.id,
+        issueId: args.issueId as never,
+        approach: args.approach,
+        files: args.files ?? [],
+        impact: args.impact,
+        benefit: args.benefit,
+        risk: args.risk,
+        status: 'pending' as const,
+        createdAt: now,
+        updatedAt: now,
+      }
+      await store.fixPlans.save(plan)
+      return { planId: plan.id }
     },
   })
 
@@ -783,6 +840,7 @@ ${result.references}` }]
     runReviewTool,
     runVerificationTool,
     reviewIssueUpdateTool,
+    reviewFixPlanTool,
     writeAgentNoteTool,
     explainConceptTool,
     summarizeLearningTool,

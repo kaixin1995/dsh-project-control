@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { chunkForNarrative, registerApiRoute } from '../src/plugin/api-route.ts'
+import { chunkForNarrative, chatVerifyCooldownReason, CHAT_VERIFY_IDLE_MS, CHAT_VERIFY_SENT_WINDOW_MS, registerApiRoute } from '../src/plugin/api-route.ts'
 import { ProjectControlService } from '../src/plugin/service.ts'
 import { ProjectService } from '../src/domain/project.ts'
 import { safeStorageId } from '../src/store/repository.ts'
@@ -38,12 +38,12 @@ beforeEach(async () => {
   const rootB = join(temp, 'project-b')
   shaA = initRepo(rootA, 'first project')
   initRepo(rootB, 'second project')
-  const sessions = new Map<string, string>([['session-a', rootA], ['session-b', rootB]])
+  const sessions = new Map<string, string>([['session-a', rootA], ['session-b', rootB], ['session-c', rootA]])
   const agentMock = { followup }
   const ctx: any = {
     sessions: { get: (id: string) => sessions.has(id) ? { header: { cwd: sessions.get(id) } } : undefined },
     workspaceRegistry: { list: () => [] },
-    agents: { get: (id: string) => id === 'session-a' ? agentMock : undefined },
+    agents: { get: (id: string) => id === 'session-a' || id === 'session-b' ? agentMock : undefined },
     get: () => undefined,
     logger: { warn: () => {} },
     effect: () => {},
@@ -67,7 +67,15 @@ beforeEach(async () => {
 afterEach(async () => {
   followup.mockClear()
   if (server !== undefined) await new Promise<void>((resolve) => server.close(() => resolve()))
-  if (temp !== undefined) rmSync(temp, { recursive: true, force: true })
+  // Windows：/fix 用例的 git worktree 进程可能仍占用目录，等待后容错删除。
+  await new Promise((resolve) => setTimeout(resolve, 800))
+  if (temp !== undefined) {
+    try {
+      rmSync(temp, { recursive: true, force: true })
+    } catch {
+      console.warn(`[digest-review.spec] temp cleanup deferred: ${temp}`)
+    }
+  }
 })
 
 async function post(path: string, body: Record<string, unknown>): Promise<{ status: number; data: any }> {
@@ -169,6 +177,50 @@ describe('applyChatVerdict 聊天复验回写', () => {
   })
 })
 
+describe('转聊天复验重复发送冷却', () => {
+  const now = 10_000_000_000
+
+  it('起步锁：发送后未回写，整个发送窗口内拒绝；过期放行', () => {
+    const entry = { lastSentAt: now - 60_000, lastToolAt: 0 }
+    expect(chatVerifyCooldownReason(entry, now)).toContain('尚无回写')
+    expect(chatVerifyCooldownReason({ lastSentAt: now - CHAT_VERIFY_SENT_WINDOW_MS - 1, lastToolAt: 0 }, now)).toBeUndefined()
+  })
+
+  it('活跃锁：最后回写在空闲窗口内拒绝（模型仍在处理）', () => {
+    const entry = { lastSentAt: now - 3 * 60_000, lastToolAt: now - 30_000 }
+    expect(chatVerifyCooldownReason(entry, now)).toContain('回写活动')
+  })
+
+  it('停止/完成解锁：最后回写超过空闲窗口即放行', () => {
+    const entry = { lastSentAt: now - 3 * 60_000, lastToolAt: now - CHAT_VERIFY_IDLE_MS - 1 }
+    expect(chatVerifyCooldownReason(entry, now)).toBeUndefined()
+  })
+
+  it('无记录（重启/新会话）直接放行', () => {
+    expect(chatVerifyCooldownReason(undefined, now)).toBeUndefined()
+  })
+
+  it('端到端：发送后同会话二次发送 409，另一会话不受影响；回写后按空闲窗口解锁', async () => {
+    const { ReviewIssueManager } = await import('../src/verification/issues.ts')
+    const manager = new ReviewIssueManager(service.store.issues)
+    await manager.createIssue({ projectId: projectA as never, changeId: 'review:ffffff' as never, severity: 'minor' as never, category: '测试' as never, title: '冷却问题', description: '证据：x' })
+    await manager.createIssue({ projectId: projectB as never, changeId: 'review:f0f0f0f0' as never, severity: 'minor' as never, category: '测试' as never, title: 'B项目问题', description: '证据：y' })
+    const first = await post('/issues/to-chat', { sessionId: 'session-a' })
+    expect(first.status).toBe(200)
+    const second = await post('/issues/to-chat', { sessionId: 'session-a' })
+    expect(second.status).toBe(409)
+    expect(String(second.data['error'])).toContain('尚无回写')
+    // 另一会话（不同项目）不受冷却影响。
+    const other = await post('/issues/to-chat', { sessionId: 'session-b' })
+    expect(other.status).toBe(200)
+    // 回写刷新活跃时间：空闲窗口外解锁。
+    const entry = service.chatVerifySessions.get('session-a')!
+    entry.lastToolAt = Date.now() - CHAT_VERIFY_IDLE_MS - 1_000
+    const third = await post('/issues/to-chat', { sessionId: 'session-a' })
+    expect(third.status).toBe(200)
+  })
+})
+
 describe('/issues/to-chat 转聊天复验', () => {
   it('只发送当前项目的待处理问题，并经 followup 注入（source=plugin）', async () => {
     const { ReviewIssueManager } = await import('../src/verification/issues.ts')
@@ -216,15 +268,64 @@ describe('/issues/to-chat 转聊天复验', () => {
     expect(text).toContain('严禁 git add -A')
   })
 
+  it('/fix 端点：dispatch（issueIds 自主路径）→ status 轮询 → 回写 resolved；model-config 可调并发', async () => {
+    // mock 子代理：在 worktree 写修复文件并调完成工具。
+    const agentCtxs: Array<{ sessionId: string; cwd: string; tools: Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>; issueId: string; attempt: number }> = []
+    const baseCtx = service.ctx as any
+    baseCtx.agents = baseCtx.agents ?? {}
+    baseCtx.agents.create = async (options: { sessionId: string; meta: { cwd: string }; setup: (agentCtx: unknown) => Promise<void> }) => {
+      const tools = new Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>()
+      await options.setup({ tools: { register: (tool: { name: string; execute: (args: unknown, exec: unknown) => Promise<unknown> }) => { tools.set(tool.name, tool) } } })
+      const parts = options.sessionId.split('-')
+      const entry = { sessionId: options.sessionId, cwd: options.meta.cwd, tools, issueId: parts.slice(2, -2).join('-'), attempt: Number(parts.at(-2)) }
+      agentCtxs.push(entry)
+      return {
+        agent: {
+          session: { id: options.sessionId },
+          followup: () => {
+            writeFileSync(join(entry.cwd, 'fixed.txt'), 'ok\n')
+            void tools.get('project_control_fix_complete')!.execute({ summary: '修了', changedFiles: ['fixed.txt'] }, { concludeTurn: () => {} })
+          },
+        },
+        dispose: async () => {},
+      }
+    }
+    const { ReviewIssueManager } = await import('../src/verification/issues.ts')
+    const manager = new ReviewIssueManager(service.store.issues)
+    const issue = await manager.createIssue({ projectId: projectA as never, changeId: 'review:fixfix01' as never, severity: 'minor' as never, category: '测试' as never, title: '待派发问题', description: '证据：x' })
+    const dispatch = await post('/fix/dispatch', { sessionId: 'session-a', issueIds: [issue.id] })
+    expect(dispatch.status).toBe(200)
+    expect(dispatch.data['accepted']).toBe(1)
+    // 轮询 status 至终态。
+    let final: any
+    for (let i = 0; i < 100; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      const status = await get('/fix/status?sessionId=session-a')
+      final = status.data['tasks']?.[0]
+      if (final !== undefined && ['done', 'conflict', 'failed', 'cancelled'].includes(final.status)) break
+    }
+    expect(final.status).toBe('done')
+    expect(final.commit).toBeDefined()
+    expect(service.store.issues.get(issue.id as never)?.status).toBe('resolved')
+    // model-config：并发读取与保存。
+    const before = await get('/model-config')
+    expect(before.data['fixConcurrency']).toBe(3)
+    const save = await post('/model-config', { fixConcurrency: 5 })
+    expect(save.status).toBe(200)
+    expect((await get('/model-config')).data['fixConcurrency']).toBe(5)
+  }, 40_000)
+
   it('显式 ids 跨项目过滤 + 无活跃会话 409 + 空清单不发送', async () => {
     const { ReviewIssueManager } = await import('../src/verification/issues.ts')
     const manager = new ReviewIssueManager(service.store.issues)
     const created = await manager.createIssue({ projectId: projectA as never, changeId: 'review:cccccccc' as never, severity: 'critical' as never, category: '构建' as never, title: '问题C', description: '证据：C' })
     const cross = await post('/issues/to-chat', { sessionId: 'session-a', ids: [created.id, 'not-in-project'] })
     expect(cross.data['sent']).toBe(1)
-    const noAgent = await post('/issues/to-chat', { sessionId: 'session-b' })
+    // session-c：有项目有问题但无活跃 agent → 409。
+    const noAgent = await post('/issues/to-chat', { sessionId: 'session-c' })
     expect(noAgent.status).toBe(409)
-    const empty = await post('/issues/to-chat', { sessionId: 'session-a', ids: ['missing-id'] })
+    // 空清单走另一会话（session-a 已发送进入冷却，属预期拦截）。
+    const empty = await post('/issues/to-chat', { sessionId: 'session-b', ids: ['missing-id'] })
     expect(empty.status).toBe(200)
     expect(empty.data['ok']).toBe(false)
     expect(followup).toHaveBeenCalledTimes(1)

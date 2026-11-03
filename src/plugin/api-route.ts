@@ -371,6 +371,31 @@ export function chunkForNarrative(shas: string[], maxPerChunk = 30): string[][] 
   return chunks.length > 0 ? chunks : [[]]
 }
 
+// ── 转聊天复验冷却（内存态；进程重启即清零 = 冷却解除）─────────────────────
+/** 发送保护窗口：发送后这时长内默认锁定（覆盖模型判定阶段尚未回写的起步期）。 */
+export const CHAT_VERIFY_SENT_WINDOW_MS = 5 * 60_000
+/** 空闲解锁：最后一次回写之后这时长无新回写，视为停止/完成，允许重发。 */
+export const CHAT_VERIFY_IDLE_MS = 2 * 60_000
+
+/**
+ * 重复发送冷却判定：距上次发送 < 发送窗口，且（从未回写 或 距最后回写 < 空闲窗口）。
+ * 从未回写时整个发送窗口都锁——防止起步阶段（模型在读代码还没回写）被误放行。
+ * @returns 锁定时返回人类可读的拒绝理由，可发送时返回 undefined。
+ */
+export function chatVerifyCooldownReason(entry: { lastSentAt: number; lastToolAt: number } | undefined, now = Date.now()): string | undefined {
+  if (entry === undefined) return undefined
+  const sinceSent = now - entry.lastSentAt
+  if (sinceSent >= CHAT_VERIFY_SENT_WINDOW_MS) return undefined
+  if (entry.lastToolAt === 0) {
+    return `上一批 ${Math.round(sinceSent / 60_000)} 分钟前已发出，模型可能仍在处理（尚无回写）。请到聊天窗口查看进度；约 ${Math.ceil((CHAT_VERIFY_SENT_WINDOW_MS - sinceSent) / 60_000)} 分钟后或停止后可重发。`
+  }
+  const sinceTool = now - entry.lastToolAt
+  if (sinceTool < CHAT_VERIFY_IDLE_MS) {
+    return `上一批 ${Math.round(sinceSent / 60_000)} 分钟前已发出，模型仍在处理中（${Math.round(sinceTool / 1000)} 秒前有回写活动）。请到聊天窗口查看进度；停止或完成后约 ${Math.ceil((CHAT_VERIFY_IDLE_MS - sinceTool) / 60_000)} 分钟可重发。`
+  }
+  return undefined
+}
+
 /** 从请求体取出会话 id（工作台按钮都会携带），并反查该会话的工作目录。 */
 async function sessionCwdOf(service: ProjectControlService, body: Record<string, unknown>): Promise<string | undefined> {
   const sessionId = body['sessionId']
@@ -2542,7 +2567,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               }
             }
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ tiers, options }))
+            res.end(JSON.stringify({ tiers, options, fixConcurrency: service.liveConfig.fixConcurrency }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -2561,11 +2586,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const body = await readJsonBody(req)
             const tiers = body['tiers']
             const CLASSES = ['standard', 'fast', 'reasoning', 'verifier']
-            if (typeof tiers !== 'object' || tiers === null) throw new Error('tiers object required')
+            const hasFixConcurrency = typeof body['fixConcurrency'] === 'number' && Number.isFinite(body['fixConcurrency'])
+            if ((typeof tiers !== 'object' || tiers === null) && !hasFixConcurrency) throw new Error('tiers object required')
             const next: Record<string, { provider: string; model: string }> = { ...service.liveConfig.modelTiers }
             let touched = false
             for (const key of CLASSES) {
-              const entry = (tiers as Record<string, unknown>)[key]
+              const entry = typeof tiers === 'object' && tiers !== null ? (tiers as Record<string, unknown>)[key] : undefined
               if (typeof entry !== 'object' || entry === null) continue
               touched = true
               const provider = String((entry as Record<string, unknown>)['provider'] ?? '')
@@ -2577,9 +2603,17 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 next[key] = { provider, model }
               }
             }
-            if (!touched) throw new Error('no tier entries in payload')
-            service.liveConfig = { ...service.liveConfig, modelTiers: next } as typeof service.liveConfig
-            await service.store.pluginSettings.save({ id: 'model-tiers', ...next })
+            if (!touched && !hasFixConcurrency) throw new Error('no tier entries in payload')
+            if (touched) {
+              service.liveConfig = { ...service.liveConfig, modelTiers: next } as typeof service.liveConfig
+              await service.store.pluginSettings.save({ id: 'model-tiers', ...next })
+            }
+            // 修复并发（可选字段）：立即生效 + 持久化。
+            if (typeof body['fixConcurrency'] === 'number' && Number.isFinite(body['fixConcurrency'])) {
+              const fixConcurrency = Math.max(1, Math.min(10, Math.trunc(body['fixConcurrency'])))
+              service.liveConfig = { ...service.liveConfig, fixConcurrency } as typeof service.liveConfig
+              await service.store.pluginSettings.save({ id: 'fix-concurrency', fixConcurrency })
+            }
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))
           } catch (error: unknown) {
@@ -2672,6 +2706,21 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               fixFiles: issue.fixFiles ?? [],
               fixImpact: issue.fixImpact ?? [],
               fixDiff: issue.fixDiff ?? '',
+              // 待评审/已派发的修复方案（方案模式产出，前端渲染方案块 + 批准派发）。
+              fixPlan: (() => {
+                const plan = (service.store?.fixPlans?.list() ?? [])
+                  .filter((candidate) => candidate.issueId === issue.id && (candidate.status === 'pending' || candidate.status === 'dispatched'))
+                  .sort((left, right) => right.createdAt - left.createdAt)[0]
+                return plan === undefined ? null : {
+                  id: plan.id,
+                  approach: plan.approach,
+                  files: plan.files,
+                  impact: plan.impact,
+                  benefit: plan.benefit,
+                  risk: plan.risk,
+                  status: plan.status,
+                }
+              })(),
               createdAt: issue.createdAt,
               updatedAt: issue.updatedAt,
             }))
@@ -2913,6 +2962,13 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: '当前会话没有活跃的对话（请先打开该项目下的会话再试）' }))
               return
             }
+            // 重复发送冷却：上一批还在处理（或刚发出）时拒绝，防重复消耗与状态翻动。
+            const cooldown = chatVerifyCooldownReason(service.chatVerifySessions.get(sessionId))
+            if (cooldown !== undefined) {
+              res.writeHead(409, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: cooldown }))
+              return
+            }
             if (selected.length === 0) {
               res.writeHead(200, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ ok: false, error: '没有待处理问题可发送', sent: 0 }))
@@ -2947,7 +3003,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                   '- 已被之前的提交修好 → verdict=already_fixed，note 引用修复提交/文件；',
                   '- 从来就不是问题 → verdict=false_positive；与其他条重复 → verdict=duplicate。',
                   '真实存在的问题（过完存在性/意图两闸后仍成立）：',
-                  '- 调用 review_issue_update 回写 verdict=confirmed，note 写「方案#N 待评审」；',
+                  '- 先调用 review_fix_plan 提交结构化方案（issueId 对应，approach/files/impact/benefit/risk 按方案#N 内容），方案会展示在 Review 面板等开发者批准；',
+                  '- 再调用 review_issue_update 回写 verdict=confirmed，note 写「方案#N 待评审」；',
                   '- 然后为每一条输出完整修复方案，格式严格如下：',
                   '  ### 方案#N：<问题标题>',
                   '  - 问题：以当前代码为准的一句话缺陷描述（引用文件:行号）',
@@ -2989,6 +3046,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               content: [{ type: 'text', text: prompt }],
               source: { kind: 'project-control' },
             }))
+            // 记录本批发送时刻（lastToolAt 置 0：回写工具会刷新它；从未回写时整个发送窗口锁定）。
+            service.chatVerifySessions.set(sessionId, { lastSentAt: Date.now(), lastToolAt: 0 })
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true, sent: selected.length }))
           } catch (error: unknown) {
@@ -3467,6 +3526,99 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           return
         }
+        // ── 修复派发（子 Agent + worktree 隔离 + cherry-pick 合并）────────────
+        if (req.method === 'POST' && routePath === '/fix/dispatch') {
+          if (service.store === undefined || service.fixDispatcher === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const planIds = Array.isArray(body['planIds']) ? (body['planIds'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
+            const issueIds = Array.isArray(body['issueIds']) ? (body['issueIds'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
+            if (planIds.length === 0 && issueIds.length === 0) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'planIds or issueIds required' }))
+              return
+            }
+            const inputs: Array<{ issueId: string; title: string; evidence: string; approach?: string; files?: string[]; planId?: string }> = []
+            // 路径一：批准的方案（plan 模式产出）。
+            for (const planId of planIds) {
+              const plan = service.store.fixPlans.get(planId)
+              if (plan === undefined || plan.projectId !== project.id || plan.status !== 'pending') continue
+              const issue = service.store.issues.get(plan.issueId as never)
+              if (issue === undefined || issue.projectId !== project.id || (issue.status !== 'open' && issue.status !== 'fixing')) continue
+              inputs.push({
+                issueId: issue.id,
+                title: issue.title,
+                evidence: (issue.description ?? '').replace(/\n\[复[检验][^\]]*\][^\n]*/g, '').slice(0, 400),
+                approach: `方案：${plan.approach}\n影响：${plan.impact}\n收益：${plan.benefit}\n风险：${plan.risk}`,
+                files: plan.files,
+                planId: plan.id,
+              })
+              plan.status = 'dispatched'
+              plan.updatedAt = Date.now()
+              await service.store.fixPlans.save(plan)
+            }
+            // 路径二：直接派发的问题（无方案，子代理自主判定+修复）。
+            for (const issueId of issueIds) {
+              const issue = service.store.issues.get(issueId as never)
+              if (issue === undefined || issue.projectId !== project.id || (issue.status !== 'open' && issue.status !== 'fixing')) continue
+              inputs.push({
+                issueId: issue.id,
+                title: issue.title,
+                evidence: (issue.description ?? '').replace(/\n\[复[检验][^\]]*\][^\n]*/g, '').slice(0, 400),
+              })
+            }
+            const accepted = service.fixDispatcher.dispatch(
+              { id: project.id, name: project.name, rootPath: project.identity.rootPath },
+              inputs,
+            )
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, accepted, concurrency: service.liveConfig.fixConcurrency }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'GET' && routePath === '/fix/status') {
+          const dispatcher = service.fixDispatcher
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            tasks: dispatcher?.status() ?? [],
+            concurrency: service.liveConfig.fixConcurrency,
+            busy: dispatcher?.isBusy() ?? false,
+          }))
+          return
+        }
+        if (req.method === 'POST' && routePath === '/fix/cancel') {
+          const dispatcher = service.fixDispatcher
+          if (dispatcher === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const stopped = dispatcher.cancel(project?.identity.rootPath ?? '')
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, stopped }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
         if (req.method === 'POST' && routePath === '/scheduled/run') {
           if (service.store === undefined || service.scheduler === undefined) {
             res.writeHead(503, { 'content-type': 'application/json' })

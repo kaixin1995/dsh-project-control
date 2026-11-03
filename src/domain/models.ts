@@ -346,3 +346,29 @@ export interface ScheduledTaskRecord {
   createdAt: number
   updatedAt: number
 }
+
+// -----------------------------------------------------------------------------
+// 12. 修复方案：转聊天复验（方案模式）产出的结构化修复计划，批准后派发子 Agent 执行
+// -----------------------------------------------------------------------------
+
+export type FixPlanStatus = 'pending' | 'dispatched' | 'completed' | 'rejected'
+
+export interface FixPlanRecord {
+  id: string
+  projectId: ProjectId
+  /** 关联的评审问题（review_issue_update confirmed 的问题）。 */
+  issueId: IssueId
+  /** 具体怎么修（步骤化，基于当前 HEAD）。 */
+  approach: string
+  /** 方案计划改动的文件（相对路径，参考性——worktree 隔离无需文件锁）。 */
+  files: string[]
+  /** 影响范围说明。 */
+  impact: string
+  /** 修复收益。 */
+  benefit: string
+  /** 修复本身的风险/回归面。 */
+  risk: string
+  status: FixPlanStatus
+  createdAt: number
+  updatedAt: number
+}
