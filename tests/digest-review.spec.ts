@@ -193,6 +193,9 @@ describe('/issues/to-chat 转聊天复验', () => {
     expect(message.content[0]!.text).toContain('第一闸（存在性）')
     expect(message.content[0]!.text).toContain('第二闸（意图）')
     expect(message.content[0]!.text).toContain('立即修复')
+    // 防丢码：auto 模式同样要求修复完成后 git 提交且只 add 修复文件。
+    expect(message.content[0]!.text).toContain('git 提交')
+    expect(message.content[0]!.text).toContain('严禁 git add -A')
   })
 
   it('方案模式（plan）：判定类回写照常，真实问题只出方案且禁止改代码', async () => {
@@ -208,6 +211,9 @@ describe('/issues/to-chat 转聊天复验', () => {
     expect(text).toContain('影响范围')
     expect(text).toContain('方案#N 待评审')
     expect(text).not.toContain('立即修复')
+    // 防丢码：两种模式都必须带"修复后 git 提交（只 add 修复文件）"规则。
+    expect(text).toContain('git 提交')
+    expect(text).toContain('严禁 git add -A')
   })
 
   it('显式 ids 跨项目过滤 + 无活跃会话 409 + 空清单不发送', async () => {

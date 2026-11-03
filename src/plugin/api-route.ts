@@ -2973,7 +2973,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               '每处理完一条（方案模式含 confirmed 回写），立即调用 review_issue_update（issueId 用清单里的 id），不要只在文字里说。',
               mode === 'auto'
                 ? '全部处理完后输出「## 汇总」：已修复清单（含改动文件）、此前已修复清单、已过时清单（功能移除/需求变更，含依据）、误报/重复清单、保留待修清单（含原因），以及你发现的新问题（如有）。'
-                : '方案输出完即停，不要动手修复。',
+                : '方案输出完即停，不要动手修复。开发者批准后执行修复时：修复 + review_issue_update(fixed) 完成后，同样按下述提交规则提交改动。',
+              '',
+              '【防丢码：提交规则】本轮只要改动过代码（含批准后的修复），在全部回写完成后必须执行 git 提交：',
+              '1. 只 git add 你本轮修复涉及的文件（与各条 fixFiles 一致），严禁 git add -A / git add .——工作区可能有开发者的其他未提交改动，绝不能卷进来；',
+              '2. 先 git diff --cached 复核暂存内容确实只有你的修复；',
+              '3. git commit，message 格式：`fix(review): batch-resolve N issues via chat re-verify`，正文逐条列出「问题标题 → 一句话修复」；',
+              '4. 不要 push，不要改分支；提交完成后在汇总末尾附上提交哈希。',
+              '若本轮没有任何代码改动（纯判定/方案），跳过提交。',
               '',
               '== 问题清单 ==',
               ...lines,
