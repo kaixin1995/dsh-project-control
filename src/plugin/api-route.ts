@@ -14,6 +14,16 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+
+// v4 会话格式是开放式生产者词表：没有通用 plugin kind（session-format-v3-to-v4
+// 的 source 校验对 kind==='plugin' 直接抛 "requires a producer-owned source
+// kind"，任何自有非空 kind 放行）。这里声明本插件的生产者归属。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'project-control': { kind: 'project-control' }
+  }
+}
 import { createHash } from 'node:crypto'
 import { readdir, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -31,7 +41,7 @@ import { generatePlanSteps } from '../runtime/plan-gen.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
 import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
 import type { ConfirmedItemRecord } from './confirmed.ts'
-import { ReviewIssueManager } from '../verification/issues.ts'
+import { ReviewIssueManager, appendCappedNote } from '../verification/issues.ts'
 import { DeterministicBuildVerifier, UnitTestVerifier, EvidenceDiffVerifier, LlmReviewVerifier } from '../verification/verifier.ts'
 import { VerificationRunner } from '../verification/service.ts'
 import type { IssueSeverity, ProjectRecord } from '../domain/models.ts'
@@ -327,6 +337,38 @@ function readHistoryCursor(service: ProjectControlService, projectId: string): {
 function writeHistoryCursor(service: ProjectControlService, projectId: string, lastCommit: string, processedCount: number): void {
   void service.store?.historyCursor?.save({ id: safeStorageId(`cursor|${projectId}`), projectId, lastCommit, processedCount })
     .catch((error: unknown) => console.error('[pc] history cursor write failed:', error))
+}
+
+/**
+ * 已解读提交标记（「未消化」圆点的消点依据）：commit-detail 成功生成/命中解读时记录
+ * sha；/commits 读取后未消化 = 新于上次总结 且 未解读。上限 500 个（FIFO），防无限膨胀。
+ */
+const ANALYZED_MARKER_CAP = 500
+
+function readAnalyzedShas(service: ProjectControlService, projectId: string): Set<string> {
+  const record = service.store?.historyCursor?.get(safeStorageId(`analyzed|${projectId}`)) as { shas?: unknown } | undefined
+  const list = Array.isArray(record?.shas) ? record.shas.filter((sha): sha is string => typeof sha === 'string') : []
+  return new Set(list)
+}
+
+function markAnalyzedSha(service: ProjectControlService, projectId: string, sha: string): void {
+  if (service.store?.historyCursor === undefined) return
+  const id = safeStorageId(`analyzed|${projectId}`)
+  const record = service.store.historyCursor.get(id) as { shas?: unknown } | undefined
+  const list = Array.isArray(record?.shas) ? record.shas.filter((item): item is string => typeof item === 'string') : []
+  if (list.includes(sha)) return
+  const next = [...list, sha].slice(-ANALYZED_MARKER_CAP)
+  void service.store.historyCursor.save({ id, projectId, shas: next })
+    .catch((error: unknown) => console.error('[pc] analyzed marker write failed:', error))
+}
+
+/** 叙事分段：超过单段上限的提交集合按时间顺序切块（段间连续、不重叠）。 */
+export function chunkForNarrative(shas: string[], maxPerChunk = 30): string[][] {
+  const chunks: string[][] = []
+  for (let start = 0; start < shas.length; start += maxPerChunk) {
+    chunks.push(shas.slice(start, start + maxPerChunk))
+  }
+  return chunks.length > 0 ? chunks : [[]]
 }
 
 /** 从请求体取出会话 id（工作台按钮都会携带），并反查该会话的工作目录。 */
@@ -849,15 +891,17 @@ export async function runMemorySync(
 }
 
 /**
- * 数据生命周期：清理超期的已解决评审问题（resolved/accepted，按 updatedAt 计龄）。
+ * 数据生命周期：清理超期的已闭环评审问题（resolved/accepted/rejected，按 updatedAt 计龄）。
+ * rejected（误报/重复）同样进保留期——它们没有留存价值且会无限累积。
  * resolvedIssueRetentionDays=0 表示永久保留。读取问题列表前执行，页面所见即清理后状态。
  */
 export async function purgeResolvedIssues(service: ProjectControlService): Promise<void> {
   const retentionDays = service.liveConfig.resolvedIssueRetentionDays ?? 7
   if (retentionDays <= 0) return
   const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+  const closable = new Set(['resolved', 'accepted', 'rejected'])
   for (const issue of service.store.issues.list()) {
-    if ((issue.status === 'resolved' || issue.status === 'accepted') && issue.updatedAt < cutoff) {
+    if (closable.has(issue.status) && issue.updatedAt < cutoff) {
       await service.store.issues.delete(issue.id)
     }
   }
@@ -1473,7 +1517,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               return
             }
             const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
-            const storeKey = `wn:${cwd}|${orderedShas.join(',')}|v1|${route.provider}/${route.model}`
+            const modelTag = route.provider + '/' + route.model
+            const storeKey = `wn:${cwd}|${orderedShas.join(',')}|v2|${modelTag}`
             if (!force) {
               const hit = cacheRead(service, storeKey)
               if (hit !== undefined) {
@@ -1482,30 +1527,96 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 return
               }
             }
-            const commitBlocks: string[] = []
-            for (const [index, sha] of orderedShas.entries()) {
+            const commitBlockOf = async (index: number, sha: string): Promise<string> => {
               const info = (await service.git.runGit(['log', '-1', '--format=%an|%ad|%s', '--date=short', sha], cwd).catch(() => '')).trim()
               const stat = await service.git.runGit(['diff', '--no-color', '--stat', `${sha}^..${sha}`], cwd).catch(() => '')
-              commitBlocks.push(`# ${index + 1}. ${sha.slice(0, 8)} ${info}\n${stat.trim().split('\n').slice(0, 15).join('\n')}`)
+              return `# ${index + 1}. ${sha.slice(0, 8)} ${info}\n${stat.trim().split('\n').slice(0, 15).join('\n')}`
             }
-            const llm = await runLlmAnalysis(ctx, {
-              prompt: [
-                '你是代码考古员。以下多个连续提交构成一轮开发工作，请把它们作为一个整体解读：',
-                '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
-                '2. 拆出这轮工作分几个步骤/阶段（如 分析→实现→修 bug→测试），每个步骤列出对应的提交编号；',
-                '3. 指出步骤间的依赖或演进关系（后一步如何建立在前一步之上）。',
-                '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
-                '',
-                ...commitBlocks.map((block) => block + '\n'),
-              ].join('\n'),
-              provider: route.provider,
-              model: route.model,
-              maxTokens: service.liveConfig.analysisMaxTokens,
-              timeoutMs: service.liveConfig.analysisTimeoutMs,
-              purpose: 'project-control-work-narrative',
-            })
-            const narrative = llm.text.trim()
-            const narrativeCostUsd = usageMeta(llm.usage, route.model).costUsd
+            // 大批次分段：>30 条时按时间顺序切块，逐段解读（带缓存）后合并为整体叙事，
+            // 避免超长材料稀释质量；响应形状与单段一致。
+            const chunks = chunkForNarrative(orderedShas, 30)
+            let narrative: string
+            let narrativeCostUsd: number | undefined
+            const sumCost = (left: number | undefined, right: number | undefined): number | undefined =>
+              left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0)
+            if (chunks.length === 1) {
+              const commitBlocks: string[] = []
+              for (const [index, sha] of orderedShas.entries()) {
+                commitBlocks.push(await commitBlockOf(index, sha))
+              }
+              const llm = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是代码考古员。以下多个连续提交构成一轮开发工作，请把它们作为一个整体解读：',
+                  '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
+                  '2. 拆出这轮工作分几个步骤/阶段（如 分析→实现→修 bug→测试），每个步骤列出对应的提交编号；',
+                  '3. 指出步骤间的依赖或演进关系（后一步如何建立在前一步之上）。',
+                  '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
+                  '',
+                  ...commitBlocks.map((block) => block + '\n'),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-work-narrative',
+              })
+              narrative = llm.text.trim()
+              narrativeCostUsd = usageMeta(llm.usage, route.model).costUsd
+            } else {
+              const segmentSummaries: string[] = []
+              let chunkOffset = 0
+              for (const [chunkIndex, chunk] of chunks.entries()) {
+                const segKey = `wn-seg:${cwd}|${chunk.join(',')}|v2|${modelTag}`
+                const segHit = force ? undefined : cacheRead(service, segKey)
+                if (segHit !== undefined) {
+                  segmentSummaries.push(String(segHit.payload['narrative'] ?? ''))
+                  chunkOffset += chunk.length
+                  continue
+                }
+                const blocks: string[] = []
+                for (const [offset, sha] of chunk.entries()) {
+                  blocks.push(await commitBlockOf(chunkOffset + offset, sha))
+                }
+                chunkOffset += chunk.length
+                const llm = await runLlmAnalysis(ctx, {
+                  prompt: [
+                    `你是代码考古员。以下是一轮开发工作（共 ${orderedShas.length} 个提交）的第 ${chunkIndex + 1}/${chunks.length} 段（全局提交编号 ${chunkOffset - chunk.length + 1}–${chunkOffset}）。`,
+                    '请解读这一段：做了什么、分几步、每步对应哪些提交编号；如与前后段可能存在衔接（修复/延续关系），请点出。',
+                    '用 Markdown 短列表输出，全部中文，基于给定材料不要编造。',
+                    '',
+                    ...blocks.map((block) => block + '\n'),
+                  ].join('\n'),
+                  provider: route.provider,
+                  model: route.model,
+                  maxTokens: service.liveConfig.analysisMaxTokens,
+                  timeoutMs: service.liveConfig.analysisTimeoutMs,
+                  purpose: 'project-control-work-narrative',
+                })
+                const segText = llm.text.trim()
+                segmentSummaries.push(segText)
+                const segCost = usageMeta(llm.usage, route.model).costUsd
+                narrativeCostUsd = sumCost(narrativeCostUsd, segCost)
+                cacheWrite(service, segKey, 'narrative-segment', { narrative: segText, ...(segCost === undefined ? {} : { costUsd: segCost }) })
+              }
+              const mergeLlm = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是代码考古员。下面是一轮开发工作各段的分段解读（按时间顺序排列）。请合并为最终整体叙事：',
+                  '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
+                  '2. 「## 步骤拆解」：合并各段步骤为一个按阶段排序的列表，每个步骤保留对应的全局提交编号；',
+                  '3. 「## 演进脉络」：后一步如何建立在前一步之上；后续提交修复前面问题的地方必须体现。',
+                  '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
+                  '',
+                  ...segmentSummaries.map((summary, index) => `== 第 ${index + 1}/${chunks.length} 段 ==\n${summary}\n`),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-work-narrative',
+              })
+              narrative = mergeLlm.text.trim()
+              narrativeCostUsd = sumCost(narrativeCostUsd, usageMeta(mergeLlm.usage, route.model).costUsd)
+            }
             cacheWrite(service, storeKey, 'narrative', { narrative, ...(narrativeCostUsd === undefined ? {} : { costUsd: narrativeCostUsd }) })
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ narrative, cached: false, generatedAt: Date.now(), ...(narrativeCostUsd === undefined ? {} : { costUsd: narrativeCostUsd }) }))
@@ -1699,6 +1810,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
+            // 已解读标记：供前端「未消化」圆点消点（新于上次总结 且 未解读才算未消化）。
+            const analyzedSet = readAnalyzedShas(service, project.id)
             const limitRaw = Number(query['limit'] ?? 50)
             const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.trunc(limitRaw))) : 50
             const status = await service.git.getStatus(cwd)
@@ -1742,7 +1855,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 isClean: status.isClean,
                 files: status.entries.slice(0, 40).map((entry) => ({ path: entry.path, status: entry.status })),
               },
-              commits,
+              commits: commits.map((commit) => ({ ...commit, analyzed: analyzedSet.has(commit.sha) })),
             }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
@@ -1797,6 +1910,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const storeKey = `cd:${cwd}|${sha}|${diff.diffHash}|v${PROMPT_VERSION}|${detailRoute.provider}/${detailRoute.model}`
             let analysis: CommitAnalysis | undefined
             let analysisCached = false
+            let analysisFailed = false
             let analysisGeneratedAt: number | undefined
             let analysisCostUsd: number | undefined
             let analysisTokens: { input: number; output: number; total: number } | undefined
@@ -1873,8 +1987,11 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 const message = error instanceof Error ? error.message : String(error)
                 analysis = { what: `AI 解读失败：${message}（点「重新生成」可重试）`, logic: [], risks: [] }
                 analysisCached = false
+                analysisFailed = true
               }
             }
+            // 成功生成或命中解读的提交记录「已解读」标记（供未消化圆点消点）；失败的解读不算。
+            if (!isWorking && !analysisFailed && project !== undefined) markAnalyzedSha(service, project.id, sha)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
               sha, isWorking, files, insertions, deletions,
@@ -2744,7 +2861,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 await service.store.issues.save(issue)
                 resolved.push(issue.title)
               } else {
-                issue.description = `${issue.description}\n[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${entry.reason.slice(0, 200)}`
+                issue.description = appendCappedNote(
+                  issue.description,
+                  `[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${entry.reason.slice(0, 200)}`,
+                )
                 issue.updatedAt = now
                 await service.store.issues.save(issue)
                 stillOpen.push({ title: issue.title, reason: entry.reason })
@@ -2752,6 +2872,118 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             }
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true, target, resolved, stillOpen, newIssues, verdict }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
+        // 把待处理问题清单发送到聊天窗口：followup 唤醒当前会话模型，从整体角度复验
+        // 这些问题是否真实存在（误报/重复/已被后续提交修复）。只发消息不改任何状态。
+        if (req.method === 'POST' && routePath === '/issues/to-chat') {
+          try {
+            const body = await readJsonBody(req)
+            const sessionId = typeof body['sessionId'] === 'string' ? body['sessionId'] : ''
+            if (sessionId === '') {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'sessionId is required' }))
+              return
+            }
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const requestedIds = Array.isArray(body['ids']) ? (body['ids'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
+            const limitRaw = typeof body['limit'] === 'number' ? Math.trunc(body['limit']) : 30
+            const limit = Math.min(60, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 30))
+            const pool = (service.store?.issues.list() ?? [])
+              .filter((issue) => issue.projectId === project.id && (issue.status === 'open' || issue.status === 'fixing'))
+              .filter((issue) => requestedIds.length === 0 || requestedIds.includes(issue.id))
+              .sort((left, right) => left.createdAt - right.createdAt)
+            const severityWeight: Record<string, number> = { blocker: 0, critical: 1, major: 2, minor: 3, info: 4 }
+            const selected = [...pool]
+              .sort((left, right) => (severityWeight[left.severity] ?? 9) - (severityWeight[right.severity] ?? 9))
+              .slice(0, limit)
+            const agent = (ctx as any)?.agents?.get?.(sessionId)
+            if (agent === undefined || typeof agent.followup !== 'function') {
+              res.writeHead(409, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: '当前会话没有活跃的对话（请先打开该项目下的会话再试）' }))
+              return
+            }
+            if (selected.length === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: '没有待处理问题可发送', sent: 0 }))
+              return
+            }
+            const lines = selected.map((issue, index) => {
+              const description = issue.description ?? ''
+              const evidence = description.replace(/^证据：/, '').slice(0, 160)
+              const fix = description.match(/建议：([^]*)/)?.[1]?.slice(0, 120) ?? ''
+              const commitTag = issue.changeId.startsWith('review:')
+                ? `提交 ${issue.changeId.slice('review:'.length, 'review:'.length + 8)}`
+                : `变更 ${issue.changeId}`
+              return [
+                `${index + 1}. [id:${issue.id}] [${issue.severity}][${issue.category || 'general'}] ${issue.title}`,
+                `   对象：${commitTag}`,
+                `   证据：${evidence}`,
+                fix === '' ? '' : `   建议：${fix}`,
+              ].filter((line) => line !== '').join('\n')
+            })
+            const mode = body['mode'] === 'plan' ? 'plan' : 'auto'
+            const gateRules = mode === 'auto'
+              ? [
+                  '【判定流程：每条必须依次过三道闸，全部通过才能进入修复】',
+                  '第一闸（存在性）：问题指向的文件/函数/功能在当前代码里还存在吗？用代码搜索/读文件确认。已被删除或重构掉 → verdict=obsolete，note 注明被哪个提交/变更移除，fixFiles 填被移除功能所在的文件。',
+                  '第二闸（意图）：代码还在，但当前行为可能是有意的设计变更（需求转向、行为故意改变）。结合后续提交的提交信息与功能演进判断：若当前行为是有意的 → verdict=obsolete（需求已变更），note 说明依据（哪个提交把行为改成了现在这样、为什么它是故意的）。绝不许把有意的变更当 bug 修回去。',
+                  '第三闸（真实性）：确认在当前版本仍是真实缺陷后，默认动作是【立即修复】——按当前代码结构修（不是按发现时的老结构）。修完 verdict=fixed，note 写修复内容，fixFiles 列出你改的文件。只判定不修复是不可接受的。',
+                ]
+              : [
+                  '【本轮是"方案模式"：绝对禁止修改任何代码/文件。你的产出是判定 + 修复方案，不是修复本身。】',
+                  '判定类结论可以直接回写（这些不改代码，安全）：',
+                  '- 功能/代码已被删除或需求有意变更 → verdict=obsolete，note 注明依据提交；',
+                  '- 已被之前的提交修好 → verdict=already_fixed，note 引用修复提交/文件；',
+                  '- 从来就不是问题 → verdict=false_positive；与其他条重复 → verdict=duplicate。',
+                  '真实存在的问题（过完存在性/意图两闸后仍成立）：',
+                  '- 调用 review_issue_update 回写 verdict=confirmed，note 写「方案#N 待评审」；',
+                  '- 然后为每一条输出完整修复方案，格式严格如下：',
+                  '  ### 方案#N：<问题标题>',
+                  '  - 问题：以当前代码为准的一句话缺陷描述（引用文件:行号）',
+                  '  - 方案：具体怎么修（改哪个文件、改什么逻辑，步骤化）',
+                  '  - 影响范围：改动会波及的文件/接口/调用方；是否影响公共行为',
+                  '  - 收益：修复后消除的风险/收益',
+                  '  - 风险：修复本身可能引入的问题、回归面',
+                  '- 方案必须基于当前 HEAD 的实际代码（先读过再写方案），不要按老提交的上下文臆测。',
+                  '全部处理完后输出「## 待评审汇总」：可直接关闭清单（已回写）、方案清单编号、建议优先级。然后停下等待开发者批准——开发者会在聊天里逐条批准（如"同意方案#1 #3"），届时再执行修复并回写 fixed。',
+                ]
+            const prompt = [
+              `请从整体角度处理以下 ${selected.length} 条 Review 问题（项目：${project.name}）。`,
+              '重要背景：这些问题是从历史提交的评审中提取的，清单里的"对象：提交 xxx"只是**发现时的基线**——代码库此后可能已经大幅演进。一切判定必须以**当前版本（HEAD）**为准，不要按老提交的视角行事。',
+              '',
+              ...gateRules,
+              '',
+              '其余判定：',
+              '- 已被之前的提交修好 → verdict=already_fixed，note 引用修复提交/文件，fixFiles 填那次修复涉及的文件；',
+              '- 从来就不是问题（证据不成立/逻辑本来正确）→ verdict=false_positive，note 写判定依据；',
+              '- 与清单中另一条重复 → verdict=duplicate，note 指明重复于哪一条；',
+              '- 属实、仍存在、但确实不该由你修 → verdict=confirmed，note 必须写明具体理由（需要产品决策 / 改公共 API 合同 / 需要同步改上游依赖），并给建议方案。修起来麻烦、工作量大都不是理由。',
+              '',
+              '每处理完一条（方案模式含 confirmed 回写），立即调用 review_issue_update（issueId 用清单里的 id），不要只在文字里说。',
+              mode === 'auto'
+                ? '全部处理完后输出「## 汇总」：已修复清单（含改动文件）、此前已修复清单、已过时清单（功能移除/需求变更，含依据）、误报/重复清单、保留待修清单（含原因），以及你发现的新问题（如有）。'
+                : '方案输出完即停，不要动手修复。',
+              '',
+              '== 问题清单 ==',
+              ...lines,
+            ].join('\n')
+            agent.followup(createUserMessage({
+              content: [{ type: 'text', text: prompt }],
+              source: { kind: 'project-control' },
+            }))
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, sent: selected.length }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))

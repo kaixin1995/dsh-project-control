@@ -724,6 +724,55 @@ ${result.references}` }]
     },
   })
 
+  // ── 聊天复验闭环：模型判定/修复后回写 Review 问题状态 ────────────────────
+
+  const reviewIssueUpdateTool = defineTool({
+    name: 'review_issue_update',
+    description: 'Update a Review issue after in-chat verification (the "send issues to chat" loop). Call this for EVERY issue you received, immediately after handling it. Verdicts: fixed after YOU fix the code (default for real, still-present defects); already_fixed when a later commit already fixed it; obsolete when the feature/code was REMOVED or the behavior was deliberately changed by later commits (cite them) — never "fix" an obsolete issue; false_positive or duplicate closes it as rejected; confirmed only when fixing is genuinely not appropriate (state why). The Review board reflects changes in real time.',
+    parameters: {
+      issueId: { type: 'string', required: true, description: 'The issue id from the list you were given (format iss_xxx).' },
+      verdict: { type: 'string', required: true, description: 'One of: fixed | already_fixed | obsolete | false_positive | duplicate | confirmed.' },
+      note: { type: 'string', required: true, description: 'One-sentence evidence for the verdict (what you fixed / which later commit fixed, removed, or repurposed it / why it is a false positive).' },
+      fixFiles: { type: 'array', items: { type: 'string' }, description: 'Files involved: the files YOU changed (verdict=fixed, required), or the files the later fix/Removal touched (already_fixed/obsolete).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { issueId: { type: 'string' }, status: { type: 'string' }, title: { type: 'string' } },
+        additionalProperties: false,
+      },
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { issueId: string; status: string; title: string }
+        return [{ type: 'text', text: `Review issue ${result.issueId} → ${result.status}: ${result.title}` }]
+      },
+    },
+    async execute(args: { issueId: string; verdict: string; note: string; fixFiles?: string[] }, exec: ToolRunContext) {
+      const service = control(ctx)
+      const store = requireStore(ctx)
+      const verdicts = ['fixed', 'already_fixed', 'obsolete', 'false_positive', 'duplicate', 'confirmed'] as const
+      if (!verdicts.includes(args.verdict as never)) {
+        throw new Error(`verdict must be one of: ${verdicts.join(' | ')}`)
+      }
+      if (args.verdict === 'fixed' && (args.fixFiles ?? []).length === 0) {
+        throw new Error('verdict=fixed requires fixFiles (the files you changed)')
+      }
+      // 归属校验：只允许操作当前会话项目的问题，杜绝跨项目改状态。
+      const ensured = await service.ensureCurrentProject(workdir(exec))
+      const issue = store.issues.get(args.issueId as never)
+      if (issue === undefined || issue.projectId !== ensured.project.id) {
+        throw new Error(`review issue "${args.issueId}" not found in the current project`)
+      }
+      const manager = new ReviewIssueManager(store.issues)
+      const updated = await manager.applyChatVerdict(
+        args.issueId as never,
+        args.verdict as 'confirmed' | 'fixed' | 'already_fixed' | 'obsolete' | 'false_positive' | 'duplicate',
+        args.note,
+        args.fixFiles,
+      )
+      return { issueId: updated.id, status: updated.status, title: updated.title }
+    },
+  })
+
   const tools = [
     createChangeTool,
     listChangesTool,
@@ -733,6 +782,7 @@ ${result.references}` }]
     queryImpactTool,
     runReviewTool,
     runVerificationTool,
+    reviewIssueUpdateTool,
     writeAgentNoteTool,
     explainConceptTool,
     summarizeLearningTool,

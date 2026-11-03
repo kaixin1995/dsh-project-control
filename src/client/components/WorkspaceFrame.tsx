@@ -39,7 +39,7 @@ export interface WorkspaceState {
   concepts?: Array<{ id: string; name: string; category: string; description: string; occurrences: number }>
 }
 
-/** GET /commits 的提交条目。 */
+/** GET /commits 的提交条目。analyzed = 已生成过 AI 解读（未消化圆点消点依据）。 */
 interface CommitEntry {
   sha: string
   shortHash: string
@@ -47,6 +47,7 @@ interface CommitEntry {
   date: number
   subject: string
   files: Array<{ path: string; adds: number; dels: number }>
+  analyzed?: boolean
 }
 
 interface CommitsPayload {
@@ -238,8 +239,8 @@ const ISSUE_STATUS_LABELS: Record<string, string> = {
   open: '待处理',
   fixing: '修复中',
   resolved: '已解决',
-  accepted: '已接受',
-  rejected: '已拒绝',
+  accepted: '已处理',
+  rejected: '误报/重复',
 }
 
 /** 记忆类型 → 中文标签。 */
@@ -460,8 +461,12 @@ export const WORKSPACE_DICT = {
     'picker.roundLatest': '第 {n} 轮（最新）',
     'picker.roundSelect': '选整轮',
     'picker.roundClear': '取消本轮',
-    'picker.undigested': '上次 AI 总结之后的新提交，尚未核查消化',
+    'picker.undigested': '上次 AI 总结之后、且尚未生成过 AI 解读的新提交',
     'picker.undigestedCount': '{n} 个提交未消化',
+    'picker.selectAllUndigested': '全选未消化',
+    'picker.digestAll': '一键消化',
+    'picker.digestAllHint': '选中全部未消化提交并批量 AI 解读（并发 3，有缓存），完成后自动生成整体叙事；之后到「笔记与记忆」生成学习总结即可重置未消化标记',
+    'narrative.digestHint': '整体叙事已生成。到「笔记与记忆」页生成 AI 学习总结，即可重置「未消化」标记。',
     'impact.factors': '风险构成（为什么是这个等级）',
     'impact.points': '影响点明细',
     'impact.keyPoints': '关键组件',
@@ -547,9 +552,32 @@ export const WORKSPACE_DICT = {
     'review.callCount': '处调用',
     'review.fixDiff': '修复差异（相对评审基线）',
     'review.refresh': '刷新',
-    'review.retentionHint': '已解决问题保留 {days} 天后自动清理',
+    'review.retentionHint': '已解决/误报问题保留 {days} 天后自动清理',
     'review.target': '对象',
     'review.workingTarget': '工作区',
+    'review.exportMd': '导出 MD',
+    'review.exportMdHint': '把当前筛选下的问题清单下载为 .md 文件',
+    'review.exportEmpty': '没有可导出的问题',
+    'review.selectAll': '全选',
+    'review.checkedCount': '已选 {n} 条',
+    'review.markHandled': '标记已处理',
+    'review.batchVerify': '批量复检',
+    'review.batchVerifyConfirmTitle': '批量复检？',
+    'review.batchVerifyConfirmMsg': '将对 {n} 个评审目标逐一复检（串行 LLM 调用，每个目标约 10-60 秒，会消耗模型用量）；可随时停止。',
+    'review.batchStop': '停止',
+    'review.batchProgress': '批量复检中 {i}/{n}',
+    'review.batchDone': '批量复检完成：解决 {a} 条 · 仍待处理 {b} 条 · 新问题 {c} 条 · 失败 {d} 个目标',
+    'review.batchStopped': '批量复检已停止',
+    'review.sendChat': '转聊天复验',
+    'review.sendChatHint': '把当前筛选下的待处理问题（最多 30 条）发送到聊天窗口，由模型从整体角度复验是否属实（误报/重复/已被修复）',
+    'review.sendChatConfirmTitle': '转聊天复验——选择模式',
+    'review.sendChatConfirmMsg': '将把 {n} 条待处理问题发送到当前聊天窗口（消耗模型用量）。直接修复：判定+修复+回写全自动。先出方案：误报/重复/已过时自动关闭；真实问题不修代码，逐条给出修复方案/影响范围/收益，等你在聊天里评审批准后才修。',
+    'review.sendChatAuto': '⚡ 直接修复',
+    'review.sendChatPlan': '📋 先出方案',
+    'review.sendChatEmpty': '没有待处理问题可发送',
+    'review.sendChatNoSession': '请先在左侧打开该项目下的会话，再转聊天复验',
+    'review.sendChatDone': '已发送 {n} 条问题到聊天窗口，模型将开始逐条复验。',
+    'review.handledDone': '已把 {n} 条问题标记为已处理',
 
     'plan.title': '编排计划确认',
     'plan.hint': '每步的角色决定上下文注入与默认模型（分析/操作=fast，开发=standard，规划=reasoning，验收=verifier）；可调整后再启动。',
@@ -729,8 +757,12 @@ export const WORKSPACE_DICT = {
     'picker.roundLatest': 'Round {n} (latest)',
     'picker.roundSelect': 'Select round',
     'picker.roundClear': 'Clear round',
-    'picker.undigested': 'New commits since the last AI summary (not yet reviewed)',
+    'picker.undigested': 'New commits since the last AI summary without AI analysis yet',
     'picker.undigestedCount': '{n} unreviewed commits',
+    'picker.selectAllUndigested': 'Select undigested',
+    'picker.digestAll': 'Digest all',
+    'picker.digestAllHint': 'Select all undigested commits and batch AI analysis (concurrency 3, cached), auto-generate the narrative afterwards; then create an AI summary in Notes & Memory to reset the marker',
+    'narrative.digestHint': 'Narrative generated. Create an AI summary in Notes & Memory to reset the undigested marker.',
     'impact.factors': 'Risk factors (why this level)',
     'impact.points': 'Impacted points',
     'impact.keyPoints': 'Key components',
@@ -816,9 +848,32 @@ export const WORKSPACE_DICT = {
     'review.callCount': 'call site(s)',
     'review.fixDiff': 'Fix diff (relative to the review baseline)',
     'review.refresh': 'Refresh',
-    'review.retentionHint': 'Resolved issues are auto-purged after {days} day(s)',
+    'review.retentionHint': 'Resolved / false-positive issues are auto-purged after {days} day(s)',
     'review.target': 'Target',
     'review.workingTarget': 'Working tree',
+    'review.exportMd': 'Export MD',
+    'review.exportMdHint': 'Download the filtered issue list as a .md file',
+    'review.exportEmpty': 'No issues to export',
+    'review.selectAll': 'Select all',
+    'review.checkedCount': '{n} selected',
+    'review.markHandled': 'Mark handled',
+    'review.batchVerify': 'Batch verify',
+    'review.batchVerifyConfirmTitle': 'Batch verify?',
+    'review.batchVerifyConfirmMsg': 'Will verify {n} review targets one by one (serial LLM calls, ~10-60s each, consumes model usage); you can stop anytime.',
+    'review.batchStop': 'Stop',
+    'review.batchProgress': 'Batch verifying {i}/{n}',
+    'review.batchDone': 'Batch verify done: {a} resolved · {b} still open · {c} new · {d} failed targets',
+    'review.batchStopped': 'Batch verify stopped',
+    'review.sendChat': 'Send to chat',
+    'review.sendChatHint': 'Send pending issues under the current filter (max 30) to the chat window for holistic re-verification (false positive / duplicate / already fixed)',
+    'review.sendChatConfirmTitle': 'Send to chat — pick a mode',
+    'review.sendChatConfirmMsg': 'Will send {n} pending issues to the current chat window (consumes model usage). Auto fix: verify + fix + write-back, fully automatic. Plan first: false positives/duplicates/obsolete are auto-closed; real issues are NOT fixed — you get per-issue plans (approach / impact / benefit) and the model fixes only after you approve in chat.',
+    'review.sendChatAuto': '⚡ Auto fix',
+    'review.sendChatPlan': '📋 Plan first',
+    'review.sendChatEmpty': 'No pending issues to send',
+    'review.sendChatNoSession': 'Open a session of this project on the left before sending to chat',
+    'review.sendChatDone': 'Sent {n} issues to chat; the model will verify them one by one.',
+    'review.handledDone': '{n} issues marked as handled',
 
     'plan.title': 'Orchestration plan',
     'plan.hint': 'Each step role drives context injection and the default model (analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier); adjust before launching.',
@@ -1272,8 +1327,8 @@ function formatTime(value: number | null | undefined): string {
   return new Date(value).toLocaleString()
 }
 
-/** 二次确认弹窗：遮罩 + 居中卡片，危险操作（删除笔记/变更/约束）共用。 */
-function ConfirmDialog(props: { title: string; message: string; danger?: boolean; onCancel: () => void; onConfirm: () => void }) {
+/** 二次确认弹窗：遮罩 + 居中卡片，危险操作（删除笔记/变更/约束）共用；alt 提供第二确认动作（如"先出方案"）。 */
+function ConfirmDialog(props: { title: string; message: string; danger?: boolean; confirmLabel?: string; alt?: { label: string; onAlt: () => void }; onCancel: () => void; onConfirm: () => void }) {
   return React.createElement(React.Fragment, null,
     React.createElement('div', {
       'data-testid': 'pc-confirm-overlay',
@@ -1310,11 +1365,15 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
             React.createElement('div', { style: { fontSize: '12px', lineHeight: 1.7, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, props.message),
           ),
         ),
-        React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '18px' } },
+        React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '18px', flexWrap: 'wrap' } },
           React.createElement('button', {
             style: { ...styles.secondary, padding: '7px 18px', borderRadius: '8px' },
             onClick: props.onCancel,
           }, '取消'),
+          props.alt !== undefined && React.createElement('button', {
+            style: { ...styles.secondary, padding: '7px 18px', borderRadius: '8px', fontWeight: 600 },
+            onClick: props.alt.onAlt,
+          }, props.alt.label),
           React.createElement('button', {
             'data-testid': 'pc-confirm-ok',
             style: {
@@ -1322,7 +1381,7 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
               background: props.danger ? '#e11d48' : 'var(--dsw-alias-button-info-fill, #2563eb)', color: '#fff',
             },
             onClick: props.onConfirm,
-          }, '确认删除'),
+          }, props.confirmLabel ?? '确认删除'),
         ),
       ),
     ),
@@ -1389,6 +1448,9 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [issueExpanded, setIssueExpanded] = useState<Record<string, boolean>>({})
   const [fixExpanded, setFixExpanded] = useState<Record<string, boolean>>({})
   const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
+  const [issueChecked, setIssueChecked] = useState<Record<string, boolean>>({})
+  const [batchVerifyState, setBatchVerifyState] = useState<{ done: number; total: number } | null>(null)
+  const batchStopRef = useRef(false)
   const [aiSummarizing, setAiSummarizing] = useState(false)
   const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number; costUsd?: number } | null>(null)
   const [narrativeBusy, setNarrativeBusy] = useState(false)
@@ -1487,6 +1549,31 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       setNarrativeBusy(false)
     }
   }
+  // 经 ref 暴露最新闭包：并发池排空触发自动叙事时读取的是最新 selectedTargets。
+  useEffect(() => { loadNarrativeRef.current = () => { void loadNarrative() } })
+
+  /** 批量勾选提交（新增的逐条触发 AI 解读，已有的走缓存）。 */
+  const selectCommits = (shas: string[]): void => {
+    const added = shas.filter((sha) => !selectedTargets.includes(sha))
+    setSelectedTargets((previous) => Array.from(new Set([...previous, ...shas])))
+    for (const sha of added) loadDetail(sha, false)
+  }
+
+  /** 一键消化：选中全部未消化提交 → 批量解读 → 排空后自动生成整体叙事。 */
+  const digestAll = (): void => {
+    const shas = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit)).map((commit) => commit.sha)
+    if (shas.length === 0) return
+    setImpact(null)
+    setReviews({})
+    const needsFetch = shas.some((sha) => !selectedTargets.includes(sha))
+    selectCommits(shas)
+    if (needsFetch) {
+      autoNarrativeRef.current = shas.length >= 2
+    } else if (shas.length >= 2) {
+      // 全部已在选中集合且解读队列空闲：直接生成叙事（等一拍让 state 落地）。
+      setTimeout(() => { loadNarrativeRef.current() }, 0)
+    }
+  }
 
   const commitsRequestRef = useRef(0)
   const loadCommits = async (): Promise<void> => {
@@ -1545,9 +1632,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const MAX_DETAIL_CONCURRENCY = 3
   const detailPoolRef = useRef<{ pending: Array<{ target: string; force: boolean }>; active: number }>({ pending: [], active: 0 })
   const detailInFlightRef = useRef(new Set<string>())
+  /** 一键消化：全部解读跑完后自动生成整体叙事（经 ref 取最新闭包，避免 selectedTargets 过期）。 */
+  const autoNarrativeRef = useRef(false)
+  const loadNarrativeRef = useRef<() => void>(() => {})
 
   const pumpDetailPool = (): void => {
     const pool = detailPoolRef.current
+    if (pool.active === 0 && pool.pending.length === 0) {
+      if (autoNarrativeRef.current && activeRef.current) {
+        autoNarrativeRef.current = false
+        loadNarrativeRef.current()
+      }
+      return
+    }
     while (activeRef.current && pool.active < MAX_DETAIL_CONCURRENCY && pool.pending.length > 0) {
       const job = pool.pending.shift()!
       pool.active += 1
@@ -1662,10 +1759,136 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     try {
       const response = await fetch('/project-control/api/issues?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
       const data: unknown = await response.json()
+      // 轮询刷新不清空勾选：勾选键随问题 id 走，已消失的 id 不影响显示。
       if (response.ok) setIssuesData((data as { issues: IssueEntry[] }).issues ?? [])
     } catch {
       // 问题列表加载失败不打断页面：列表保持原样。
     }
+  }
+
+  // Review 页签实时同步：模型在聊天里回写状态（review_issue_update）后，看板 4 秒内跟上。
+  useEffect(() => {
+    if (tab !== 'review') return
+    const timer = setInterval(() => { void loadIssues() }, 4000)
+    return () => { clearInterval(timer) }
+  }, [tab, props.sessionId])
+
+  /** 问题清单导出为 Markdown（按严重度排序；复用笔记导出的下载方式）。 */
+  const exportIssuesMd = (issues: IssueEntry[]): void => {
+    if (issues.length === 0) {
+      setActionResult('✗ ' + t('review.exportEmpty'))
+      return
+    }
+    const severityOrder: Record<string, number> = { blocker: 0, critical: 1, major: 2, minor: 3, info: 4 }
+    const ordered = [...issues].sort((left, right) =>
+      (severityOrder[normalizeIssueSeverity(left.severity)] ?? 9) - (severityOrder[normalizeIssueSeverity(right.severity)] ?? 9)
+      || left.createdAt - right.createdAt)
+    const lines: string[] = [
+      '# Review 问题清单',
+      '',
+      `- 项目：${state?.project?.name ?? '—'}`,
+      `- 仓库：${commitsData?.rootPath ?? state?.project?.rootPath ?? '—'}`,
+      `- 分支：${commitsData?.branch ?? '—'}`,
+      `- 导出时间：${new Date().toLocaleString()}`,
+      `- 数量：${issues.length}（待处理 ${issues.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length}）`,
+      '',
+    ]
+    ordered.forEach((issue, index) => {
+      const target = issue.changeId.startsWith('review:') && issue.changeId !== 'review:worktree'
+        ? `提交 ${issue.changeId.slice('review:'.length, 'review:'.length + 8)}`
+        : issue.changeId === 'review:worktree' ? '工作区' : issue.changeId
+      lines.push(`## ${index + 1}. [${issue.severity}][${issue.category || 'general'}] ${issue.title}`)
+      lines.push('')
+      lines.push(`- 状态：${ISSUE_STATUS_LABELS[issue.status] ?? issue.status}`)
+      lines.push(`- 对象：${target}`)
+      lines.push(`- 发现时间：${new Date(issue.createdAt).toLocaleString()}`)
+      if ((issue.description ?? '') !== '') lines.push(`- 描述：${issue.description!.replace(/\n/g, ' ')}`)
+      if ((issue.resolution ?? '') !== '') lines.push(`- 结论：${issue.resolution}`)
+      lines.push('')
+    })
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `review-issues-${new Date().toISOString().slice(0, 10)}.md`
+    anchor.click()
+    URL.revokeObjectURL(url)
+    setActionResult('✓ ' + t('notes.exportDone'))
+  }
+
+  /** 批量标记已处理（accepted）：人工确认无需逐条复检时直接结案。 */
+  const markIssuesHandled = async (ids: string[]): Promise<void> => {
+    let done = 0
+    for (const id of ids) {
+      const { ok } = await post('/project-control/api/issues/status', { id, status: 'accepted' })
+      if (ok) done += 1
+    }
+    await loadIssues()
+    if (done > 0) setActionResult('✓ ' + t('review.handledDone').replace('{n}', String(done)))
+  }
+
+  /** 批量复检：对选中的评审目标逐个跑复检（串行 LLM），实时进度、可中途停止。 */
+  const runBatchVerify = async (targets: string[]): Promise<void> => {
+    if (targets.length === 0) return
+    batchStopRef.current = false
+    setBatchVerifyState({ done: 0, total: targets.length })
+    let resolvedTotal = 0
+    let openTotal = 0
+    let newTotal = 0
+    let failed = 0
+    for (const [index, target] of targets.entries()) {
+      if (batchStopRef.current) break
+      setBatchVerifyState({ done: index, total: targets.length })
+      try {
+        const { ok, data } = await post('/project-control/api/issues/verify', { target })
+        if (!ok) failed += 1
+        else {
+          resolvedTotal += ((data['resolved'] as unknown[]) ?? []).length
+          openTotal += ((data['stillOpen'] as unknown[]) ?? []).length
+          newTotal += ((data['newIssues'] as unknown[]) ?? []).length
+        }
+      } catch {
+        failed += 1
+      }
+    }
+    setBatchVerifyState(null)
+    await loadIssues()
+    if (batchStopRef.current) setActionResult('⏹ ' + t('review.batchStopped'))
+    else setActionResult('✓ ' + t('review.batchDone').replace('{a}', String(resolvedTotal)).replace('{b}', String(openTotal)).replace('{c}', String(newTotal)).replace('{d}', String(failed)))
+  }
+
+  /** 转聊天复验：把筛选范围内的待处理问题发送到当前会话（followup 唤醒模型整体复验）。 */
+  const sendIssuesToChat = (issues: IssueEntry[]): void => {
+    const ids = issues
+      .filter((issue) => issue.status === 'open' || issue.status === 'fixing')
+      .map((issue) => issue.id)
+    if (ids.length === 0) {
+      setActionResult('✗ ' + t('review.sendChatEmpty'))
+      return
+    }
+    if (props.sessionId === undefined || props.sessionId === '') {
+      setActionResult('✗ ' + t('review.sendChatNoSession'))
+      return
+    }
+    setConfirmDialog({
+      title: t('review.sendChatConfirmTitle'),
+      message: t('review.sendChatConfirmMsg').replace('{n}', String(Math.min(ids.length, 30))),
+      danger: false,
+      confirmLabel: t('review.sendChatAuto'),
+      alt: {
+        label: t('review.sendChatPlan'),
+        onAlt: () => { void sendToChat(ids, 'plan') },
+      },
+      onConfirm: () => { void sendToChat(ids, 'auto') },
+    })
+  }
+
+  /** 实际发送：mode=auto 全自动修复；plan 半手动（误报/重复直接关，真问题只出方案等评审）。 */
+  const sendToChat = async (ids: string[], mode: 'auto' | 'plan'): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/issues/to-chat', { ids, limit: 30, mode })
+    setActionResult(ok
+      ? '✓ ' + t('review.sendChatDone').replace('{n}', String(data['sent'] ?? ''))
+      : '✗ ' + String(data['error'] ?? 'error'))
   }
 
   /**
@@ -2209,14 +2432,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const lastSummaryAt = notes
     .filter((note) => note.sha === 'summary')
     .sort((left, right) => right.createdAt - left.createdAt)[0]?.createdAt
-  const isUndigested = (date: number): boolean => lastSummaryAt === undefined || date > lastSummaryAt
-  const undigestedCount = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit.date)).length
+  const isUndigested = (commit: { sha: string; date: number }): boolean => {
+    if (commit.sha === 'working') return false
+    // 已生成过 AI 解读（analyzed 标记）即视为已消化；否则新于上次总结的都算未消化。
+    if (commitBySha.get(commit.sha)?.analyzed === true) return false
+    return lastSummaryAt === undefined || commit.date > lastSummaryAt
+  }
+  const undigestedCount = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit)).length
   const commitRounds = clusterIntoRounds(commitsData?.commits ?? [])
 
   /** 下拉框的提交行（含未消化圆点；working 条目不标）。 */
   const renderPickerRow = (entry: { key: string; label: string; meta: string; sha: string }): React.ReactNode => {
     const commit = commitBySha.get(entry.sha)
-    const undigested = commit !== undefined && isUndigested(commit.date)
+    const undigested = commit !== undefined && isUndigested(commit)
     return (
       <div
         key={entry.key}
@@ -2287,6 +2515,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     value={pickerFilter}
                     onChange={(e) => { setPickerFilter(e.target.value) }}
                   />
+                  {(commitsData?.commits ?? []).some((commit) => isUndigested(commit)) && (
+                    <button
+                      style={styles.secondary}
+                      title={t('picker.undigested')}
+                      onClick={() => { selectCommits((commitsData?.commits ?? []).filter((commit) => isUndigested(commit)).map((commit) => commit.sha)) }}
+                    >● {t('picker.selectAllUndigested')}</button>
+                  )}
                   <button style={styles.secondary} onClick={() => { setSelectedTargets([]) }}>{t('picker.clear')}</button>
                 </div>
                 <div style={{ maxHeight: 420, overflowY: 'auto' }}>
@@ -2335,9 +2570,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px', alignItems: 'center' }}>
           <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('picker.hint')}</span>
           {undigestedCount > 0 && (
-            <span title={t('picker.undigested')} style={{ fontSize: '11px', color: themeAwareText('#d97706') }}>
-              ● {t('picker.undigestedCount').replace('{n}', String(undigestedCount))}
-            </span>
+            <>
+              <span title={t('picker.undigested')} style={{ fontSize: '11px', color: themeAwareText('#d97706') }}>
+                ● {t('picker.undigestedCount').replace('{n}', String(undigestedCount))}
+              </span>
+              <button style={styles.secondary} title={t('picker.digestAllHint')} onClick={digestAll}>⚡ {t('picker.digestAll')}</button>
+            </>
           )}
           {(detailQueuedCount > 0 || detailRunningCount > 0) && (
             <span style={styles.badge('#dcdcaa')}>
@@ -2371,6 +2609,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             )}
           </div>
           {narrativeError !== '' && <div style={{ ...styles.empty, color: themeAwareText('#d1242f') }}>{narrativeError}</div>}
+          {narrative !== null && <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '4px' }}>{t('narrative.digestHint')}</div>}
           {narrative !== null && (
             <div style={{ ...styles.what, whiteSpace: 'pre-wrap' }}>{renderStructuredContent(narrative.narrative)}</div>
           )}
@@ -3356,20 +3595,24 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {(() => {
           const all = (issuesData ?? []).map((issue) => ({ ...issue, severity: normalizeIssueSeverity(issue.severity) }))
           const openCount = all.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+          // 计数 chips 跟随状态筛选（"全部"= 状态筛选后的总数）：选"已解决"后各严重度数字立即对应已解决列表。
+          const statusFiltered = all.filter((issue) => issueStatusFilter === '' || issue.status === issueStatusFilter)
           const counts: Array<{ key: string; label: string; count: number }> = [
-            { key: '', label: t('review.filterAll'), count: all.length },
-            { key: 'critical', label: 'critical', count: all.filter((issue) => issue.severity === 'critical' || issue.severity === 'blocker').length },
-            { key: 'major', label: 'major', count: all.filter((issue) => issue.severity === 'major').length },
-            { key: 'minor', label: 'minor', count: all.filter((issue) => issue.severity === 'minor').length },
-            { key: 'info', label: 'info', count: all.filter((issue) => issue.severity === 'info').length },
+            { key: '', label: t('review.filterAll'), count: statusFiltered.length },
+            { key: 'critical', label: 'critical', count: statusFiltered.filter((issue) => issue.severity === 'critical' || issue.severity === 'blocker').length },
+            { key: 'major', label: 'major', count: statusFiltered.filter((issue) => issue.severity === 'major').length },
+            { key: 'minor', label: 'minor', count: statusFiltered.filter((issue) => issue.severity === 'minor').length },
+            { key: 'info', label: 'info', count: statusFiltered.filter((issue) => issue.severity === 'info').length },
           ]
-          const visible = all
+          const visible = statusFiltered
             .filter((issue) => {
               if (issueSeverityFilter === '') return true
               if (issueSeverityFilter === 'critical') return issue.severity === 'critical' || issue.severity === 'blocker'
               return issue.severity === issueSeverityFilter
             })
-            .filter((issue) => issueStatusFilter === '' || issue.status === issueStatusFilter)
+          const checkedVisible = visible.filter((issue) => issueChecked[issue.id] === true)
+          const checkedOpen = checkedVisible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
+          const checkedOpenTargets = Array.from(new Set(checkedOpen.map((issue) => issue.changeId)))
           return (
             <>
               <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' }}>
@@ -3388,8 +3631,51 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <option value="">{t('review.statusAll')}</option>
                   {Object.entries(ISSUE_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                 </select>
+                <button
+                  style={styles.secondary}
+                  onClick={() => {
+                    setIssueChecked((previous) => {
+                      const allChecked = visible.every((issue) => previous[issue.id] === true)
+                      const next = { ...previous }
+                      for (const issue of visible) next[issue.id] = !allChecked
+                      return next
+                    })
+                  }}
+                >{t('review.selectAll')}</button>
+                <button style={styles.secondary} title={t('review.exportMdHint')} onClick={() => { exportIssuesMd(visible) }}>{t('review.exportMd')}</button>
+                <button style={styles.secondary} title={t('review.sendChatHint')} onClick={() => { sendIssuesToChat(visible) }}>{'💬 ' + t('review.sendChat')}</button>
                 <button style={styles.secondary} onClick={() => { void loadIssues() }}>{t('review.refresh')}</button>
               </div>
+              {(checkedVisible.length > 0 || batchVerifyState !== null) && (
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', padding: '6px 10px', marginBottom: '10px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))', borderRadius: '6px', fontSize: '11px' }}>
+                  {batchVerifyState !== null ? (
+                    <>
+                      <span style={{ color: themeAwareText('#d97706') }}>
+                        ⏳ {t('review.batchProgress').replace('{i}', String(batchVerifyState.done)).replace('{n}', String(batchVerifyState.total))}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { batchStopRef.current = true }}>{t('review.batchStop')}</button>
+                    </>
+                  ) : (
+                    <>
+                      <span>{t('review.checkedCount').replace('{n}', String(checkedVisible.length))}</span>
+                      {checkedOpenTargets.length > 0 && (
+                        <button
+                          style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                          title={t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length))}
+                          onClick={() => { setConfirmDialog({ title: t('review.batchVerifyConfirmTitle'), message: t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length)), danger: false, onConfirm: () => { void runBatchVerify(checkedOpenTargets) } }) }}
+                        >🔍 {t('review.batchVerify')}({String(checkedOpenTargets.length)})</button>
+                      )}
+                      {checkedOpen.length > 0 && (
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void markIssuesHandled(checkedOpen.map((issue) => issue.id)) }}>✓ {t('review.markHandled')}</button>
+                      )}
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { exportIssuesMd(checkedVisible) }}>{t('review.exportMd')}</button>
+                      <span style={{ flex: 1 }} />
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setIssueChecked({}) }}>{t('picker.clear')}</button>
+                    </>
+                  )}
+                </div>
+              )}
               {all.length === 0 ? (
                 <div style={styles.empty}>{issuesData === null ? '…' : t('review.recordsEmpty')}</div>
               ) : visible.length === 0 ? (
@@ -3402,6 +3688,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <div key={issue.id} style={styles.noteCard}>
                     <div style={styles.noteTitleRow}>
                       <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <input
+                          type="checkbox"
+                          checked={issueChecked[issue.id] === true}
+                          onChange={() => { setIssueChecked((previous) => ({ ...previous, [issue.id]: !(previous[issue.id] === true) })) }}
+                          style={{ margin: 0, flexShrink: 0, cursor: 'pointer', accentColor: 'var(--dsw-alias-brand-primary, #2563eb)' }}
+                        />
                         <span style={styles.badge(severityColor(issue.severity))}>{issue.severity}</span>
                         {issue.category ? <span style={styles.badge('#57606a')}>{issue.category}</span> : null}
                         <span style={styles.badge(issue.status === 'open' || issue.status === 'fixing' ? '#dcdcaa' : issue.status === 'resolved' || issue.status === 'accepted' ? '#4ec9b0' : '#8b8b8b')}>
@@ -3431,6 +3723,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                               })
                             }}
                           >🚫 {t('review.falsePositive')}</button>
+                        )}
+                        {(issue.status === 'open' || issue.status === 'fixing') && (
+                          <button
+                            style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                            title={t('review.markHandled')}
+                            onClick={() => { void markIssuesHandled([issue.id]) }}
+                          >✓ {t('review.markHandled')}</button>
                         )}
                       </div>
                     </div>
