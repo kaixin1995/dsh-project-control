@@ -39,7 +39,7 @@ export interface WorkspaceState {
   concepts?: Array<{ id: string; name: string; category: string; description: string; occurrences: number }>
 }
 
-/** GET /commits 的提交条目。 */
+/** GET /commits 的提交条目。analyzed = 已生成过 AI 解读（未消化圆点消点依据）。 */
 interface CommitEntry {
   sha: string
   shortHash: string
@@ -47,6 +47,7 @@ interface CommitEntry {
   date: number
   subject: string
   files: Array<{ path: string; adds: number; dels: number }>
+  analyzed?: boolean
 }
 
 interface CommitsPayload {
@@ -134,8 +135,31 @@ interface IssueEntry {
   fixFiles: string[]
   fixImpact: Array<{ symbol: string; definedIn: string; callers: Array<{ file: string; line: string; snippet: string }> }>
   fixDiff: string
+  /** 待评审/已派发的修复方案（方案模式产出）。 */
+  fixPlan?: { id: string; approach: string; files: string[]; impact: string; benefit: string; risk: string; status: string } | null
   createdAt: number
   updatedAt: number
+}
+
+/** 修复派发任务视图（GET /fix/status）。 */
+interface FixTaskEntry {
+  issueId: string
+  title: string
+  status: 'queued' | 'running' | 'merging' | 'redo' | 'done' | 'conflict' | 'failed' | 'cancelled'
+  attempt: number
+  summary?: string
+  files?: string[]
+  commit?: string
+  error?: string
+  /** 运行中子代理的最近动作（读/写哪个文件）。 */
+  currentAction?: string
+  /** 完成后的影响摘要（直派任务自动计算）。 */
+  impact?: { riskLevel: string; riskScore: number; direct: string[]; indirect: string[]; potential: string[] }
+  /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
+  mode?: 'fix' | 'plan'
+  /** 模型报错续跑次数 / 探活次数（活性状态机透出）。 */
+  resumes?: number
+  probes?: number
 }
 
 /** 修复差异的行级着色渲染：+ 绿、- 红、文件头加粗、其余弱化。 */
@@ -238,8 +262,8 @@ const ISSUE_STATUS_LABELS: Record<string, string> = {
   open: '待处理',
   fixing: '修复中',
   resolved: '已解决',
-  accepted: '已接受',
-  rejected: '已拒绝',
+  accepted: '已处理',
+  rejected: '误报/重复',
 }
 
 /** 记忆类型 → 中文标签。 */
@@ -411,12 +435,15 @@ export interface WorkspaceFrameProps {
   t?: (key: string) => string
   /** 当前会话 id（官方 session 标准属性；切换会话时重新撑开工作台轨道）。 */
   sessionId?: string
+  /** 新版宿主由外层加法浮层管理布局，不使用旧版 details 换列。 */
+  layoutMode?: 'legacy' | 'overlay'
 }
 
 /** 工作台文案词典（zh / en）。 */
 export const WORKSPACE_DICT = {
   zh: {
     'workspace.title': '项目核查台',
+    'workspace.selectSession': '请先在左侧选择项目下的会话，工作台才会显示该项目的数据。',
     'tab.commits': '提交核查',
     'tab.overview': '项目总览',
     'tab.execution': '执行中心',
@@ -457,8 +484,12 @@ export const WORKSPACE_DICT = {
     'picker.roundLatest': '第 {n} 轮（最新）',
     'picker.roundSelect': '选整轮',
     'picker.roundClear': '取消本轮',
-    'picker.undigested': '上次 AI 总结之后的新提交，尚未核查消化',
+    'picker.undigested': '上次 AI 总结之后、且尚未生成过 AI 解读的新提交',
     'picker.undigestedCount': '{n} 个提交未消化',
+    'picker.selectAllUndigested': '全选未消化',
+    'picker.digestAll': '一键消化',
+    'picker.digestAllHint': '选中全部未消化提交并批量 AI 解读（并发 3，有缓存），完成后自动生成整体叙事；之后到「笔记与记忆」生成学习总结即可重置未消化标记',
+    'narrative.digestHint': '整体叙事已生成。到「笔记与记忆」页生成 AI 学习总结，即可重置「未消化」标记。',
     'impact.factors': '风险构成（为什么是这个等级）',
     'impact.points': '影响点明细',
     'impact.keyPoints': '关键组件',
@@ -544,9 +575,66 @@ export const WORKSPACE_DICT = {
     'review.callCount': '处调用',
     'review.fixDiff': '修复差异（相对评审基线）',
     'review.refresh': '刷新',
-    'review.retentionHint': '已解决问题保留 {days} 天后自动清理',
+    'review.retentionHint': '已解决/误报问题保留 {days} 天后自动清理',
     'review.target': '对象',
     'review.workingTarget': '工作区',
+    'review.exportMd': '导出 MD',
+    'review.exportMdHint': '把当前筛选下的问题清单下载为 .md 文件',
+    'review.exportEmpty': '没有可导出的问题',
+    'review.selectAll': '全选',
+    'review.checkedCount': '已选 {n} 条',
+    'review.markHandled': '标记已处理',
+    'review.batchVerify': '批量复检',
+    'review.batchVerifyConfirmTitle': '批量复检？',
+    'review.batchVerifyConfirmMsg': '将对 {n} 个评审目标逐一复检（串行 LLM 调用，每个目标约 10-60 秒，会消耗模型用量）；可随时停止。',
+    'review.batchStop': '停止',
+    'review.batchProgress': '批量复检中 {i}/{n}',
+    'review.batchDone': '批量复检完成：解决 {a} 条 · 仍待处理 {b} 条 · 新问题 {c} 条 · 失败 {d} 个目标',
+    'review.batchStopped': '批量复检已停止',
+    'review.triage': '🧹 整体分诊',
+    'review.triageHint': 'LLM 整体扫描全部待处理问题：判重复/过时/不成立即时关闭（带依据，可人工重开复核），真问题留下再派发修复',
+    'review.triageConfirmTitle': '整体分诊？',
+    'review.triageConfirmMsg': '将用 LLM 分批扫描全部待处理问题（每批最多 {n} 条，消耗模型用量）。判为重复/过时/不成立的问题会【立即关闭】并注明依据——全部可在问题卡复核重开。留下的真问题再走派发修复。',
+    'review.triageProgress': '分诊中：已处理 {n} 条，剩余约 {m} 条',
+    'review.triageStop': '停止',
+    'review.triageDone': '分诊完成：关闭 重复 {a} · 过时 {b} · 不存在 {c}；保留 {d} 条待处理',
+    'review.triageStopped': '分诊已停止（已判定的不会重复消耗，可再次点击继续）',
+    'review.triageNothing': '当前会话定位到的项目没有待分诊的待处理问题（若与列表不符，请确认左侧打开的会话属于该项目）',
+    'review.triageParseFail': '；有一批输出解析失败已按保留处理，可重试',
+    'review.handledDone': '已把 {n} 条问题标记为已处理',
+    'fix.plan': '修复方案',
+    'fix.planApproach': '方案',
+    'fix.planImpact': '影响范围',
+    'fix.planBenefit': '收益',
+    'fix.planRisk': '风险',
+    'fix.dispatch': '派发修复',
+    'fix.dispatchHintMain': '把勾选的待处理问题（未勾选=当前筛选下全部）派发给子 Agent 并发处理：直接修复=三道闸判定+修复+回写+提交全自动；先出方案=只读分析产出结构化方案，批准后再派发执行',
+    'fix.dispatchModeTitle': '派发修复——选择模式',
+    'fix.dispatchModeMsg': '将派发 {n} 条待处理问题给子 Agent 并发处理（每任务独立 worktree，消耗模型用量，不占用聊天窗口）。⚡ 直接修复：三道闸判定 + 修复 + 回写 + 提交全自动，误报/重复/过时会自动关闭。📋 先出方案：只读分析产出结构化方案，不改任何代码；你在问题卡的方案块批准后点「派发待审方案」执行。',
+    'fix.dispatchAuto': '⚡ 直接修复',
+    'fix.dispatchPlan': '📋 先出方案',
+    'fix.dispatchNoOpen': '当前筛选下没有待处理问题可派发',
+    'fix.dispatchPlans': '派发待审方案',
+    'fix.dispatchPlansHint': '把已产出的待评审方案派发给子 Agent 并发执行修复（每任务独立 worktree，合并冲突自动基于最新代码重做）',
+    'fix.dispatchDone': '已派发 {n} 个修复任务（并发 {c}）',
+    'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案产出）',
+    'fix.status': '修复执行',
+    'fix.stop': '停止',
+    'fix.stopDone': '已停止 {n} 个修复任务',
+    'fix.taskQueued': '排队中',
+    'fix.taskRunning': '运行中',
+    'fix.taskMerging': '合并中',
+    'fix.taskRedo': '重做中',
+    'fix.taskDone': '已完成',
+    'fix.taskConflict': '冲突',
+    'fix.taskFailed': '失败',
+    'fix.taskCancelled': '已停止',
+    'fix.attempt': '第 {n} 次',
+    'fix.runtime': '已运行 {n} 分',
+    'fix.resumes': '续跑 {n}',
+    'fix.probes': '探活 {n}',
+    'fix.modelTitle': '修复并发（子 Agent 池）',
+    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰；修改后立即生效。',
 
     'plan.title': '编排计划确认',
     'plan.hint': '每步的角色决定上下文注入与默认模型（分析/操作=fast，开发=standard，规划=reasoning，验收=verifier）；可调整后再启动。',
@@ -683,6 +771,7 @@ export const WORKSPACE_DICT = {
   },
   en: {
     'workspace.title': 'Review Desk',
+    'workspace.selectSession': 'Select a session under a workspace on the left to view its project data.',
     'tab.commits': 'Commit Review',
     'tab.overview': 'Overview',
     'tab.execution': 'Execution',
@@ -725,8 +814,12 @@ export const WORKSPACE_DICT = {
     'picker.roundLatest': 'Round {n} (latest)',
     'picker.roundSelect': 'Select round',
     'picker.roundClear': 'Clear round',
-    'picker.undigested': 'New commits since the last AI summary (not yet reviewed)',
+    'picker.undigested': 'New commits since the last AI summary without AI analysis yet',
     'picker.undigestedCount': '{n} unreviewed commits',
+    'picker.selectAllUndigested': 'Select undigested',
+    'picker.digestAll': 'Digest all',
+    'picker.digestAllHint': 'Select all undigested commits and batch AI analysis (concurrency 3, cached), auto-generate the narrative afterwards; then create an AI summary in Notes & Memory to reset the marker',
+    'narrative.digestHint': 'Narrative generated. Create an AI summary in Notes & Memory to reset the undigested marker.',
     'impact.factors': 'Risk factors (why this level)',
     'impact.points': 'Impacted points',
     'impact.keyPoints': 'Key components',
@@ -812,9 +905,66 @@ export const WORKSPACE_DICT = {
     'review.callCount': 'call site(s)',
     'review.fixDiff': 'Fix diff (relative to the review baseline)',
     'review.refresh': 'Refresh',
-    'review.retentionHint': 'Resolved issues are auto-purged after {days} day(s)',
+    'review.retentionHint': 'Resolved / false-positive issues are auto-purged after {days} day(s)',
     'review.target': 'Target',
     'review.workingTarget': 'Working tree',
+    'review.exportMd': 'Export MD',
+    'review.exportMdHint': 'Download the filtered issue list as a .md file',
+    'review.exportEmpty': 'No issues to export',
+    'review.selectAll': 'Select all',
+    'review.checkedCount': '{n} selected',
+    'review.markHandled': 'Mark handled',
+    'review.batchVerify': 'Batch verify',
+    'review.batchVerifyConfirmTitle': 'Batch verify?',
+    'review.batchVerifyConfirmMsg': 'Will verify {n} review targets one by one (serial LLM calls, ~10-60s each, consumes model usage); you can stop anytime.',
+    'review.batchStop': 'Stop',
+    'review.batchProgress': 'Batch verifying {i}/{n}',
+    'review.batchDone': 'Batch verify done: {a} resolved · {b} still open · {c} new · {d} failed targets',
+    'review.batchStopped': 'Batch verify stopped',
+    'review.triage': '🧹 Triage all',
+    'review.triageHint': 'LLM holistic scan over all pending issues: duplicates/obsolete/non-issues are closed immediately with evidence (reopenable); real issues stay for fix dispatch',
+    'review.triageConfirmTitle': 'Triage all pending issues?',
+    'review.triageConfirmMsg': 'Will scan all pending issues with the LLM in batches (up to {n} per batch, consumes model usage). Issues judged duplicate/obsolete/non-issues are closed IMMEDIATELY with evidence — every closure is reviewable and reopenable on the issue card. Real issues stay for fix dispatch.',
+    'review.triageProgress': 'Triaging: {n} processed, ~{m} remaining',
+    'review.triageStop': 'Stop',
+    'review.triageDone': 'Triage done: closed {a} duplicate · {b} obsolete · {c} non-issues; {d} pending kept',
+    'review.triageStopped': 'Triage stopped (judged items are not re-billed; click again to continue)',
+    'review.triageNothing': 'No pending issues to triage for the project this session resolves to (if this looks wrong, check the open session belongs to that project)',
+    'review.triageParseFail': '; one batch failed to parse and was kept as-is, retryable',
+    'review.handledDone': '{n} issues marked as handled',
+    'fix.plan': 'Fix plan',
+    'fix.planApproach': 'Approach',
+    'fix.planImpact': 'Impact',
+    'fix.planBenefit': 'Benefit',
+    'fix.planRisk': 'Risk',
+    'fix.dispatch': 'Dispatch fixes',
+    'fix.dispatchHintMain': 'Dispatch the checked pending issues (unchecked = all under the current filter) to concurrent sub-agents: auto fix = three-gate verify + fix + write-back + commit; plan first = read-only structured plans awaiting your approval',
+    'fix.dispatchModeTitle': 'Dispatch fixes — pick a mode',
+    'fix.dispatchModeMsg': 'Will dispatch {n} pending issues to concurrent sub-agents (one worktree per task, consumes model usage, does not use the chat window). ⚡ Auto fix: three-gate verify + fix + write-back + commit; false positives/duplicates/obsolete are auto-closed. 📋 Plan first: read-only structured plans, no code changes; approve them on the issue card, then press "Dispatch approved plans".',
+    'fix.dispatchAuto': '⚡ Auto fix',
+    'fix.dispatchPlan': '📋 Plan first',
+    'fix.dispatchNoOpen': 'No pending issues under the current filter to dispatch',
+    'fix.dispatchPlans': 'Dispatch approved plans',
+    'fix.dispatchPlansHint': 'Dispatch the approved pending plans to concurrent sub-agent fixes (one worktree per task; conflicts auto-redo on latest HEAD)',
+    'fix.dispatchDone': '已派发 {n} 个修复任务（并发 {c}）',
+    'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案产出）',
+    'fix.status': '修复执行',
+    'fix.stop': '停止',
+    'fix.stopDone': '已停止 {n} 个修复任务',
+    'fix.taskQueued': '排队中',
+    'fix.taskRunning': '运行中',
+    'fix.taskMerging': '合并中',
+    'fix.taskRedo': '重做中',
+    'fix.taskDone': '已完成',
+    'fix.taskConflict': '冲突',
+    'fix.taskFailed': '失败',
+    'fix.taskCancelled': '已停止',
+    'fix.attempt': '第 {n} 次',
+    'fix.runtime': '已运行 {n} 分',
+    'fix.resumes': '续跑 {n}',
+    'fix.probes': '探活 {n}',
+    'fix.modelTitle': '修复并发（子 Agent 池）',
+    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰。',
 
     'plan.title': 'Orchestration plan',
     'plan.hint': 'Each step role drives context injection and the default model (analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier); adjust before launching.',
@@ -1268,8 +1418,8 @@ function formatTime(value: number | null | undefined): string {
   return new Date(value).toLocaleString()
 }
 
-/** 二次确认弹窗：遮罩 + 居中卡片，危险操作（删除笔记/变更/约束）共用。 */
-function ConfirmDialog(props: { title: string; message: string; danger?: boolean; onCancel: () => void; onConfirm: () => void }) {
+/** 二次确认弹窗：遮罩 + 居中卡片，危险操作（删除笔记/变更/约束）共用；alt 提供第二确认动作（如"先出方案"）。 */
+function ConfirmDialog(props: { title: string; message: string; danger?: boolean; confirmLabel?: string; alt?: { label: string; onAlt: () => void }; onCancel: () => void; onConfirm: () => void }) {
   return React.createElement(React.Fragment, null,
     React.createElement('div', {
       'data-testid': 'pc-confirm-overlay',
@@ -1306,11 +1456,15 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
             React.createElement('div', { style: { fontSize: '12px', lineHeight: 1.7, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, props.message),
           ),
         ),
-        React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '18px' } },
+        React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '18px', flexWrap: 'wrap' } },
           React.createElement('button', {
             style: { ...styles.secondary, padding: '7px 18px', borderRadius: '8px' },
             onClick: props.onCancel,
           }, '取消'),
+          props.alt !== undefined && React.createElement('button', {
+            style: { ...styles.secondary, padding: '7px 18px', borderRadius: '8px', fontWeight: 600 },
+            onClick: props.alt.onAlt,
+          }, props.alt.label),
           React.createElement('button', {
             'data-testid': 'pc-confirm-ok',
             style: {
@@ -1318,7 +1472,7 @@ function ConfirmDialog(props: { title: string; message: string; danger?: boolean
               background: props.danger ? '#e11d48' : 'var(--dsw-alias-button-info-fill, #2563eb)', color: '#fff',
             },
             onClick: props.onConfirm,
-          }, '确认删除'),
+          }, props.confirmLabel ?? '确认删除'),
         ),
       ),
     ),
@@ -1337,6 +1491,11 @@ function Card(props: { title?: React.ReactNode; children?: React.ReactNode }) {
  */
 export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const t = props.t ?? fallbackT
+  const activeRef = useRef(true)
+  useEffect(() => {
+    activeRef.current = true
+    return () => { activeRef.current = false }
+  }, [])
   const [tab, setTab] = useState<TabKey>('commits')
   const [state, setState] = useState<WorkspaceState | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -1366,7 +1525,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [reviews, setReviews] = useState<Record<string, ReviewPayload>>({})
   const [reviewLoading, setReviewLoading] = useState(false)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string>>({})
-  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; danger?: boolean; onConfirm: () => void } | null>(null)
+  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; danger?: boolean; confirmLabel?: string; alt?: { label: string; onAlt: () => void }; onConfirm: () => void } | null>(null)
   const [notes, setNotes] = useState<NoteEntry[]>([])
   const [noteTitle, setNoteTitle] = useState('')
   const [noteContent, setNoteContent] = useState('')
@@ -1380,6 +1539,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [issueExpanded, setIssueExpanded] = useState<Record<string, boolean>>({})
   const [fixExpanded, setFixExpanded] = useState<Record<string, boolean>>({})
   const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
+  const [issueChecked, setIssueChecked] = useState<Record<string, boolean>>({})
+  const [batchVerifyState, setBatchVerifyState] = useState<{ done: number; total: number } | null>(null)
+  const [triageState, setTriageState] = useState<{ processed: number; remaining: number } | null>(null)
+  const batchStopRef = useRef(false)
+  const [fixTasks, setFixTasks] = useState<FixTaskEntry[]>([])
+  const [fixConcurrency, setFixConcurrency] = useState('3')
   const [aiSummarizing, setAiSummarizing] = useState(false)
   const [narrative, setNarrative] = useState<{ narrative: string; cached: boolean; generatedAt?: number; costUsd?: number } | null>(null)
   const [narrativeBusy, setNarrativeBusy] = useState(false)
@@ -1420,7 +1585,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const response = await fetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...body, sessionId: props.sessionId }),
+        body: JSON.stringify({ ...body, sessionId: props.sessionId ?? '' }),
         signal: controller.signal,
       })
       const data: unknown = await response.json()
@@ -1441,7 +1606,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const timer = setTimeout(() => controller.abort(), 10_000)
       const response = await fetch('/project-control/api/peek', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path, line, sessionId: props.sessionId }),
+        body: JSON.stringify({ path, line, sessionId: props.sessionId ?? '' }),
         signal: controller.signal,
       })
       clearTimeout(timer)
@@ -1478,15 +1643,45 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       setNarrativeBusy(false)
     }
   }
+  // 经 ref 暴露最新闭包：并发池排空触发自动叙事时读取的是最新 selectedTargets。
+  useEffect(() => { loadNarrativeRef.current = () => { void loadNarrative() } })
 
+  /** 批量勾选提交（新增的逐条触发 AI 解读，已有的走缓存）。 */
+  const selectCommits = (shas: string[]): void => {
+    const added = shas.filter((sha) => !selectedTargets.includes(sha))
+    setSelectedTargets((previous) => Array.from(new Set([...previous, ...shas])))
+    for (const sha of added) loadDetail(sha, false)
+  }
+
+  /** 一键消化：选中全部未消化提交 → 批量解读 → 排空后自动生成整体叙事。 */
+  const digestAll = (): void => {
+    const shas = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit)).map((commit) => commit.sha)
+    if (shas.length === 0) return
+    setImpact(null)
+    setReviews({})
+    const needsFetch = shas.some((sha) => !selectedTargets.includes(sha))
+    selectCommits(shas)
+    if (needsFetch) {
+      autoNarrativeRef.current = shas.length >= 2
+    } else if (shas.length >= 2) {
+      // 全部已在选中集合且解读队列空闲：直接生成叙事（等一拍让 state 落地）。
+      setTimeout(() => { loadNarrativeRef.current() }, 0)
+    }
+  }
+
+  const commitsRequestRef = useRef(0)
   const loadCommits = async (): Promise<void> => {
+    const request = ++commitsRequestRef.current
     try {
       const response = await fetch(`/project-control/api/commits?sessionId=${encodeURIComponent(props.sessionId ?? '')}&limit=60`)
       const data: unknown = await response.json()
       if (!response.ok) throw new Error((data as { error?: string }).error ?? `HTTP ${response.status}`)
+      if (!activeRef.current || request !== commitsRequestRef.current) return
       setCommitsData(data as CommitsPayload)
       setCommitsError(null)
     } catch (error: unknown) {
+      if (!activeRef.current || request !== commitsRequestRef.current) return
+      setCommitsData(null)
       setCommitsError(error instanceof Error ? error.message : String(error))
     }
   }
@@ -1531,10 +1726,20 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const MAX_DETAIL_CONCURRENCY = 3
   const detailPoolRef = useRef<{ pending: Array<{ target: string; force: boolean }>; active: number }>({ pending: [], active: 0 })
   const detailInFlightRef = useRef(new Set<string>())
+  /** 一键消化：全部解读跑完后自动生成整体叙事（经 ref 取最新闭包，避免 selectedTargets 过期）。 */
+  const autoNarrativeRef = useRef(false)
+  const loadNarrativeRef = useRef<() => void>(() => {})
 
   const pumpDetailPool = (): void => {
     const pool = detailPoolRef.current
-    while (pool.active < MAX_DETAIL_CONCURRENCY && pool.pending.length > 0) {
+    if (pool.active === 0 && pool.pending.length === 0) {
+      if (autoNarrativeRef.current && activeRef.current) {
+        autoNarrativeRef.current = false
+        loadNarrativeRef.current()
+      }
+      return
+    }
+    while (activeRef.current && pool.active < MAX_DETAIL_CONCURRENCY && pool.pending.length > 0) {
       const job = pool.pending.shift()!
       pool.active += 1
       void loadDetailOnce(job.target, job.force)
@@ -1611,6 +1816,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setReviewLoading(true)
     try {
       for (const target of selectedTargets) {
+        if (!activeRef.current) break
         const { ok, data } = await post('/project-control/api/review', { sha: target, force })
         const payload = data as unknown as ReviewPayload
         setReviews((previous) => ({
@@ -1647,9 +1853,183 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     try {
       const response = await fetch('/project-control/api/issues?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
       const data: unknown = await response.json()
+      // 轮询刷新不清空勾选：勾选键随问题 id 走，已消失的 id 不影响显示。
       if (response.ok) setIssuesData((data as { issues: IssueEntry[] }).issues ?? [])
     } catch {
       // 问题列表加载失败不打断页面：列表保持原样。
+    }
+  }
+
+  // Review 页签实时同步：修复子代理回写状态后，看板 4 秒内跟上。
+  useEffect(() => {
+    if (tab !== 'review') return
+    const timer = setInterval(() => { void loadIssues(); void loadFixStatus() }, 4000)
+    return () => { clearInterval(timer) }
+  }, [tab, props.sessionId])
+
+  /** 拉取修复派发任务状态（Review 页轮询；有活动任务时驱动刷新）。 */
+  const loadFixStatus = async (): Promise<void> => {
+    try {
+      const response = await fetch('/project-control/api/fix/status?sessionId=' + encodeURIComponent(props.sessionId ?? ''))
+      if (response.ok) {
+        const data: unknown = await response.json()
+        setFixTasks((data as { tasks: FixTaskEntry[] }).tasks ?? [])
+      }
+    } catch {
+      // 状态拉取失败不打断页面。
+    }
+  }
+
+  /** 派发修复：planIds=批准的待评审方案；issueIds=待处理问题（mode=fix 修复 / plan 只读出方案）。 */
+  const dispatchFix = async (planIds: string[], issueIds: string[], mode: 'fix' | 'plan' = 'fix'): Promise<void> => {
+    if (planIds.length === 0 && issueIds.length === 0) {
+      setActionResult('✗ ' + t('fix.dispatchEmpty'))
+      return
+    }
+    const { ok, data } = await post('/project-control/api/fix/dispatch', { planIds, issueIds, mode })
+    if (ok) {
+      setActionResult('✓ ' + t('fix.dispatchDone').replace('{n}', String(data['accepted'] ?? 0)).replace('{c}', String(data['concurrency'] ?? 3)))
+      await loadFixStatus()
+    } else {
+      setActionResult('✗ ' + String(data['error'] ?? 'error'))
+    }
+  }
+
+  /** 停止修复派发：取消排队与运行中的任务。 */
+  const cancelFix = async (): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/fix/cancel', {})
+    if (ok) setActionResult('⏹ ' + t('fix.stopDone').replace('{n}', String(data['stopped'] ?? 0)))
+    await loadFixStatus()
+  }
+
+  /** 问题清单导出为 Markdown（按严重度排序；复用笔记导出的下载方式）。 */
+  const exportIssuesMd = (issues: IssueEntry[]): void => {
+    if (issues.length === 0) {
+      setActionResult('✗ ' + t('review.exportEmpty'))
+      return
+    }
+    const severityOrder: Record<string, number> = { blocker: 0, critical: 1, major: 2, minor: 3, info: 4 }
+    const ordered = [...issues].sort((left, right) =>
+      (severityOrder[normalizeIssueSeverity(left.severity)] ?? 9) - (severityOrder[normalizeIssueSeverity(right.severity)] ?? 9)
+      || left.createdAt - right.createdAt)
+    const lines: string[] = [
+      '# Review 问题清单',
+      '',
+      `- 项目：${state?.project?.name ?? '—'}`,
+      `- 仓库：${commitsData?.rootPath ?? state?.project?.rootPath ?? '—'}`,
+      `- 分支：${commitsData?.branch ?? '—'}`,
+      `- 导出时间：${new Date().toLocaleString()}`,
+      `- 数量：${issues.length}（待处理 ${issues.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length}）`,
+      '',
+    ]
+    ordered.forEach((issue, index) => {
+      const target = issue.changeId.startsWith('review:') && issue.changeId !== 'review:worktree'
+        ? `提交 ${issue.changeId.slice('review:'.length, 'review:'.length + 8)}`
+        : issue.changeId === 'review:worktree' ? '工作区' : issue.changeId
+      lines.push(`## ${index + 1}. [${issue.severity}][${issue.category || 'general'}] ${issue.title}`)
+      lines.push('')
+      lines.push(`- 状态：${ISSUE_STATUS_LABELS[issue.status] ?? issue.status}`)
+      lines.push(`- 对象：${target}`)
+      lines.push(`- 发现时间：${new Date(issue.createdAt).toLocaleString()}`)
+      if ((issue.description ?? '') !== '') lines.push(`- 描述：${issue.description!.replace(/\n/g, ' ')}`)
+      if ((issue.resolution ?? '') !== '') lines.push(`- 结论：${issue.resolution}`)
+      lines.push('')
+    })
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `review-issues-${new Date().toISOString().slice(0, 10)}.md`
+    anchor.click()
+    URL.revokeObjectURL(url)
+    setActionResult('✓ ' + t('notes.exportDone'))
+  }
+
+  /** 批量标记已处理（accepted）：人工确认无需逐条复检时直接结案。 */
+  const markIssuesHandled = async (ids: string[]): Promise<void> => {
+    let done = 0
+    for (const id of ids) {
+      const { ok } = await post('/project-control/api/issues/status', { id, status: 'accepted' })
+      if (ok) done += 1
+    }
+    await loadIssues()
+    if (done > 0) setActionResult('✓ ' + t('review.handledDone').replace('{n}', String(done)))
+  }
+
+  /** 批量复检：对选中的评审目标逐个跑复检（串行 LLM），实时进度、可中途停止。 */
+  const runBatchVerify = async (targets: string[]): Promise<void> => {
+    if (targets.length === 0) return
+    batchStopRef.current = false
+    setBatchVerifyState({ done: 0, total: targets.length })
+    let resolvedTotal = 0
+    let openTotal = 0
+    let newTotal = 0
+    let failed = 0
+    for (const [index, target] of targets.entries()) {
+      if (batchStopRef.current) break
+      setBatchVerifyState({ done: index, total: targets.length })
+      try {
+        const { ok, data } = await post('/project-control/api/issues/verify', { target })
+        if (!ok) failed += 1
+        else {
+          resolvedTotal += ((data['resolved'] as unknown[]) ?? []).length
+          openTotal += ((data['stillOpen'] as unknown[]) ?? []).length
+          newTotal += ((data['newIssues'] as unknown[]) ?? []).length
+        }
+      } catch {
+        failed += 1
+      }
+    }
+    setBatchVerifyState(null)
+    await loadIssues()
+    if (batchStopRef.current) setActionResult('⏹ ' + t('review.batchStopped'))
+    else setActionResult('✓ ' + t('review.batchDone').replace('{a}', String(resolvedTotal)).replace('{b}', String(openTotal)).replace('{c}', String(newTotal)).replace('{d}', String(failed)))
+  }
+
+  /** 整体分诊：循环调用 /issues/triage 直至 done（每批 = 服务端"open 且本轮未送审"的前 N 条），
+   * 判定即时关闭、可停止可续跑（服务端 seen 记忆防重复消耗）。 */
+  const runTriage = async (): Promise<void> => {
+    batchStopRef.current = false
+    // remaining=-1 = 尚未拿到首批响应（显示 … 而不是误导性的 0）。
+    setTriageState({ processed: 0, remaining: -1 })
+    const closed = { duplicate: 0, obsolete: 0, false_positive: 0 }
+    let kept = 0
+    let processed = 0
+    let parseFailed = false
+    let stopped = false
+    let first = true
+    for (;;) {
+      if (batchStopRef.current) { stopped = true; break }
+      let outcome: { ok: boolean; data: Record<string, unknown> }
+      try {
+        outcome = await post('/project-control/api/issues/triage', { sessionId: props.sessionId ?? '', ...(first ? { reset: true } : {}) })
+      } catch {
+        outcome = { ok: false, data: { error: 'network error' } }
+      }
+      first = false
+      if (!outcome.ok) { setActionResult('✗ ' + String(outcome.data['error'] ?? 'error')); break }
+      const data = outcome.data
+      // 先累加再判 done：最后一批（done:true 且 processed>0）的计数不能丢。
+      const batchClosed = (data['closed'] ?? {}) as Record<string, number>
+      closed.duplicate += Number(batchClosed['duplicate'] ?? 0)
+      closed.obsolete += Number(batchClosed['obsolete'] ?? 0)
+      closed.false_positive += Number(batchClosed['false_positive'] ?? 0)
+      kept += Number(data['kept'] ?? 0)
+      processed += Number(data['processed'] ?? 0)
+      if (data['parseFailed'] === true) parseFailed = true
+      if (data['done'] === true) break
+      setTriageState({ processed, remaining: Number(data['remaining'] ?? 0) })
+    }
+    setTriageState(null)
+    await loadIssues()
+    if (stopped) setActionResult('⏹ ' + t('review.triageStopped'))
+    else if (processed === 0) {
+      // 首轮即 done 且零处理：当前会话定位到的项目没有待分诊问题——若与列表不符，多半是会话不属于该项目。
+      setActionResult('✗ ' + t('review.triageNothing'))
+    } else {
+      setActionResult('✓ ' + t('review.triageDone')
+        .replace('{a}', String(closed.duplicate)).replace('{b}', String(closed.obsolete)).replace('{c}', String(closed.false_positive)).replace('{d}', String(kept))
+        + (parseFailed ? t('review.triageParseFail') : ''))
     }
   }
 
@@ -1832,7 +2212,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   /** 加载 Run 详情（步骤时间线 + 任务工作记忆）。 */
   const loadRunDetail = async (id: string): Promise<void> => {
     try {
-      const response = await fetch('/project-control/api/runs/detail?id=' + encodeURIComponent(id))
+      const response = await fetch('/project-control/api/runs/detail?id=' + encodeURIComponent(id) + '&sessionId=' + encodeURIComponent(props.sessionId ?? ''))
       const data: unknown = await response.json()
       if (response.ok) setRunDetail(data as RunDetail)
     } catch {
@@ -1948,6 +2328,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // 构建哈希重注入（幂等，已存在则跳过）。
   const layoutFace = (props as unknown as { layout?: { openDetails?: () => void } }).layout
   useEffect(() => {
+    if (props.layoutMode === 'overlay') return
     applyStatsLineClamp()
     const timer = setInterval(() => {
       if (document.getElementById('pc-stats-clamp') === null) applyStatsLineClamp()
@@ -1956,7 +2337,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       if (width !== -1 && width < 50) layoutFace?.openDetails?.()
     }, 500)
     return () => { clearInterval(timer) }
-  }, [props.sessionId, layoutFace])
+  }, [props.sessionId, props.layoutMode, layoutFace])
 
   /** 以 important 内联样式直接写官方网格模板（最高优先级，任何重渲染不会覆盖）。 */
   const frameTemplateSet = (chatPx: number): void => {
@@ -1980,6 +2361,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   // 官方 React 重渲染会改写内联模板，MutationObserver 按当前值守卫重写
   // （值相同不会触发新的 mutation，无回环）。
   useEffect(() => {
+    if (props.layoutMode === 'overlay') return
     const saved = Number(localStorage.getItem('pc.chatWidth') ?? '')
     const apply = (): void => {
       // 挂载/官方重渲染时无条件夺回模板（important 覆写；值相同时官方样式变更
@@ -1998,7 +2380,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       // 官方「详情」面板虽回到该列但 0 宽不可见（0.1.2 实测回归）。
       collapseFrameTemplate()
     }
-  }, [])
+  }, [props.layoutMode])
 
   /** 分隔条拖拽：调整聊天列宽（工作台吸收剩余空间），写入 localStorage 记忆。 */
   const onDividerDown = (e: React.PointerEvent): void => {
@@ -2018,17 +2400,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   useEffect(() => {
     let disposed = false
+    let generation = 0
     const load = async (): Promise<void> => {
+      const request = ++generation
       try {
         const response = await fetch('/project-control/api/state?sessionId=' + encodeURIComponent(props.sessionId ?? ''), { headers: { accept: 'application/json' } })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const data: unknown = await response.json()
-        if (!disposed) {
+        if (!disposed && request === generation) {
           setState(data as WorkspaceState)
           setLoadError(null)
         }
       } catch (error: unknown) {
-        if (!disposed) setLoadError(error instanceof Error ? error.message : String(error))
+        if (!disposed && request === generation) setLoadError(error instanceof Error ? error.message : String(error))
       }
     }
     void load()
@@ -2037,7 +2421,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       disposed = true
       clearInterval(timer)
     }
-  }, [])
+  }, [props.sessionId])
 
   // 进入提交/笔记/Review 页签时按需拉取（提交列表依赖会话工作区，轮询无意义）。
   // 提交页也拉笔记：轮次未消化标记需要「上次 AI 总结时间」。
@@ -2056,6 +2440,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       const data: unknown = await response.json()
       setModelTiers((data as { tiers: Record<string, { provider: string; model: string }> }).tiers ?? {})
       setModelOptions((data as { options: Array<{ provider: string; id: string; name: string }> }).options ?? [])
+      const concurrency = (data as { fixConcurrency?: number }).fixConcurrency
+      if (typeof concurrency === 'number') setFixConcurrency(String(concurrency))
     } catch {
       // 模型配置加载失败不打断页面
     }
@@ -2066,10 +2452,11 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setModelSaving(true)
     setModelSaved(false)
     try {
+      const concurrency = Number(fixConcurrency)
       const response = await fetch('/project-control/api/model-config', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tiers: modelTiers }),
+        body: JSON.stringify({ tiers: modelTiers, ...(Number.isFinite(concurrency) ? { fixConcurrency: Math.max(1, Math.min(10, Math.trunc(concurrency))) } : {}) }),
       })
       if (response.ok) {
         setModelSaved(true)
@@ -2190,14 +2577,19 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const lastSummaryAt = notes
     .filter((note) => note.sha === 'summary')
     .sort((left, right) => right.createdAt - left.createdAt)[0]?.createdAt
-  const isUndigested = (date: number): boolean => lastSummaryAt === undefined || date > lastSummaryAt
-  const undigestedCount = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit.date)).length
+  const isUndigested = (commit: { sha: string; date: number }): boolean => {
+    if (commit.sha === 'working') return false
+    // 已生成过 AI 解读（analyzed 标记）即视为已消化；否则新于上次总结的都算未消化。
+    if (commitBySha.get(commit.sha)?.analyzed === true) return false
+    return lastSummaryAt === undefined || commit.date > lastSummaryAt
+  }
+  const undigestedCount = (commitsData?.commits ?? []).filter((commit) => isUndigested(commit)).length
   const commitRounds = clusterIntoRounds(commitsData?.commits ?? [])
 
   /** 下拉框的提交行（含未消化圆点；working 条目不标）。 */
   const renderPickerRow = (entry: { key: string; label: string; meta: string; sha: string }): React.ReactNode => {
     const commit = commitBySha.get(entry.sha)
-    const undigested = commit !== undefined && isUndigested(commit.date)
+    const undigested = commit !== undefined && isUndigested(commit)
     return (
       <div
         key={entry.key}
@@ -2268,6 +2660,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     value={pickerFilter}
                     onChange={(e) => { setPickerFilter(e.target.value) }}
                   />
+                  {(commitsData?.commits ?? []).some((commit) => isUndigested(commit)) && (
+                    <button
+                      style={styles.secondary}
+                      title={t('picker.undigested')}
+                      onClick={() => { selectCommits((commitsData?.commits ?? []).filter((commit) => isUndigested(commit)).map((commit) => commit.sha)) }}
+                    >● {t('picker.selectAllUndigested')}</button>
+                  )}
                   <button style={styles.secondary} onClick={() => { setSelectedTargets([]) }}>{t('picker.clear')}</button>
                 </div>
                 <div style={{ maxHeight: 420, overflowY: 'auto' }}>
@@ -2316,9 +2715,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px', alignItems: 'center' }}>
           <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('picker.hint')}</span>
           {undigestedCount > 0 && (
-            <span title={t('picker.undigested')} style={{ fontSize: '11px', color: themeAwareText('#d97706') }}>
-              ● {t('picker.undigestedCount').replace('{n}', String(undigestedCount))}
-            </span>
+            <>
+              <span title={t('picker.undigested')} style={{ fontSize: '11px', color: themeAwareText('#d97706') }}>
+                ● {t('picker.undigestedCount').replace('{n}', String(undigestedCount))}
+              </span>
+              <button style={styles.secondary} title={t('picker.digestAllHint')} onClick={digestAll}>⚡ {t('picker.digestAll')}</button>
+            </>
           )}
           {(detailQueuedCount > 0 || detailRunningCount > 0) && (
             <span style={styles.badge('#dcdcaa')}>
@@ -2352,6 +2754,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
             )}
           </div>
           {narrativeError !== '' && <div style={{ ...styles.empty, color: themeAwareText('#d1242f') }}>{narrativeError}</div>}
+          {narrative !== null && <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)', marginTop: '4px' }}>{t('narrative.digestHint')}</div>}
           {narrative !== null && (
             <div style={{ ...styles.what, whiteSpace: 'pre-wrap' }}>{renderStructuredContent(narrative.narrative)}</div>
           )}
@@ -2664,6 +3067,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 </div>
               )
             })}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '8px', padding: '8px 10px', borderRadius: '6px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))' }}>
+              <span style={{ fontSize: '12px', fontWeight: 600 }}>🤖 {t('fix.modelTitle')}</span>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                style={{ ...styles.input, width: 64, textAlign: 'center' }}
+                value={fixConcurrency}
+                onChange={(e) => { setFixConcurrency(e.target.value) }}
+              />
+              <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{t('fix.modelHint')}</span>
+            </div>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
               <button style={styles.button} disabled={modelSaving} onClick={() => { void saveModelConfig() }}>
                 {modelSaving ? t('action.running') : t('model.save')}
@@ -3337,20 +3752,24 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         {(() => {
           const all = (issuesData ?? []).map((issue) => ({ ...issue, severity: normalizeIssueSeverity(issue.severity) }))
           const openCount = all.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+          // 计数 chips 跟随状态筛选（"全部"= 状态筛选后的总数）：选"已解决"后各严重度数字立即对应已解决列表。
+          const statusFiltered = all.filter((issue) => issueStatusFilter === '' || issue.status === issueStatusFilter)
           const counts: Array<{ key: string; label: string; count: number }> = [
-            { key: '', label: t('review.filterAll'), count: all.length },
-            { key: 'critical', label: 'critical', count: all.filter((issue) => issue.severity === 'critical' || issue.severity === 'blocker').length },
-            { key: 'major', label: 'major', count: all.filter((issue) => issue.severity === 'major').length },
-            { key: 'minor', label: 'minor', count: all.filter((issue) => issue.severity === 'minor').length },
-            { key: 'info', label: 'info', count: all.filter((issue) => issue.severity === 'info').length },
+            { key: '', label: t('review.filterAll'), count: statusFiltered.length },
+            { key: 'critical', label: 'critical', count: statusFiltered.filter((issue) => issue.severity === 'critical' || issue.severity === 'blocker').length },
+            { key: 'major', label: 'major', count: statusFiltered.filter((issue) => issue.severity === 'major').length },
+            { key: 'minor', label: 'minor', count: statusFiltered.filter((issue) => issue.severity === 'minor').length },
+            { key: 'info', label: 'info', count: statusFiltered.filter((issue) => issue.severity === 'info').length },
           ]
-          const visible = all
+          const visible = statusFiltered
             .filter((issue) => {
               if (issueSeverityFilter === '') return true
               if (issueSeverityFilter === 'critical') return issue.severity === 'critical' || issue.severity === 'blocker'
               return issue.severity === issueSeverityFilter
             })
-            .filter((issue) => issueStatusFilter === '' || issue.status === issueStatusFilter)
+          const checkedVisible = visible.filter((issue) => issueChecked[issue.id] === true)
+          const checkedOpen = checkedVisible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
+          const checkedOpenTargets = Array.from(new Set(checkedOpen.map((issue) => issue.changeId)))
           return (
             <>
               <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' }}>
@@ -3360,17 +3779,178 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     {item.label} · {item.count}
                   </button>
                 ))}
-                <span style={{ flex: 1 }} />
-                <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                <span style={{ marginLeft: '16px', fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
                   {openCount} 待处理 / 共 {all.length}
-                  {(state?.resolvedIssueRetentionDays ?? 0) > 0 ? ` · ${t('review.retentionHint').replace('{days}', String(state?.resolvedIssueRetentionDays ?? 7))}` : ''}
                 </span>
-                <select style={{ ...styles.select, width: 'auto', padding: '3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
+                {(state?.resolvedIssueRetentionDays ?? 0) > 0 && (
+                  <span
+                    title={t('review.retentionHint').replace('{days}', String(state?.resolvedIssueRetentionDays ?? 7))}
+                    style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '14px', height: '14px', borderRadius: '50%', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.15))', fontSize: '10px', lineHeight: 1, color: 'var(--dsw-alias-label-secondary, #6b7280)', cursor: 'help', userSelect: 'none', flexShrink: 0 }}
+                  >?</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' }}>
+                <select style={{ ...styles.select, width: 'auto', padding: '3px 24px 3px 8px' }} value={issueStatusFilter} onChange={(e) => { setIssueStatusFilter(e.target.value) }}>
                   <option value="">{t('review.statusAll')}</option>
                   {Object.entries(ISSUE_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                 </select>
+                <button
+                  style={styles.secondary}
+                  onClick={() => {
+                    setIssueChecked((previous) => {
+                      const allChecked = visible.every((issue) => previous[issue.id] === true)
+                      const next = { ...previous }
+                      for (const issue of visible) next[issue.id] = !allChecked
+                      return next
+                    })
+                  }}
+                >{t('review.selectAll')}</button>
+                <button style={styles.secondary} title={t('review.exportMdHint')} onClick={() => { exportIssuesMd(visible) }}>{t('review.exportMd')}</button>
+                <button
+                  style={styles.secondary}
+                  title={t('review.triageHint')}
+                  onClick={() => {
+                    const openCount = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+                    if (openCount === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+                    setConfirmDialog({
+                      title: t('review.triageConfirmTitle'),
+                      message: t('review.triageConfirmMsg').replace('{n}', '40'),
+                      danger: false,
+                      confirmLabel: t('review.triage'),
+                      onConfirm: () => { void runTriage() },
+                    })
+                  }}
+                >{t('review.triage')}</button>
+                {(() => {
+                  // 派发对象：勾选的待处理问题优先；未勾选 = 当前筛选下全部待处理（常驻入口，不再藏）。
+                  const openVisible = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
+                  const checkedIds = openVisible.filter((issue) => issueChecked[issue.id] === true).map((issue) => issue.id)
+                  const ids = checkedIds.length > 0 ? checkedIds : openVisible.map((issue) => issue.id)
+                  return (
+                    <button
+                      style={{ ...styles.secondary, fontWeight: 600 }}
+                      title={t('fix.dispatchHintMain')}
+                      onClick={() => {
+                        if (ids.length === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+                        setConfirmDialog({
+                          title: t('fix.dispatchModeTitle'),
+                          message: t('fix.dispatchModeMsg').replace('{n}', String(ids.length)),
+                          danger: false,
+                          confirmLabel: t('fix.dispatchAuto'),
+                          alt: { label: t('fix.dispatchPlan'), onAlt: () => { void dispatchFix([], ids, 'plan') } },
+                          onConfirm: () => { void dispatchFix([], ids, 'fix') },
+                        })
+                      }}
+                    >🚀 {t('fix.dispatch')}({String(ids.length)})</button>
+                  )
+                })()}
+                {(() => {
+                  const pendingPlans = visible.filter((issue) => issue.fixPlan?.status === 'pending')
+                  return pendingPlans.length > 0 ? (
+                    <button
+                      style={styles.secondary}
+                      title={t('fix.dispatchPlansHint')}
+                      onClick={() => { setConfirmDialog({ title: t('fix.dispatchPlans'), message: `将派发 ${String(pendingPlans.length)} 个已产出的修复方案给子 Agent 并发执行（独立 worktree，消耗模型用量；完成后自动回写并提交）。`, danger: false, confirmLabel: t('fix.dispatchPlans'), onConfirm: () => { void dispatchFix(pendingPlans.map((issue) => issue.fixPlan!.id), [], 'fix') } }) }}
+                    >📦 {t('fix.dispatchPlans')}({String(pendingPlans.length)})</button>
+                  ) : null
+                })()}
                 <button style={styles.secondary} onClick={() => { void loadIssues() }}>{t('review.refresh')}</button>
               </div>
+              {fixTasks.length > 0 && (() => {
+                const FIX_STATUS_LABELS: Record<string, string> = { queued: t('fix.taskQueued'), running: t('fix.taskRunning'), merging: t('fix.taskMerging'), redo: t('fix.taskRedo'), done: t('fix.taskDone'), conflict: t('fix.taskConflict'), failed: t('fix.taskFailed'), cancelled: t('fix.taskCancelled') }
+                const fixActive = fixTasks.some((task) => task.status === 'queued' || task.status === 'running' || task.status === 'merging' || task.status === 'redo')
+                return (
+                  <Card title={'🤖 ' + t('fix.status')}>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px', fontSize: '11px' }}>
+                      <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                        {String(fixTasks.filter((task) => task.status === 'done').length)}/{String(fixTasks.length)} {t('fix.taskDone')}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      {fixActive && <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void cancelFix() }}>⏹ {t('fix.stop')}</button>}
+                    </div>
+                    {fixTasks.map((task) => (
+                      <div key={task.issueId} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '6px 4px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
+                        <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
+                          {FIX_STATUS_LABELS[task.status] ?? task.status}{task.mode === 'plan' ? '·方案' : ''}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
+                        </span>
+                        {(() => {
+                          const active = task.status === 'running' || task.status === 'merging' || task.status === 'redo'
+                          if (!active) return null
+                          const minutes = Math.max(0, Math.round((Date.now() - (task.startedAt ?? Date.now())) / 60_000))
+                          const extra = [
+                            minutes > 0 ? t('fix.runtime').replace('{n}', String(minutes)) : '',
+                            (task.resumes ?? 0) > 0 ? t('fix.resumes').replace('{n}', String(task.resumes)) : '',
+                            (task.probes ?? 0) > 0 ? t('fix.probes').replace('{n}', String(task.probes)) : '',
+                          ].filter((part) => part !== '')
+                          return extra.length > 0 ? <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)', flexShrink: 0 }}>{extra.join(' · ')}</span> : null
+                        })()}
+                        <span style={{ minWidth: 0, flex: 1 }}>
+                          <span style={{ display: 'block', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
+                          {(task.status === 'running' || task.status === 'queued') && task.currentAction !== undefined && (
+                            <span style={{ display: 'block', color: themeAwareText('#d97706'), fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)' }}>▸ {task.currentAction}</span>
+                          )}
+                          {task.summary !== undefined && <span style={{ display: 'block', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{task.summary}</span>}
+                          {task.impact !== undefined && (
+                            <span style={{ display: 'block' }}>
+                              <span style={styles.badge(task.impact.riskLevel === 'low' ? '#4ec9b0' : task.impact.riskLevel === 'medium' ? '#dcdcaa' : '#f14c4c')}>
+                                影响 {task.impact.riskLevel}({String(task.impact.riskScore)})
+                              </span>
+                              <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                                {' '}直接 {String(task.impact.direct.length)} · 间接 {String(task.impact.indirect.length)} · 潜在 {String(task.impact.potential.length)}
+                                {task.impact.indirect.length > 0 ? `（如 ${task.impact.indirect.slice(0, 2).join(', ')}）` : ''}
+                              </span>
+                            </span>
+                          )}
+                          {task.error !== undefined && <span style={{ display: 'block', color: themeAwareText('#d1242f') }}>{task.error}</span>}
+                          {(task.files ?? []).length > 0 && (
+                            <span style={{ display: 'block', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                              {task.files!.slice(0, 4).join(', ')}{task.commit !== undefined ? ` · ${task.commit}` : ''}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                  </Card>
+                )
+              })()}
+              {(checkedVisible.length > 0 || batchVerifyState !== null || triageState !== null) && (
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', padding: '6px 10px', marginBottom: '10px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))', borderRadius: '6px', fontSize: '11px' }}>
+                  {batchVerifyState !== null ? (
+                    <>
+                      <span style={{ color: themeAwareText('#d97706') }}>
+                        ⏳ {t('review.batchProgress').replace('{i}', String(batchVerifyState.done)).replace('{n}', String(batchVerifyState.total))}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { batchStopRef.current = true }}>{t('review.batchStop')}</button>
+                    </>
+                  ) : triageState !== null ? (
+                    <>
+                      <span style={{ color: themeAwareText('#d97706') }}>
+                        ⏳ {t('review.triageProgress').replace('{n}', String(triageState.processed)).replace('{m}', triageState.remaining >= 0 ? String(triageState.remaining) : '…')}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { batchStopRef.current = true }}>{t('review.triageStop')}</button>
+                    </>
+                  ) : (
+                    <>
+                      <span>{t('review.checkedCount').replace('{n}', String(checkedVisible.length))}</span>
+                      {checkedOpenTargets.length > 0 && (
+                        <button
+                          style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                          title={t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length))}
+                          onClick={() => { setConfirmDialog({ title: t('review.batchVerifyConfirmTitle'), message: t('review.batchVerifyConfirmMsg').replace('{n}', String(checkedOpenTargets.length)), danger: false, confirmLabel: t('review.batchVerify'), onConfirm: () => { void runBatchVerify(checkedOpenTargets) } }) }}
+                        >🔍 {t('review.batchVerify')}({String(checkedOpenTargets.length)})</button>
+                      )}
+                      {checkedOpen.length > 0 && (
+                        <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void markIssuesHandled(checkedOpen.map((issue) => issue.id)) }}>✓ {t('review.markHandled')}</button>
+                      )}
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { exportIssuesMd(checkedVisible) }}>{t('review.exportMd')}</button>
+                      <span style={{ flex: 1 }} />
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { setIssueChecked({}) }}>{t('picker.clear')}</button>
+                    </>
+                  )}
+                </div>
+              )}
               {all.length === 0 ? (
                 <div style={styles.empty}>{issuesData === null ? '…' : t('review.recordsEmpty')}</div>
               ) : visible.length === 0 ? (
@@ -3383,6 +3963,12 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <div key={issue.id} style={styles.noteCard}>
                     <div style={styles.noteTitleRow}>
                       <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <input
+                          type="checkbox"
+                          checked={issueChecked[issue.id] === true}
+                          onChange={() => { setIssueChecked((previous) => ({ ...previous, [issue.id]: !(previous[issue.id] === true) })) }}
+                          style={{ margin: 0, flexShrink: 0, cursor: 'pointer', accentColor: 'var(--dsw-alias-brand-primary, #2563eb)' }}
+                        />
                         <span style={styles.badge(severityColor(issue.severity))}>{issue.severity}</span>
                         {issue.category ? <span style={styles.badge('#57606a')}>{issue.category}</span> : null}
                         <span style={styles.badge(issue.status === 'open' || issue.status === 'fixing' ? '#dcdcaa' : issue.status === 'resolved' || issue.status === 'accepted' ? '#4ec9b0' : '#8b8b8b')}>
@@ -3408,10 +3994,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                                 title: t('review.falsePositiveTitle'),
                                 message: t('review.falsePositiveMsg').replace('{title}', issue.title),
                                 danger: false,
+                                confirmLabel: t('review.falsePositive'),
                                 onConfirm: () => { void post('/project-control/api/issues/status', { id: issue.id, status: 'rejected' }).then(async ({ ok }) => { if (ok) await loadIssues() }) },
                               })
                             }}
                           >🚫 {t('review.falsePositive')}</button>
+                        )}
+                        {(issue.status === 'open' || issue.status === 'fixing') && (
+                          <button
+                            style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }}
+                            title={t('review.markHandled')}
+                            onClick={() => { void markIssuesHandled([issue.id]) }}
+                          >✓ {t('review.markHandled')}</button>
                         )}
                       </div>
                     </div>
@@ -3423,6 +4017,31 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         ✓ {issue.resolution}
                       </div>
                     ) : null}
+                    {issue.fixPlan != null && (() => {
+                      const plan = issue.fixPlan
+                      const planOpen = issueExpanded[`${issue.id}-plan`] === true
+                      return (
+                        <div style={{ marginTop: '6px', borderRadius: '6px', background: 'rgba(37, 99, 235, 0.05)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.12))', fontSize: '11px', overflow: 'hidden' }}>
+                          <button
+                            style={{ ...styles.linkBtn, width: '100%', textAlign: 'left', padding: '5px 10px', display: 'flex', gap: '6px', alignItems: 'center' }}
+                            onClick={() => { setIssueExpanded((previous) => ({ ...previous, [`${issue.id}-plan`]: !(previous[`${issue.id}-plan`] === true) })) }}
+                          >
+                            📄 {t('fix.plan')}
+                            <span style={styles.badge(plan.status === 'pending' ? '#d97706' : '#2563eb')}>{plan.status === 'pending' ? '待评审' : '已派发'}</span>
+                            {plan.files.length > 0 && <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)' }}>{plan.files.slice(0, 3).join(', ')}</span>}
+                            <span style={{ flex: 1 }} />{planOpen ? '▲' : '▼'}
+                          </button>
+                          {planOpen && (
+                            <div style={{ padding: '2px 10px 8px', lineHeight: 1.7 }}>
+                              <div><b>{t('fix.planApproach')}：</b>{plan.approach}</div>
+                              <div><b>{t('fix.planImpact')}：</b>{plan.impact}</div>
+                              <div><b>{t('fix.planBenefit')}：</b>{plan.benefit}</div>
+                              <div><b>{t('fix.planRisk')}：</b>{plan.risk}</div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
                     {(issue.fixStats != null || Boolean(issue.fixDiff)) && (
                       <>
                         <button
@@ -3511,15 +4130,15 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
 
   return (
     <div style={styles.root} data-testid="project-control-workspace">
-      <style>{LAYOUT_STYLE}</style>
-      <div
+      {props.layoutMode !== 'overlay' && <style>{LAYOUT_STYLE}</style>}
+      {props.layoutMode !== 'overlay' && <div
         data-testid="project-control-divider"
         onPointerDown={onDividerDown}
         style={{
           position: 'absolute', top: 0, bottom: 0, right: -4, width: 8,
           cursor: 'col-resize', zIndex: 20,
         }}
-      />
+      />}
       <div style={styles.nav}>
         <span style={styles.title}>{t('workspace.title')}</span>
         {tabs.map((entry) => (
@@ -3544,20 +4163,27 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
         })()}
       </div>
       <div style={styles.body}>
-        {loadError !== null && <div style={styles.empty}>{t('error.load')}: {loadError}</div>}
-        {state?.ready === false && <div style={styles.empty}>{state.reason ?? ''}</div>}
-        {tab === 'commits' && commitsTab}
-        {tab === 'overview' && overviewTab}
-        {tab === 'execution' && executionTab}
-        {tab === 'review' && reviewTab}
-        {tab === 'notes' && notesTab}
-        {tab === 'settings' && settingsTab}
+        {props.sessionId === undefined || props.sessionId === '' ? <div style={styles.empty}>{t('workspace.selectSession')}</div> : <>
+          {loadError !== null && <div style={styles.empty}>{t('error.load')}: {loadError}</div>}
+          {state?.ready === false && <div style={styles.empty}>{state.reason ?? ''}</div>}
+          {tab === 'commits' && commitsTab}
+          {tab === 'overview' && overviewTab}
+          {tab === 'execution' && executionTab}
+          {tab === 'review' && reviewTab}
+          {tab === 'notes' && notesTab}
+          {tab === 'settings' && settingsTab}
+        </>}
       </div>
       {confirmDialog !== null && (
         <ConfirmDialog
           title={confirmDialog.title}
           message={confirmDialog.message}
           danger={confirmDialog.danger}
+          confirmLabel={confirmDialog.confirmLabel}
+          alt={confirmDialog.alt === undefined ? undefined : {
+            label: confirmDialog.alt.label,
+            onAlt: () => { confirmDialog.alt!.onAlt(); setConfirmDialog(null) },
+          }}
           onCancel={() => { setConfirmDialog(null) }}
           onConfirm={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }}
         />

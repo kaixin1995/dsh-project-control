@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { readFileSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { coreDomainSpec, analysisDomainSpec, historyDomainSpec } from '../store/domains.ts'
+import { FixDispatcher } from '../runtime/fix-dispatcher.ts'
 import { DomainRepository, createInMemoryStore, type ProjectControlStore, type ProjectNoteRecord } from '../store/repository.ts'
 import type {
   ProjectRecord,
@@ -25,6 +26,7 @@ import type {
   RunContextRecord,
   MemoryBaselineRecord,
   ScheduledTaskRecord,
+  FixPlanRecord,
   ImportedChangeRecord,
 } from '../domain/models.ts'
 import { ProjectService } from '../domain/project.ts'
@@ -70,6 +72,15 @@ export class ProjectControlService {
     }
   })()
 
+  /** 修复派发器（子 Agent + worktree 隔离 + cherry-pick 合并）。 */
+  public fixDispatcher?: import('../runtime/fix-dispatcher.ts').FixDispatcher
+
+  /**
+   * 整体分诊的已送审记忆（内存态）：一轮分诊中已判过的 issueId（含 keep——
+   * keep 不关闭，不记会每批重复选中死循环）。前端「整体分诊」以 reset 开始新一轮。
+   */
+  public readonly triageSeen = new Set<string>()
+
   constructor(public readonly ctx: any, config: ProjectControlConfig = {}) {
     this.liveConfig = resolveFullConfig(config as never)
     // 默认初始化内存 Store，保证在无 storageDomain 的环境（如 headless 面或测试环境）下基础操作仍可用
@@ -92,6 +103,7 @@ export class ProjectControlService {
       memoryService: this.memoryService,
       conceptService: this.conceptService,
     })
+    this.fixDispatcher = new FixDispatcher(this.ctx, this, this.git)
   }
 
   /**
@@ -124,6 +136,7 @@ export class ProjectControlService {
       pluginSettings: new DomainRepository<Record<string, unknown>>(this.coreDomainHandle.table('plugin_settings')),
       runContexts: new DomainRepository<RunContextRecord>(this.coreDomainHandle.table('run_contexts')),
       scheduledTasks: new DomainRepository<ScheduledTaskRecord>(this.coreDomainHandle.table('scheduled_tasks')),
+      fixPlans: new DomainRepository<FixPlanRecord>(this.coreDomainHandle.table('fix_plans')),
       memoryBaselines: new DomainRepository<MemoryBaselineRecord>(this.historyDomainHandle.table('memory_baselines')),
       evidence: new DomainRepository<EvidenceRecord>(this.analysisDomainHandle.table('evidence')),
       issues: new DomainRepository<ReviewIssueRecord>(this.historyDomainHandle.table('issues')),
@@ -172,8 +185,27 @@ export class ProjectControlService {
     // 调度器独立容错：故障不拖垮服务启动，但必须留下日志。
     try {
       this.scheduler.start()
-    } catch (error) {
+    } catch (error: unknown) {
       this.ctx?.logger?.warn?.(`project-control: scheduler start failed: ${String(error)}`)
+    }
+
+    // 修复派发器的崩溃恢复（业主 2026-11-04 容错要求）：删除上次进程遗留的
+    // pc-fix-* worktree + 中止主仓 cherry-pick 残留 + dispatched 方案复位待评审。
+    if (this.fixDispatcher !== undefined) {
+      for (const project of this.store.projects.list()) {
+        try {
+          const removed = await this.fixDispatcher.cleanupOrphans(project.identity.rootPath)
+          if (removed > 0) this.ctx?.logger?.info?.(`project-control: cleaned ${removed} orphan fix worktree(s) for ${project.identity.rootPath}`)
+        } catch (error: unknown) {
+          this.ctx?.logger?.warn?.(`project-control: fix worktree cleanup failed for ${project.identity.rootPath}: ${String(error)}`)
+        }
+        try {
+          const recovered = await this.fixDispatcher.recoverInterrupted({ id: project.id, rootPath: project.identity.rootPath })
+          if (recovered > 0) this.ctx?.logger?.info?.(`project-control: reset ${recovered} interrupted fix plan(s) for ${project.identity.rootPath}`)
+        } catch (error: unknown) {
+          this.ctx?.logger?.warn?.(`project-control: fix interruption recovery failed for ${project.identity.rootPath}: ${String(error)}`)
+        }
+      }
     }
   }
 

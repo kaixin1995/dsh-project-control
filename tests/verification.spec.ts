@@ -178,18 +178,53 @@ describe('Resolved issue retention purge', () => {
     { id: 'new-resolved', projectId: 'p1', changeId: 'c1', status: 'resolved', updatedAt: now - 2 * day },
     { id: 'old-accepted', projectId: 'p1', changeId: 'c1', status: 'accepted', updatedAt: now - 9 * day },
     { id: 'old-open', projectId: 'p1', changeId: 'c1', status: 'open', updatedAt: now - 30 * day },
+    { id: 'old-rejected', projectId: 'p1', changeId: 'c1', status: 'rejected', updatedAt: now - 10 * day },
+    { id: 'new-rejected', projectId: 'p1', changeId: 'c1', status: 'rejected', updatedAt: now - 1 * day },
   ]
 
-  it('deletes resolved/accepted issues older than the retention window and keeps the rest', async () => {
+  it('deletes resolved/accepted/rejected issues older than the retention window and keeps the rest', async () => {
     const service = makeService(records(), 7)
     await purgeResolvedIssues(service as never)
     const remaining = service.store.issues.list().map((issue: { id: string }) => issue.id)
-    expect(remaining).toEqual(['new-resolved', 'old-open'])
+    expect(remaining).toEqual(['new-resolved', 'old-open', 'new-rejected'])
   })
 
   it('keeps everything when retention is 0 (permanent)', async () => {
     const service = makeService(records(), 0)
     await purgeResolvedIssues(service as never)
-    expect(service.store.issues.list()).toHaveLength(4)
+    expect(service.store.issues.list()).toHaveLength(6)
+  })
+})
+
+describe('appendCappedNote 复检备注封顶', () => {
+  it('反复追加只保留最近 5 条，原始证据文案不动', async () => {
+    const { appendCappedNote } = await import('../src/verification/issues.ts')
+    let description = '证据：空指针风险'
+    for (let i = 1; i <= 8; i += 1) {
+      description = appendCappedNote(description, `[复检 1/1 ${String(i).padStart(2, '0')}:00] 仍未修复：第${i}次原因`)
+    }
+    expect(description.startsWith('证据：空指针风险')).toBe(true)
+    expect(description).not.toContain('第1次原因')
+    expect(description).not.toContain('第3次原因')
+    expect(description).toContain('第4次原因')
+    expect(description).toContain('第8次原因')
+    const noteCount = (description.match(/\[复检/g) ?? []).length
+    expect(noteCount).toBe(5)
+  })
+
+  it('复检与复验混合备注同样按总数封顶', async () => {
+    const { appendCappedNote } = await import('../src/verification/issues.ts')
+    let description = '证据：x'
+    description = appendCappedNote(description, '[复检 1/1 10:00] 仍未修复：a')
+    description = appendCappedNote(description, '[复验 1/1 11:00] 属实待修复：b')
+    description = appendCappedNote(description, '[复检 1/1 12:00] 仍未修复：c')
+    description = appendCappedNote(description, '[复检 1/1 13:00] 仍未修复：d')
+    description = appendCappedNote(description, '[复检 1/1 14:00] 仍未修复：e')
+    description = appendCappedNote(description, '[复检 1/1 15:00] 仍未修复：f')
+    expect(description.startsWith('证据：x')).toBe(true)
+    expect(description).not.toContain('仍未修复：a')
+    expect(description).toContain('属实待修复：b')
+    expect(description).toContain('仍未修复：c')
+    expect((description.match(/\[(复检|复验)/g) ?? []).length).toBe(5)
   })
 })

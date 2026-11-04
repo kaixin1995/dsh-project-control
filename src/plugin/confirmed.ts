@@ -93,8 +93,8 @@ export function registerConflictGuard(ctx: Context, service: ProjectControlServi
 export function addConfirmedItem(
   service: ProjectControlService,
   input: { type: ConfirmedItemRecord['type']; text: string; forbiddenPaths?: string[] },
+  projectId: string,
 ): ConfirmedItemRecord {
-  const projectId = service.currentProject?.id ?? 'prj_ad_hoc'
   const record: ConfirmedItemRecord = {
     id: CONFIRMED_ID_PREFIX + generateUlid(),
     projectId,

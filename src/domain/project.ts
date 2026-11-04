@@ -5,6 +5,7 @@
  * @module dsh-project-control/domain/project
  */
 
+import { realpath, stat } from 'node:fs/promises'
 import { createProjectId, type ProjectId } from './ids.ts'
 import type { ProjectRecord, RepositoryIdentity } from './models.ts'
 import type { DomainRepository } from '../store/repository.ts'
@@ -107,8 +108,14 @@ export class ProjectService {
 
     const allProjects = this.projectsRepo.list()
 
-    // 1. 路径完全匹配
-    const exactMatch = allProjects.find(p => p.identity.rootPath === identity.rootPath)
+    // 1. 规范化路径匹配，避免 Windows 短路径、大小写或分隔符差异。
+    const comparable = async (path: string): Promise<string> => {
+      const canonical = (await realpath(path).catch(() => path)).replace(/\\/g, '/').replace(/\/+$/, '')
+      return process.platform === 'win32' ? canonical.toLowerCase() : canonical
+    }
+    const targetPath = await comparable(identity.rootPath)
+    const paths = await Promise.all(allProjects.map(async project => ({ project, path: await comparable(project.identity.rootPath) })))
+    const exactMatch = paths.find(item => item.path === targetPath)?.project
     if (exactMatch) {
       exactMatch.identity = identity
       exactMatch.updatedAt = now
@@ -118,11 +125,15 @@ export class ProjectService {
 
     // 2. 指纹匹配：检测同源迁移或重新克隆（相同 rootCommitHash 且非空）
     if (identity.rootCommitHash && identity.rootCommitHash !== 'empty_repository') {
-      const fingerprintMatch = allProjects.find(
-        p => p.identity.rootCommitHash === identity.rootCommitHash,
-      )
-      if (fingerprintMatch) {
+      const candidates = allProjects.filter(p => p.identity.rootCommitHash === identity.rootCommitHash)
+      // 同源克隆或 worktree 可同时存在：只有原路径确定不存在时才能判为搬迁。
+      for (const fingerprintMatch of candidates) {
         const previousPath = fingerprintMatch.identity.rootPath
+        let missing = false
+        try { await stat(previousPath) } catch (error: unknown) {
+          missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
+        }
+        if (!missing) continue
         fingerprintMatch.identity = identity
         fingerprintMatch.updatedAt = now
         await this.projectsRepo.save(fingerprintMatch)

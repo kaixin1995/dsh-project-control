@@ -207,7 +207,7 @@ export class RunOrchestrator {
   private async loadRunContext(run: RunRecord, change: ChangeRecord, cwd: string): Promise<RunContextRecord> {
     const existing = this.store.runContexts.get(run.id)
     if (existing !== undefined) return existing
-    const checkpoint = this.store.checkpoints.list().at(-1)
+    const checkpoint = this.store.checkpoints.list((item) => item.projectId === change.projectId).at(-1)
     const project = this.store.projects.get(change.projectId)
     const status = await this.deps.git.getStatus(cwd).catch(() => undefined)
     const branch = status?.branch
@@ -725,7 +725,7 @@ export class RunOrchestrator {
       const prompt = this.composeStepPrompt(run, change, definition, role, cwd)
       handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'project-control' },
+        source: { kind: 'project-control' },
       }))
       // 确定性等待：whenIdle() 在代理尚未进入活动态时会立即返回（followup 竞态），
       // 改为轮询会话事件——完成协议已调用（outcome）或回合静默（有 assistant 输出且
@@ -762,7 +762,7 @@ export class RunOrchestrator {
       if (settled === 'ended' && state.outcome === undefined) {
         handle.agent.followup(createUserMessage({
           content: [{ type: 'text', text: 'You finished your turn WITHOUT calling the project_control_step_complete tool. Report now: call project_control_step_complete exactly once with a faithful summary (and changedFiles if any); set blocked only if the step truly cannot proceed.' }],
-          source: { kind: 'plugin', plugin: 'project-control' },
+          source: { kind: 'project-control' },
         }))
         settled = await waitTurn()
       }
@@ -835,7 +835,7 @@ export class RunOrchestrator {
     const memoryBlock = role === 'ops'
       ? ''
       : this.memoryContext?.synthesizeContext(change.projectId, definition.targetFiles ?? [], branch) ?? ''
-    const hotFiles = this.store.checkpoints.list().at(-1)?.hotFiles ?? []
+    const hotFiles = this.store.checkpoints.list((item) => item.projectId === change.projectId).at(-1)?.hotFiles ?? []
     const touchedHot = hotFiles.filter((hot) => (definition.targetFiles ?? []).some((target) => target.includes(hot)))
     const riskHint = touchedHot.length === 0 || role === 'ops'
       ? ''

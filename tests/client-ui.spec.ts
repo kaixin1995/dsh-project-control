@@ -55,6 +55,29 @@ describe('Client UI & Slot Registration (T7.1 - T7.4)', () => {
     expect(registeredSlots).toContain('tool.call.toolview')
   })
 
+  it('新版布局注册加法浮层且不占用 rightbar 单槽', async () => {
+    class ModernLayoutService extends Service {
+      panelInfo = { getSnapshot: () => ({ activePanelId: null }), subscribe: () => () => {} }
+      constructor(ctx: Context) { super(ctx, 'layout', true) }
+    }
+    class UiSessionService extends Service {
+      adapter = { current: { getSnapshot: () => ({ key: undefined }), subscribe: () => () => {} } }
+      constructor(ctx: Context) { super(ctx, 'uiSession', true) }
+    }
+    const ctx = new Context()
+    const registeredSlots: string[] = []
+    await ctx.plugin(MockSlotsService, registeredSlots)
+    await ctx.plugin(MockLocaleService)
+    await ctx.plugin(ModernLayoutService)
+    await ctx.plugin(UiSessionService)
+    await ctx.plugin({ name: 'test-client-modern', apply, inject: ['slots', 'locale', 'layout'] })
+
+    expect(registeredSlots).toContain('shell.overlay')
+    expect(registeredSlots).toContain('sidebar.footer.action')
+    expect(registeredSlots).not.toContain('rightbar')
+    expect(registeredSlots).not.toContain('details')
+  })
+
   it('T7.2: renders ChangeCard React element with correct props and badges', () => {
     const element = React.createElement(ChangeCard, {
       title: 'Fix Authentication',

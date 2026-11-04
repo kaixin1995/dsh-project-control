@@ -21,6 +21,22 @@ export interface CreateIssueParams {
   suggestedFix?: string
 }
 
+/** 复检/复验备注行的形状（`[复检 …] 仍未修复：…` / `[复验 …] 属实待修复：…`）。 */
+const NOTE_LINE = /\n\[(复检|复验)[^\]\n]*\] [^\n]*/g
+
+/**
+ * 追加一条复检/复验备注并只保留最近 limit 条（含新追加的这条）：
+ * 反复复检同一问题不会让 description 无限膨胀；原始证据文案永不动。
+ */
+export function appendCappedNote(description: string, line: string, limit = 5): string {
+  const notes = description.match(NOTE_LINE) ?? []
+  const base = notes.length > 0
+    ? description.slice(0, description.length - notes.join('').length)
+    : description
+  const kept = notes.slice(-(limit - 1))
+  return `${base}${kept.join('')}\n${line}`
+}
+
 export class ReviewIssueManager {
   constructor(private readonly issuesRepo: DomainRepository<ReviewIssueRecord, IssueId>) {}
 
@@ -76,5 +92,44 @@ export class ReviewIssueManager {
    */
   listByChange(changeId: ChangeId): ReviewIssueRecord[] {
     return this.issuesRepo.list(i => i.changeId === changeId)
+  }
+
+  /**
+   * 应用复验结论（修复派发子代理的回写端；聊天复验链路已下线，语义不变）：
+   * - false_positive / duplicate / obsolete → rejected（关闭），resolution 记录结论与依据；
+   * - fixed → resolved（解决），记录修复说明与涉及文件；
+   * - already_fixed → resolved（解决），此前提交已修复，记录历史修复依据；
+   * - confirmed → 保持 open，复验备注追加到 description（属实但尚未修复）。
+   * @returns 更新后的记录。
+   */
+  async applyChatVerdict(
+    issueId: IssueId,
+    verdict: 'confirmed' | 'fixed' | 'already_fixed' | 'false_positive' | 'duplicate' | 'obsolete',
+    note: string,
+    fixFiles?: string[],
+  ): Promise<ReviewIssueRecord> {
+    const issue = this.issuesRepo.get(issueId)
+    if (!issue) throw new Error(`Review issue not found: ${issueId}`)
+    const stamp = new Date().toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    const safeNote = note.slice(0, 300)
+    if (verdict === 'false_positive' || verdict === 'duplicate' || verdict === 'obsolete') {
+      const label = verdict === 'false_positive' ? '误报' : verdict === 'duplicate' ? '重复' : '功能已移除/需求已变更'
+      issue.status = 'rejected'
+      issue.resolution = `${label}（复验 ${stamp}）：${safeNote}`
+    } else if (verdict === 'fixed') {
+      issue.status = 'resolved'
+      issue.resolution = `复验修复（${stamp}）：${safeNote}`
+      if (fixFiles !== undefined && fixFiles.length > 0) issue.fixFiles = fixFiles
+    } else if (verdict === 'already_fixed') {
+      issue.status = 'resolved'
+      issue.resolution = `此前已修复（复验 ${stamp}）：${safeNote}`
+      if (fixFiles !== undefined && fixFiles.length > 0) issue.fixFiles = fixFiles
+    } else {
+      issue.status = 'open'
+      issue.description = appendCappedNote(issue.description, `[复验 ${stamp}] 属实待修复：${safeNote}`)
+    }
+    issue.updatedAt = Date.now()
+    await this.issuesRepo.save(issue)
+    return issue
   }
 }

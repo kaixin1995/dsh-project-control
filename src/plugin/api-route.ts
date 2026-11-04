@@ -14,8 +14,17 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+
+// v4 会话格式是开放式生产者词表：没有通用 plugin kind（session-format-v3-to-v4
+// 的 source 校验对 kind==='plugin' 直接抛 "requires a producer-owned source
+// kind"，任何自有非空 kind 放行）。这里声明本插件的生产者归属。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'project-control': { kind: 'project-control' }
+  }
+}
 import { createHash } from 'node:crypto'
-import { readdir } from 'node:fs/promises'
+import { readdir, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { BootstrapPipeline } from '../bootstrap/pipeline.ts'
@@ -29,9 +38,10 @@ import { ChangeService } from '../domain/change.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { generatePlanSteps } from '../runtime/plan-gen.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { runTriageBatch, toTriageIssue, TRIAGE_BATCH_SIZE } from '../verification/triage.ts'
 import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
 import type { ConfirmedItemRecord } from './confirmed.ts'
-import { ReviewIssueManager } from '../verification/issues.ts'
+import { ReviewIssueManager, appendCappedNote } from '../verification/issues.ts'
 import { DeterministicBuildVerifier, UnitTestVerifier, EvidenceDiffVerifier, LlmReviewVerifier } from '../verification/verifier.ts'
 import { VerificationRunner } from '../verification/service.ts'
 import type { IssueSeverity, ProjectRecord } from '../domain/models.ts'
@@ -101,6 +111,12 @@ function trustFence(req: IncomingMessage, res: ServerResponse): number | undefin
 /** 统一路径分隔符为 POSIX 风格（git 输出在 Windows 上已是 /，防御性归一）。 */
 function normalizePath(path: string): string {
   return path.trim().replace(/\\/g, '/')
+}
+
+async function comparablePath(path: string): Promise<string> {
+  const canonical = await realpath(path).catch(() => resolve(path))
+  const normalized = normalizePath(canonical).replace(/\/+$/, '')
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
 /** 解析 `git diff --numstat` 输出为逐文件增删行数（二进制文件计 0）。 */
@@ -311,25 +327,79 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 }
 
 /** 读取历史扫描游标（分块续跑；无游标返回空对象）。 */
-function readHistoryCursor(service: ProjectControlService): { lastCommit?: string; processedCount?: number } {
-  const cursor = service.store?.historyCursor?.get('cursor')
+function readHistoryCursor(service: ProjectControlService, projectId: string): { lastCommit?: string; processedCount?: number } {
+  const cursor = service.store?.historyCursor?.get(safeStorageId(`cursor|${projectId}`))
   if (cursor === undefined || cursor === null) return {}
   return cursor as { lastCommit?: string; processedCount?: number }
 }
 
 /** 写历史扫描游标。 */
-function writeHistoryCursor(service: ProjectControlService, lastCommit: string, processedCount: number): void {
-  void service.store?.historyCursor?.save({ id: 'cursor', lastCommit, processedCount })
+function writeHistoryCursor(service: ProjectControlService, projectId: string, lastCommit: string, processedCount: number): void {
+  void service.store?.historyCursor?.save({ id: safeStorageId(`cursor|${projectId}`), projectId, lastCommit, processedCount })
     .catch((error: unknown) => console.error('[pc] history cursor write failed:', error))
 }
 
+/**
+ * 已解读提交标记（「未消化」圆点的消点依据）：commit-detail 成功生成/命中解读时记录
+ * sha；/commits 读取后未消化 = 新于上次总结 且 未解读。上限 500 个（FIFO），防无限膨胀。
+ */
+const ANALYZED_MARKER_CAP = 500
+
+function readAnalyzedShas(service: ProjectControlService, projectId: string): Set<string> {
+  const record = service.store?.historyCursor?.get(safeStorageId(`analyzed|${projectId}`)) as { shas?: unknown } | undefined
+  const list = Array.isArray(record?.shas) ? record.shas.filter((sha): sha is string => typeof sha === 'string') : []
+  return new Set(list)
+}
+
+function markAnalyzedSha(service: ProjectControlService, projectId: string, sha: string): void {
+  if (service.store?.historyCursor === undefined) return
+  const id = safeStorageId(`analyzed|${projectId}`)
+  const record = service.store.historyCursor.get(id) as { shas?: unknown } | undefined
+  const list = Array.isArray(record?.shas) ? record.shas.filter((item): item is string => typeof item === 'string') : []
+  if (list.includes(sha)) return
+  const next = [...list, sha].slice(-ANALYZED_MARKER_CAP)
+  void service.store.historyCursor.save({ id, projectId, shas: next })
+    .catch((error: unknown) => console.error('[pc] analyzed marker write failed:', error))
+}
+
+/** 叙事分段：超过单段上限的提交集合按时间顺序切块（段间连续、不重叠）。 */
+export function chunkForNarrative(shas: string[], maxPerChunk = 30): string[][] {
+  const chunks: string[][] = []
+  for (let start = 0; start < shas.length; start += maxPerChunk) {
+    chunks.push(shas.slice(start, start + maxPerChunk))
+  }
+  return chunks.length > 0 ? chunks : [[]]
+}
+
 /** 从请求体取出会话 id（工作台按钮都会携带），并反查该会话的工作目录。 */
-function sessionCwdOf(service: ProjectControlService, body: Record<string, unknown>): string | undefined {
+async function sessionCwdOf(service: ProjectControlService, body: Record<string, unknown>): Promise<string | undefined> {
   const sessionId = body['sessionId']
   if (typeof sessionId !== 'string' || sessionId === '') return undefined
-  const session = (service.ctx as any)?.sessions?.get?.(sessionId)
-  const cwd = session?.header?.cwd
-  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+  const ctx = service.ctx as any
+  const session = ctx?.sessions?.get?.(sessionId)
+  const liveCwd = session?.header?.cwd
+  if (typeof liveCwd === 'string' && liveCwd !== '') return liveCwd
+  try {
+    const workspaces = ctx?.workspaceRegistry?.list?.() ?? []
+    const matches = workspaces.filter((workspace: { sessionIds?: readonly string[]; path?: string }) =>
+      workspace.sessionIds?.includes(sessionId) && typeof workspace.path === 'string' && workspace.path !== '')
+    if (matches.length === 1) return matches[0].path
+  } catch {
+    // 工作区注册表不可用时继续尝试官方的只读会话查询。
+  }
+  try {
+    const query = ctx?.get?.('sessionQuery')
+    if (query?.observeSession === undefined) return undefined
+    const observation = await query.observeSession(sessionId, { projectionMode: 'none', signal: AbortSignal.timeout(5000) })
+    try {
+      const cwd = observation.header?.cwd
+      return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+    } finally {
+      observation[Symbol.dispose]()
+    }
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -342,7 +412,9 @@ function sessionCwdOf(service: ProjectControlService, body: Record<string, unkno
 async function adoptProject(service: ProjectControlService, body: Record<string, unknown> = {}): Promise<ProjectRecord | undefined> {
   // 显式 rootPath 优先（与 /bootstrap 一致的调用方直连方式），其次会话工作目录。
   const explicitRoot = typeof body['rootPath'] === 'string' && body['rootPath'] !== '' ? body['rootPath'] : undefined
-  const cwd = explicitRoot ?? sessionCwdOf(service, body)
+  const hasSession = Object.hasOwn(body, 'sessionId')
+  const cwd = explicitRoot ?? await sessionCwdOf(service, body)
+  if (cwd === undefined && hasSession) return undefined
   if (service.currentProject === undefined || cwd !== undefined) {
     const root = cwd ?? service.currentProject?.identity.rootPath
     if (root !== undefined) {
@@ -351,8 +423,8 @@ async function adoptProject(service: ProjectControlService, body: Record<string,
         (args, dir) => service.git.runGit(args, dir),
       )
       const ensured = await projectService.ensureProject(root)
-      service.currentProject = ensured.project
-      return service.currentProject
+      if (!hasSession) service.currentProject = ensured.project
+      return ensured.project
     }
   }
   if (service.currentProject !== undefined) return service.currentProject
@@ -485,6 +557,9 @@ export async function executeReviewForTarget(
   const boundChange = changeId !== undefined && changeId !== ''
     ? service.store.changes.get(changeId as never)
     : undefined
+  if (changeId !== undefined && changeId !== '' && (boundChange === undefined || boundChange.projectId !== project.id)) {
+    throw new Error('change not found in current project')
+  }
   const issueTarget = boundChange !== undefined ? boundChange.id : `review:${reviewSha ?? 'worktree'}`
   if (!force) {
     const storeHit = cacheRead(service, reviewStoreKey)
@@ -492,7 +567,7 @@ export async function executeReviewForTarget(
       const cachedList = (storeHit.payload['issueList'] ?? []) as ReviewIssueEntry[]
       // 缓存命中也保证落库：该目标尚无记录时补写一次（后续命中不再重复写）。
       if (cachedList.length > 0
-        && service.store.issues.list((issue) => issue.changeId === issueTarget).length === 0) {
+        && service.store.issues.list((issue) => issue.projectId === project.id && issue.changeId === issueTarget).length === 0) {
         await persistReviewIssues(service, project.id, issueTarget, cachedList)
       }
       return {
@@ -583,7 +658,7 @@ export async function runIncrementalAiSummary(
     .filter((memory) => sinceMs === undefined || memory.createdAt > sinceMs)
     .slice(0, 20)
     .map((memory) => `- [${memory.isHumanConfirmed ? '已确认' : memory.truthLevel}] ${memory.title}：${String(memory.content ?? '').slice(0, 120)}`)
-  const bootstrap = service.store.checkpoints.list().at(-1) ?? null
+  const bootstrap = service.store.checkpoints.list((item) => item.projectId === project.id).at(-1) ?? null
   const recentChanges = (service.store.changes?.list() ?? [])
     .filter((change) => change.projectId === pid)
     .filter((change) => sinceMs === undefined || change.updatedAt > sinceMs)
@@ -816,15 +891,17 @@ export async function runMemorySync(
 }
 
 /**
- * 数据生命周期：清理超期的已解决评审问题（resolved/accepted，按 updatedAt 计龄）。
+ * 数据生命周期：清理超期的已闭环评审问题（resolved/accepted/rejected，按 updatedAt 计龄）。
+ * rejected（误报/重复）同样进保留期——它们没有留存价值且会无限累积。
  * resolvedIssueRetentionDays=0 表示永久保留。读取问题列表前执行，页面所见即清理后状态。
  */
 export async function purgeResolvedIssues(service: ProjectControlService): Promise<void> {
   const retentionDays = service.liveConfig.resolvedIssueRetentionDays ?? 7
   if (retentionDays <= 0) return
   const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+  const closable = new Set(['resolved', 'accepted', 'rejected'])
   for (const issue of service.store.issues.list()) {
-    if ((issue.status === 'resolved' || issue.status === 'accepted') && issue.updatedAt < cutoff) {
+    if (closable.has(issue.status) && issue.updatedAt < cutoff) {
       await service.store.issues.delete(issue.id)
     }
   }
@@ -840,7 +917,7 @@ async function persistReviewIssues(
   issueTarget: string,
   issueList: ReviewIssueEntry[],
 ): Promise<void> {
-  for (const stale of service.store.issues.list((issue) => issue.changeId === issueTarget)) {
+  for (const stale of service.store.issues.list((issue) => issue.projectId === projectId && issue.changeId === issueTarget)) {
     await service.store.issues.delete(stale.id)
   }
   const issuesManager = new ReviewIssueManager(service.store.issues)
@@ -857,13 +934,13 @@ async function persistReviewIssues(
 }
 
 /** 工作台所需的完整状态快照（来自 storage-domain 真实数据）。 */
-function buildState(service: ProjectControlService, projectOverride?: ProjectRecord): Record<string, unknown> {
+function buildState(service: ProjectControlService, projectOverride?: ProjectRecord | null): Record<string, unknown> {
   const store = service.store
   if (store === undefined) {
     return { ready: false, reason: 'service not started' }
   }
   const projects = store.projects.list()
-  const project = projectOverride ?? service.currentProject ?? projects.at(-1) ?? null
+  const project = projectOverride === undefined ? (service.currentProject ?? projects.at(-1) ?? null) : projectOverride
   // 工作台是项目级视图：所有业务列表按当前项目过滤，跨项目数据不串显。
   const pid = project?.id
   const inProject = <T extends { projectId: string }>(records: T[]): T[] =>
@@ -927,7 +1004,7 @@ function buildState(service: ProjectControlService, projectOverride?: ProjectRec
     }),
     attemptsCount: attempts.length,
     importedChanges: (store.importedChanges?.list() ?? [])
-      .filter((item) => pid === undefined || (item as { projectId?: string }).projectId === pid)
+      .filter((item) => pid !== undefined && (item as { projectId?: string }).projectId === pid)
       .slice(-100).map((item) => {
         const record = item as { id: string; title: string; commitShas: string[]; firstCommitAt: number; lastCommitAt: number; confidence: number; status: string }
         return {
@@ -1028,15 +1105,19 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             // 匹配（纯内存查询，不跑 git 不建项目），多会话并行互不串显。
             const query: Record<string, unknown> = {}
             for (const [key, value] of url.searchParams.entries()) query[key] = value
-            const requestedRoot = sessionCwdOf(service, query)
-              ?? (typeof query['rootPath'] === 'string' && query['rootPath'] !== '' ? query['rootPath'] : undefined)
-            let override: ProjectRecord | undefined
+            const hasSelector = Object.hasOwn(query, 'sessionId')
+              || (typeof query['rootPath'] === 'string' && query['rootPath'] !== '')
+            const requestedRoot = typeof query['rootPath'] === 'string' && query['rootPath'] !== ''
+              ? query['rootPath'] : await sessionCwdOf(service, query)
+            let override: ProjectRecord | null | undefined = hasSelector ? null : undefined
             if (requestedRoot !== undefined && service.store !== undefined) {
-              const normalized = normalizePath(requestedRoot)
-              override = service.store.projects.list().find(
-                (candidate) => normalizePath(candidate.identity.rootPath) === normalized,
-              )
-              if (override !== undefined) service.currentProject = override
+              const repoRoot = await service.git.runGit(['rev-parse', '--show-toplevel'], requestedRoot)
+                .then((value) => value.trim() || requestedRoot).catch(() => requestedRoot)
+              const normalized = await comparablePath(repoRoot)
+              const candidates = await Promise.all(service.store.projects.list().map(async (candidate) => ({
+                candidate, path: await comparablePath(candidate.identity.rootPath),
+              })))
+              override = candidates.find((item) => item.path === normalized)?.candidate ?? null
             }
             const body = JSON.stringify(buildState(service, override))
             res.writeHead(200, { 'content-type': 'application/json' })
@@ -1058,10 +1139,11 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const rootPathRaw = body['rootPath']
+            const hasSession = Object.hasOwn(body, 'sessionId')
             const rootPath = typeof rootPathRaw === 'string' && rootPathRaw.length > 0
               ? rootPathRaw
-              : sessionCwdOf(service, body)
-                  ?? service.currentProject?.identity.rootPath
+              : (await sessionCwdOf(service, body))
+                  ?? (hasSession ? undefined : service.currentProject?.identity.rootPath)
             if (rootPath === undefined) {
               res.writeHead(400, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'no project root known; pass rootPath' }))
@@ -1072,7 +1154,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               (args, cwd) => service.git.runGit(args, cwd),
             )
             const ensured = await projectService.ensureProject(rootPath)
-            service.currentProject = ensured.project
+            if (!hasSession) service.currentProject = ensured.project
             const pipeline = new BootstrapPipeline(
               service.git,
               new GenericLanguageAnalyzer(),
@@ -1111,13 +1193,13 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 }
               : undefined
             const maxCommits = typeof body['maxCommits'] === 'number' ? Math.min(body['maxCommits'], service.liveConfig.bootstrap.maxCommitsPerRun) : service.liveConfig.bootstrap.defaultMaxCommits
-            const cursor = readHistoryCursor(service)
+            const cursor = readHistoryCursor(service, ensured.project.id)
             const imported = resume && cursor.lastCommit !== undefined
               ? await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, ...(summaries === undefined ? {} : { summaries }), fromCommit: cursor.lastCommit })
               : await scanHistory(service.git, rootPath, ensured.project.id, service.store.importedChanges, { maxCommits, ...(summaries === undefined ? {} : { summaries }) })
             importedCount = imported.length
             const lastHash = await service.git.getHeadSha(rootPath)
-            if (lastHash !== undefined) writeHistoryCursor(service, lastHash, importedCount)
+            if (lastHash !== undefined) writeHistoryCursor(service, ensured.project.id, lastHash, importedCount)
           }
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
@@ -1163,7 +1245,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               type: (typeof body['type'] === 'string' && ['requirement', 'constraint', 'decision', 'non-goal'].includes(body['type']) ? body['type'] : 'constraint') as never,
               text,
               forbiddenPaths: Array.isArray(body['forbiddenPaths']) ? body['forbiddenPaths'] as string[] : [],
-            })
+            }, project.id)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true, id: item.id }))
           } catch (error: unknown) {
@@ -1182,7 +1264,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
-            const removed = id === '' ? false : removeConfirmedItem(service, id)
+            const project = await adoptProject(service, body)
+            const item = id === '' ? undefined : service.store.confirmed.get(id)
+            const removed = project !== undefined && item?.['projectId'] === project.id
+              ? removeConfirmedItem(service, id) : false
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: removed }))
           } catch (error: unknown) {
@@ -1193,11 +1278,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
         }
 
         if (req.method === 'GET' && routePath === '/history/status') {
-          const cursor = readHistoryCursor(service)
+          const query: Record<string, unknown> = {}
+          for (const [key, value] of url.searchParams.entries()) query[key] = value
+          const project = await adoptProject(service, query)
+          const cursor = project === undefined ? {} : readHistoryCursor(service, project.id)
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({
             cursor,
-            importedChanges: service.store?.importedChanges?.list().length ?? 0,
+            importedChanges: project === undefined ? 0 : service.store?.importedChanges?.list((item) => item.projectId === project.id).length ?? 0,
             canResume: cursor.lastCommit !== undefined,
           }))
           return
@@ -1216,7 +1304,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const route = resolveDeploymentRoute(ctx, 'standard', service.liveConfig)
             const diff = await service.git.getDiff(cwd)
             const evidence = service.evidenceManager.createEvidence({
-              projectId: (service.currentProject?.id ?? 'prj_ad_hoc') as never,
+              projectId: project.id as never,
               source: 'git_diff',
               truthLevel: 'fact',
               locator: 'git:diff:HEAD..worktree',
@@ -1311,8 +1399,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const project = await adoptProject(service, body)
             const change = id === '' ? undefined : service.store.changes.get(id as never)
-            if (change === undefined) {
+            if (project === undefined || change === undefined || change.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'change not found' }))
               return
@@ -1428,7 +1517,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               return
             }
             const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
-            const storeKey = `wn:${cwd}|${orderedShas.join(',')}|v1|${route.provider}/${route.model}`
+            const modelTag = route.provider + '/' + route.model
+            const storeKey = `wn:${cwd}|${orderedShas.join(',')}|v2|${modelTag}`
             if (!force) {
               const hit = cacheRead(service, storeKey)
               if (hit !== undefined) {
@@ -1437,30 +1527,96 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 return
               }
             }
-            const commitBlocks: string[] = []
-            for (const [index, sha] of orderedShas.entries()) {
+            const commitBlockOf = async (index: number, sha: string): Promise<string> => {
               const info = (await service.git.runGit(['log', '-1', '--format=%an|%ad|%s', '--date=short', sha], cwd).catch(() => '')).trim()
               const stat = await service.git.runGit(['diff', '--no-color', '--stat', `${sha}^..${sha}`], cwd).catch(() => '')
-              commitBlocks.push(`# ${index + 1}. ${sha.slice(0, 8)} ${info}\n${stat.trim().split('\n').slice(0, 15).join('\n')}`)
+              return `# ${index + 1}. ${sha.slice(0, 8)} ${info}\n${stat.trim().split('\n').slice(0, 15).join('\n')}`
             }
-            const llm = await runLlmAnalysis(ctx, {
-              prompt: [
-                '你是代码考古员。以下多个连续提交构成一轮开发工作，请把它们作为一个整体解读：',
-                '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
-                '2. 拆出这轮工作分几个步骤/阶段（如 分析→实现→修 bug→测试），每个步骤列出对应的提交编号；',
-                '3. 指出步骤间的依赖或演进关系（后一步如何建立在前一步之上）。',
-                '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
-                '',
-                ...commitBlocks.map((block) => block + '\n'),
-              ].join('\n'),
-              provider: route.provider,
-              model: route.model,
-              maxTokens: service.liveConfig.analysisMaxTokens,
-              timeoutMs: service.liveConfig.analysisTimeoutMs,
-              purpose: 'project-control-work-narrative',
-            })
-            const narrative = llm.text.trim()
-            const narrativeCostUsd = usageMeta(llm.usage, route.model).costUsd
+            // 大批次分段：>30 条时按时间顺序切块，逐段解读（带缓存）后合并为整体叙事，
+            // 避免超长材料稀释质量；响应形状与单段一致。
+            const chunks = chunkForNarrative(orderedShas, 30)
+            let narrative: string
+            let narrativeCostUsd: number | undefined
+            const sumCost = (left: number | undefined, right: number | undefined): number | undefined =>
+              left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0)
+            if (chunks.length === 1) {
+              const commitBlocks: string[] = []
+              for (const [index, sha] of orderedShas.entries()) {
+                commitBlocks.push(await commitBlockOf(index, sha))
+              }
+              const llm = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是代码考古员。以下多个连续提交构成一轮开发工作，请把它们作为一个整体解读：',
+                  '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
+                  '2. 拆出这轮工作分几个步骤/阶段（如 分析→实现→修 bug→测试），每个步骤列出对应的提交编号；',
+                  '3. 指出步骤间的依赖或演进关系（后一步如何建立在前一步之上）。',
+                  '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
+                  '',
+                  ...commitBlocks.map((block) => block + '\n'),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-work-narrative',
+              })
+              narrative = llm.text.trim()
+              narrativeCostUsd = usageMeta(llm.usage, route.model).costUsd
+            } else {
+              const segmentSummaries: string[] = []
+              let chunkOffset = 0
+              for (const [chunkIndex, chunk] of chunks.entries()) {
+                const segKey = `wn-seg:${cwd}|${chunk.join(',')}|v2|${modelTag}`
+                const segHit = force ? undefined : cacheRead(service, segKey)
+                if (segHit !== undefined) {
+                  segmentSummaries.push(String(segHit.payload['narrative'] ?? ''))
+                  chunkOffset += chunk.length
+                  continue
+                }
+                const blocks: string[] = []
+                for (const [offset, sha] of chunk.entries()) {
+                  blocks.push(await commitBlockOf(chunkOffset + offset, sha))
+                }
+                chunkOffset += chunk.length
+                const llm = await runLlmAnalysis(ctx, {
+                  prompt: [
+                    `你是代码考古员。以下是一轮开发工作（共 ${orderedShas.length} 个提交）的第 ${chunkIndex + 1}/${chunks.length} 段（全局提交编号 ${chunkOffset - chunk.length + 1}–${chunkOffset}）。`,
+                    '请解读这一段：做了什么、分几步、每步对应哪些提交编号；如与前后段可能存在衔接（修复/延续关系），请点出。',
+                    '用 Markdown 短列表输出，全部中文，基于给定材料不要编造。',
+                    '',
+                    ...blocks.map((block) => block + '\n'),
+                  ].join('\n'),
+                  provider: route.provider,
+                  model: route.model,
+                  maxTokens: service.liveConfig.analysisMaxTokens,
+                  timeoutMs: service.liveConfig.analysisTimeoutMs,
+                  purpose: 'project-control-work-narrative',
+                })
+                const segText = llm.text.trim()
+                segmentSummaries.push(segText)
+                const segCost = usageMeta(llm.usage, route.model).costUsd
+                narrativeCostUsd = sumCost(narrativeCostUsd, segCost)
+                cacheWrite(service, segKey, 'narrative-segment', { narrative: segText, ...(segCost === undefined ? {} : { costUsd: segCost }) })
+              }
+              const mergeLlm = await runLlmAnalysis(ctx, {
+                prompt: [
+                  '你是代码考古员。下面是一轮开发工作各段的分段解读（按时间顺序排列）。请合并为最终整体叙事：',
+                  '1. 用 2-3 句话概括这轮工作整体做了什么、达成了什么目标；',
+                  '2. 「## 步骤拆解」：合并各段步骤为一个按阶段排序的列表，每个步骤保留对应的全局提交编号；',
+                  '3. 「## 演进脉络」：后一步如何建立在前一步之上；后续提交修复前面问题的地方必须体现。',
+                  '用 Markdown 输出：一段总述 + 「## 步骤拆解」（列表） + 「## 演进脉络」（短列表）。全部用中文，基于给定材料不要编造。',
+                  '',
+                  ...segmentSummaries.map((summary, index) => `== 第 ${index + 1}/${chunks.length} 段 ==\n${summary}\n`),
+                ].join('\n'),
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-work-narrative',
+              })
+              narrative = mergeLlm.text.trim()
+              narrativeCostUsd = sumCost(narrativeCostUsd, usageMeta(mergeLlm.usage, route.model).costUsd)
+            }
             cacheWrite(service, storeKey, 'narrative', { narrative, ...(narrativeCostUsd === undefined ? {} : { costUsd: narrativeCostUsd }) })
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ narrative, cached: false, generatedAt: Date.now(), ...(narrativeCostUsd === undefined ? {} : { costUsd: narrativeCostUsd }) }))
@@ -1563,7 +1719,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             ]
             const runner = new VerificationRunner(service.store.verifications, verifiers)
             const pipeline = await runner.runPipeline({
-              projectId: (service.currentProject?.id ?? 'prj_ad_hoc') as never,
+              projectId: project.id as never,
               changeId: (change?.id ?? 'adhoc') as never,
               cwd,
               changedFiles: [],
@@ -1654,6 +1810,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'no project initialized' }))
               return
             }
+            // 已解读标记：供前端「未消化」圆点消点（新于上次总结 且 未解读才算未消化）。
+            const analyzedSet = readAnalyzedShas(service, project.id)
             const limitRaw = Number(query['limit'] ?? 50)
             const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.trunc(limitRaw))) : 50
             const status = await service.git.getStatus(cwd)
@@ -1697,7 +1855,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 isClean: status.isClean,
                 files: status.entries.slice(0, 40).map((entry) => ({ path: entry.path, status: entry.status })),
               },
-              commits,
+              commits: commits.map((commit) => ({ ...commit, analyzed: analyzedSet.has(commit.sha) })),
             }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
@@ -1752,6 +1910,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const storeKey = `cd:${cwd}|${sha}|${diff.diffHash}|v${PROMPT_VERSION}|${detailRoute.provider}/${detailRoute.model}`
             let analysis: CommitAnalysis | undefined
             let analysisCached = false
+            let analysisFailed = false
             let analysisGeneratedAt: number | undefined
             let analysisCostUsd: number | undefined
             let analysisTokens: { input: number; output: number; total: number } | undefined
@@ -1828,8 +1987,11 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 const message = error instanceof Error ? error.message : String(error)
                 analysis = { what: `AI 解读失败：${message}（点「重新生成」可重试）`, logic: [], risks: [] }
                 analysisCached = false
+                analysisFailed = true
               }
             }
+            // 成功生成或命中解读的提交记录「已解读」标记（供未消化圆点消点）；失败的解读不算。
+            if (!isWorking && !analysisFailed && project !== undefined) markAnalyzedSha(service, project.id, sha)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({
               sha, isWorking, files, insertions, deletions,
@@ -2150,7 +2312,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             }
             const changeService = new ChangeService(service.store.changes, service.git, service.evidenceManager)
             const change = await changeService.createChange(project.id as never, title, description, cwd)
-            const bootstrap = service.store.checkpoints.list().at(-1)
+            const bootstrap = service.store.checkpoints.list((item) => item.projectId === project.id).at(-1)
             const stackHint = bootstrap != null ? `仓库技术栈：${bootstrap.techStack.join(', ') || '未知'}` : ''
             const steps = await generatePlanSteps(ctx, service, title, description, stackHint)
             // 创建表单选择的执行模型：作为本计划所有步骤的默认模型覆盖（计划确认页仍可逐步改）。
@@ -2187,8 +2349,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : ''
+            const project = await adoptProject(service, body)
             const change = changeId === '' ? undefined : service.store.changes.get(changeId as never)
-            if (change === undefined) {
+            if (project === undefined || change === undefined || change.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'change not found' }))
               return
@@ -2233,8 +2396,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const changeId = typeof body['changeId'] === 'string' ? body['changeId'] : ''
+            const project = await adoptProject(service, body)
             const change = changeId === '' ? undefined : service.store.changes.get(changeId as never)
-            if (change === undefined) {
+            if (project === undefined || change === undefined || change.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'change not found' }))
               return
@@ -2254,8 +2418,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           const query: Record<string, unknown> = {}
           for (const [key, value] of url.searchParams.entries()) query[key] = value
           const id = typeof query['id'] === 'string' ? query['id'] : ''
+          const project = await adoptProject(service, query)
           const run = id === '' ? undefined : service.store?.runs.get(id as never)
-          if (run === undefined) {
+          if (project === undefined || run === undefined || run.projectId !== project.id) {
             res.writeHead(404, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: 'run not found' }))
             return
@@ -2333,6 +2498,13 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'runId is required' }))
               return
             }
+            const project = await adoptProject(service, body)
+            const run = service.store.runs.get(runId as never)
+            if (project === undefined || run === undefined || run.projectId !== project.id) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'run not found in current project' }))
+              return
+            }
             await service.orchestrator.resumeRun(runId as never, action as never)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true, action }))
@@ -2370,7 +2542,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               }
             }
             res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ tiers, options }))
+            res.end(JSON.stringify({ tiers, options, fixConcurrency: service.liveConfig.fixConcurrency }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -2389,11 +2561,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const body = await readJsonBody(req)
             const tiers = body['tiers']
             const CLASSES = ['standard', 'fast', 'reasoning', 'verifier']
-            if (typeof tiers !== 'object' || tiers === null) throw new Error('tiers object required')
+            const hasFixConcurrency = typeof body['fixConcurrency'] === 'number' && Number.isFinite(body['fixConcurrency'])
+            if ((typeof tiers !== 'object' || tiers === null) && !hasFixConcurrency) throw new Error('tiers object required')
             const next: Record<string, { provider: string; model: string }> = { ...service.liveConfig.modelTiers }
             let touched = false
             for (const key of CLASSES) {
-              const entry = (tiers as Record<string, unknown>)[key]
+              const entry = typeof tiers === 'object' && tiers !== null ? (tiers as Record<string, unknown>)[key] : undefined
               if (typeof entry !== 'object' || entry === null) continue
               touched = true
               const provider = String((entry as Record<string, unknown>)['provider'] ?? '')
@@ -2405,9 +2578,17 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 next[key] = { provider, model }
               }
             }
-            if (!touched) throw new Error('no tier entries in payload')
-            service.liveConfig = { ...service.liveConfig, modelTiers: next } as typeof service.liveConfig
-            await service.store.pluginSettings.save({ id: 'model-tiers', ...next })
+            if (!touched && !hasFixConcurrency) throw new Error('no tier entries in payload')
+            if (touched) {
+              service.liveConfig = { ...service.liveConfig, modelTiers: next } as typeof service.liveConfig
+              await service.store.pluginSettings.save({ id: 'model-tiers', ...next })
+            }
+            // 修复并发（可选字段）：立即生效 + 持久化。
+            if (typeof body['fixConcurrency'] === 'number' && Number.isFinite(body['fixConcurrency'])) {
+              const fixConcurrency = Math.max(1, Math.min(10, Math.trunc(body['fixConcurrency'])))
+              service.liveConfig = { ...service.liveConfig, fixConcurrency } as typeof service.liveConfig
+              await service.store.pluginSettings.save({ id: 'fix-concurrency', fixConcurrency })
+            }
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))
           } catch (error: unknown) {
@@ -2483,7 +2664,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           const pid = project?.id
           const severityWeight: Record<string, number> = { blocker: 0, critical: 1, major: 2, minor: 3, info: 4 }
           const issues = (service.store?.issues.list() ?? [])
-            .filter((issue) => pid === undefined || issue.projectId === pid)
+            .filter((issue) => pid !== undefined && issue.projectId === pid)
             .sort((left, right) =>
               (severityWeight[left.severity] ?? 9) - (severityWeight[right.severity] ?? 9)
               || right.createdAt - left.createdAt)
@@ -2500,6 +2681,21 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               fixFiles: issue.fixFiles ?? [],
               fixImpact: issue.fixImpact ?? [],
               fixDiff: issue.fixDiff ?? '',
+              // 待评审/已派发的修复方案（方案模式产出，前端渲染方案块 + 批准派发）。
+              fixPlan: (() => {
+                const plan = (service.store?.fixPlans?.list() ?? [])
+                  .filter((candidate) => candidate.issueId === issue.id && (candidate.status === 'pending' || candidate.status === 'dispatched'))
+                  .sort((left, right) => right.createdAt - left.createdAt)[0]
+                return plan === undefined ? null : {
+                  id: plan.id,
+                  approach: plan.approach,
+                  files: plan.files,
+                  impact: plan.impact,
+                  benefit: plan.benefit,
+                  risk: plan.risk,
+                  status: plan.status,
+                }
+              })(),
               createdAt: issue.createdAt,
               updatedAt: issue.updatedAt,
             }))
@@ -2523,10 +2719,77 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'id and a valid status are required' }))
               return
             }
+            const project = await adoptProject(service, body)
+            const issue = service.store.issues.get(id as never)
+            if (project === undefined || issue === undefined || issue.projectId !== project.id) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'issue not found in current project' }))
+              return
+            }
             const manager = new ReviewIssueManager(service.store.issues)
             await manager.updateStatus(id as never, status as never)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        // 整体分诊（业主 2026-11-04 拍板 LLM 批量判定）：对未解决问题全集做清单级
+        // 扫描——判 duplicate/obsolete/false_positive 即时关闭（带依据可复核重开），
+        // keep 留给修复阶段。每轮处理"open 且本轮未送审"的前 N 条，前端循环到 done。
+        if (req.method === 'POST' && routePath === '/issues/triage') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            if (body['reset'] === true) service.triageSeen.clear()
+            const open = service.store.issues.list(
+              (issue) => issue.projectId === project.id && (issue.status === 'open' || issue.status === 'fixing'),
+            ).sort((left, right) => left.createdAt - right.createdAt)
+            const pending = open.filter((issue) => !service.triageSeen.has(issue.id))
+            if (pending.length === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: true, done: true, processed: 0, remaining: 0, closed: { duplicate: 0, obsolete: 0, false_positive: 0 }, kept: 0, parseFailed: false }))
+              return
+            }
+            const batch = pending.slice(0, TRIAGE_BATCH_SIZE).map(toTriageIssue)
+            const all = open.map(toTriageIssue)
+            const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+            const result = await runTriageBatch(service.store.issues as never, batch, all, async (prompt) => {
+              const llm = await runLlmAnalysis(ctx, {
+                prompt,
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-issue-triage',
+              })
+              return llm.text
+            })
+            // 本批全部记为已送审（含 keep——keep 不关闭，不记会每批重复选中）。
+            for (const issue of batch) service.triageSeen.add(issue.id)
+            const remaining = open.filter((issue) => !service.triageSeen.has(issue.id)).length
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              ok: true,
+              done: remaining === 0,
+              processed: batch.length,
+              remaining,
+              closed: result.closed,
+              kept: result.kept,
+              parseFailed: result.parseFailed,
+            }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
@@ -2682,7 +2945,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 await service.store.issues.save(issue)
                 resolved.push(issue.title)
               } else {
-                issue.description = `${issue.description}\n[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${entry.reason.slice(0, 200)}`
+                issue.description = appendCappedNote(
+                  issue.description,
+                  `[复检 ${new Date(now).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}] 仍未修复：${entry.reason.slice(0, 200)}`,
+                )
                 issue.updatedAt = now
                 await service.store.issues.save(issue)
                 stillOpen.push({ title: issue.title, reason: entry.reason })
@@ -2702,7 +2968,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           const project = await adoptProject(service, query)
           const pid = project?.id
           const notes = (service.store?.notes?.list() ?? [])
-            .filter((note) => pid === undefined || note.projectId === pid)
+            .filter((note) => pid !== undefined && note.projectId === pid)
             .sort((left, right) => right.createdAt - left.createdAt)
             .slice(0, 200)
           res.writeHead(200, { 'content-type': 'application/json' })
@@ -2718,6 +2984,11 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized; open a project workspace first' }))
+              return
+            }
             const title = typeof body['title'] === 'string' ? body['title'].trim() : ''
             const content = typeof body['content'] === 'string' ? body['content'].trim() : ''
             if (title === '' || content === '') {
@@ -2728,7 +2999,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const now = Date.now()
             const note = {
               id: `note_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-              projectId: project?.id ?? 'prj_ad_hoc',
+              projectId: project.id,
               title,
               content,
               tags: parseTags(body['tags']),
@@ -2780,8 +3051,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const project = await adoptProject(service, body)
             const note = id === '' ? undefined : service.store.notes.get(id)
-            if (note === undefined) {
+            if (project === undefined || note === undefined || note.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'note not found' }))
               return
@@ -2811,7 +3083,14 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
-            const removed = id === '' ? false : await service.store.notes.delete(id)
+            const project = await adoptProject(service, body)
+            const note = id === '' ? undefined : service.store.notes.get(id)
+            if (project === undefined || note === undefined || note.projectId !== project.id) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'note not found in current project' }))
+              return
+            }
+            const removed = await service.store.notes.delete(id)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: removed }))
           } catch (error: unknown) {
@@ -2838,13 +3117,18 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               return
             }
             const project = await adoptProject(service, body)
-            const cwd = project?.identity?.rootPath
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized; open a project workspace first' }))
+              return
+            }
+            const cwd = project.identity.rootPath
             // 记忆跟随项目 + 分支：落库时打上当前仓库分支戳。
             const branch = cwd === undefined
               ? undefined
               : await service.git.getStatus(cwd).then((status) => status.branch).catch(() => undefined)
             const memoryParams = {
-              projectId: (project?.id ?? service.currentProject?.id ?? 'prj_ad_hoc') as never,
+              projectId: project.id as never,
               type: (typeof body['memoryType'] === 'string' ? body['memoryType'] : 'project_log') as never,
               truthLevel: 'inferred' as never,
               title,
@@ -2877,7 +3161,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             ? undefined
             : await service.git.getStatus(cwd).then((status) => status.branch).catch(() => undefined)
           const all = (service.store?.memories.list() ?? [])
-            .filter((memory) => pid === undefined || memory.projectId === pid)
+            .filter((memory) => pid !== undefined && memory.projectId === pid)
             .sort((left, right) => right.updatedAt - left.updatedAt)
           const memories = all.map((memory) => ({
             id: memory.id,
@@ -2949,6 +3233,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             const body = await readJsonBody(req)
             const action = body['action'] === 'archive' ? 'archive' : 'mark-stale'
             const ids = Array.isArray(body['ids']) ? body['ids'].filter((id): id is string => typeof id === 'string') : []
+            const project = await adoptProject(service, body)
+            if (project === undefined || ids.some((id) => service.store?.memories.get(id as never)?.projectId !== project.id)) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'memory not found in current project' }))
+              return
+            }
             for (const id of ids) {
               await service.memoryService.updateStatus(id as never, action === 'archive' ? 'archived' : 'stale')
             }
@@ -2977,6 +3267,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'id and a valid status are required' }))
               return
             }
+            const project = await adoptProject(service, body)
+            if (project === undefined || service.store?.memories.get(id as never)?.projectId !== project.id) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'memory not found in current project' }))
+              return
+            }
             await service.memoryService.updateStatus(id as never, status as never)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))
@@ -3000,6 +3296,12 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
               res.end(JSON.stringify({ error: 'id is required' }))
               return
             }
+            const project = await adoptProject(service, body)
+            if (project === undefined || service.store?.memories.get(id as never)?.projectId !== project.id) {
+              res.writeHead(404, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'memory not found in current project' }))
+              return
+            }
             await service.memoryService.normalizeToProject(id as never)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))
@@ -3017,7 +3319,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           const project = await adoptProject(service, query)
           const pid = project?.id
           const tasks = (service.store?.scheduledTasks.list() ?? [])
-            .filter((task) => pid === undefined || task.projectId === pid)
+            .filter((task) => pid !== undefined && task.projectId === pid)
             .sort((left, right) => left.createdAt - right.createdAt)
             .map((task) => ({
               id: task.id,
@@ -3088,8 +3390,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const project = await adoptProject(service, body)
             const task = id === '' ? undefined : service.store.scheduledTasks.get(id)
-            if (task === undefined) {
+            if (project === undefined || task === undefined || task.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'task not found' }))
               return
@@ -3117,7 +3420,10 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
-            const removed = id === '' ? false : await service.store.scheduledTasks.delete(id)
+            const project = await adoptProject(service, body)
+            const task = id === '' ? undefined : service.store.scheduledTasks.get(id)
+            const removed = project !== undefined && task?.projectId === project.id
+              ? await service.store.scheduledTasks.delete(id) : false
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: removed }))
           } catch (error: unknown) {
@@ -3126,6 +3432,108 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           return
         }
+        // ── 修复派发（子 Agent + worktree 隔离 + cherry-pick 合并）────────────
+        if (req.method === 'POST' && routePath === '/fix/dispatch') {
+          if (service.store === undefined || service.fixDispatcher === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const planIds = Array.isArray(body['planIds']) ? (body['planIds'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
+            const issueIds = Array.isArray(body['issueIds']) ? (body['issueIds'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
+            // issueIds 路径的模式：fix=判定+修复+合并提交（默认）；plan=只读出方案入库待评审。
+            const mode: 'fix' | 'plan' = body['mode'] === 'plan' ? 'plan' : 'fix'
+            if (planIds.length === 0 && issueIds.length === 0) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'planIds or issueIds required' }))
+              return
+            }
+            const inputs: Array<{ issueId: string; title: string; evidence: string; approach?: string; files?: string[]; planId?: string; mode?: 'fix' | 'plan' }> = []
+            // 路径一：批准的方案（plan 模式产出）→ 固定按 fix 执行（方案就是让它修）。
+            for (const planId of planIds) {
+              const plan = service.store.fixPlans.get(planId)
+              if (plan === undefined || plan.projectId !== project.id || plan.status !== 'pending') continue
+              const issue = service.store.issues.get(plan.issueId as never)
+              if (issue === undefined || issue.projectId !== project.id || (issue.status !== 'open' && issue.status !== 'fixing')) continue
+              inputs.push({
+                issueId: issue.id,
+                title: issue.title,
+                evidence: (issue.description ?? '').replace(/\n\[复[检验][^\]]*\][^\n]*/g, '').slice(0, 400),
+                approach: `方案：${plan.approach}\n影响：${plan.impact}\n收益：${plan.benefit}\n风险：${plan.risk}`,
+                files: plan.files,
+                planId: plan.id,
+                mode: 'fix',
+              })
+              plan.status = 'dispatched'
+              plan.updatedAt = Date.now()
+              await service.store.fixPlans.save(plan)
+            }
+            // 路径二：直接派发的问题（fix=自主判定+修复；plan=只读出方案）。
+            for (const issueId of issueIds) {
+              const issue = service.store.issues.get(issueId as never)
+              if (issue === undefined || issue.projectId !== project.id || (issue.status !== 'open' && issue.status !== 'fixing')) continue
+              // plan 模式跳过已有待评审方案的问题（避免重复产出/覆盖）。
+              if (mode === 'plan') {
+                const hasPending = (service.store.fixPlans.list() ?? []).some((candidate) => candidate.issueId === issue.id && candidate.status === 'pending')
+                if (hasPending) continue
+              }
+              inputs.push({
+                issueId: issue.id,
+                title: issue.title,
+                evidence: (issue.description ?? '').replace(/\n\[复[检验][^\]]*\][^\n]*/g, '').slice(0, 400),
+                mode,
+              })
+            }
+            const accepted = service.fixDispatcher.dispatch(
+              { id: project.id, name: project.name, rootPath: project.identity.rootPath },
+              inputs,
+            )
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, accepted, concurrency: service.liveConfig.fixConcurrency }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        if (req.method === 'GET' && routePath === '/fix/status') {
+          const dispatcher = service.fixDispatcher
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            tasks: dispatcher?.status() ?? [],
+            concurrency: service.liveConfig.fixConcurrency,
+            busy: dispatcher?.isBusy() ?? false,
+          }))
+          return
+        }
+        if (req.method === 'POST' && routePath === '/fix/cancel') {
+          const dispatcher = service.fixDispatcher
+          if (dispatcher === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            const stopped = dispatcher.cancel(project?.identity.rootPath ?? '')
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, stopped }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+
         if (req.method === 'POST' && routePath === '/scheduled/run') {
           if (service.store === undefined || service.scheduler === undefined) {
             res.writeHead(503, { 'content-type': 'application/json' })
@@ -3135,8 +3543,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const id = typeof body['id'] === 'string' ? body['id'] : ''
+            const project = await adoptProject(service, body)
             const task = id === '' ? undefined : service.store.scheduledTasks.get(id)
-            if (task === undefined) {
+            if (project === undefined || task === undefined || task.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'task not found' }))
               return
@@ -3164,8 +3573,9 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           try {
             const body = await readJsonBody(req)
             const memoryId = typeof body['memoryId'] === 'string' ? body['memoryId'] : ''
+            const project = await adoptProject(service, body)
             const memory = memoryId === '' ? undefined : service.store.memories.get(memoryId as never)
-            if (memory === undefined) {
+            if (project === undefined || memory === undefined || memory.projectId !== project.id) {
               res.writeHead(404, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'memory not found' }))
               return

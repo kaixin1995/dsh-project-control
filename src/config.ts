@@ -50,6 +50,8 @@ export interface ProjectControlFullConfig {
   analysisTimeoutMs: number
   /** 已解决评审问题的保留天数（超期自动清理；0=永久保留）。 */
   resolvedIssueRetentionDays: number
+  /** 修复派发并发（子 Agent 池上限；worktree 隔离，1-10）。 */
+  fixConcurrency: number
   /** 单次步骤尝试的停滞超时（毫秒）：超时视为失败进入重试，防子代理卡死。 */
   stepTimeoutMs: number
   /** Run 结束是否强制执行确定性收尾验收（配置了 build/test 命令时）。 */
@@ -102,6 +104,8 @@ export const PROJECT_CONTROL_SETTINGS_SCHEMA: z<ProjectControlFullConfig> = z.ob
   analysisMaxTokens: z.number().min(256).default(4096),
   analysisTimeoutMs: z.number().min(5000).default(120000),
   resolvedIssueRetentionDays: z.number().min(0).default(7),
+  /** 修复派发并发（子 Agent 池上限；worktree 隔离，1-10）。 */
+  fixConcurrency: z.number().min(1).max(10).default(3),
   stepTimeoutMs: z.number().min(30_000).default(600_000),
   finalVerificationGate: z.boolean().default(true),
   autoResumeRuns: z.boolean().default(true),
@@ -126,6 +130,7 @@ export const PROJECT_CONTROL_DEFAULTS: ProjectControlFullConfig = {
   analysisMaxTokens: 4096,
   analysisTimeoutMs: 120000,
   resolvedIssueRetentionDays: 7,
+  fixConcurrency: 3,
   stepTimeoutMs: 600_000,
   finalVerificationGate: true,
   autoResumeRuns: true,
