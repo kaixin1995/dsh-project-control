@@ -1,0 +1,3 @@
+lib/** -text
+*.png binary
+*.ico binary
