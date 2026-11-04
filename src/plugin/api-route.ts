@@ -37,7 +37,7 @@ import { ProjectService } from '../domain/project.ts'
 import { ChangeService } from '../domain/change.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { generatePlanSteps } from '../runtime/plan-gen.ts'
-import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { runLlmAnalysis, runLlmAnalysisAutoExpand } from '../analysis/llm-analyzer.ts'
 import { runTriageBatch, toTriageIssue, TRIAGE_BATCH_SIZE } from '../verification/triage.ts'
 import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
 import type { ConfirmedItemRecord } from './confirmed.ts'
@@ -1945,7 +1945,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             }
             if (analysis === undefined) {
               try {
-                const llm = await runLlmAnalysis(ctx, {
+                // 解读用自动放大版：hit max tokens 自动放大输出重试一次（业主 2026-11-04）。
+                const llm = await runLlmAnalysisAutoExpand(ctx, {
                 prompt: [
                   'You are explaining a git change to a senior developer who must review AI-written code.',
                   'Answer in Chinese, STRICTLY in this format (no extra text):',

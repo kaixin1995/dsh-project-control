@@ -42,6 +42,29 @@ function withTimeout(ms: number): { signal: AbortSignal; dispose: () => void } {
   return { signal: controller.signal, dispose: () => clearTimeout(timer) }
 }
 
+/** 自动放大重试的输出上限（防止无界膨胀）。 */
+export const LLM_ANALYSIS_MAX_TOKENS_CAP = 32_768
+
+/**
+ * 带自动放大重试的一次性分析（业主 2026-11-04：hit max tokens 二次手点效率低）：
+ * 首次调用若因输出截断失败（MAX_TOKENS），自动把 maxTokens 放大 ×4（夹在
+ * 8192~32768）立即重试一次；其余错误原样抛出。大 diff 解读常需要比默认 4096
+ * 更大的输出空间，用户不应为此手动二次点击。
+ */
+export async function runLlmAnalysisAutoExpand(ctx: Context, req: LlmAnalysisRequest): Promise<LlmAnalysisResult> {
+  try {
+    return await runLlmAnalysis(ctx, req)
+  } catch (error: unknown) {
+    if (error instanceof LlmError && error.code === 'MAX_TOKENS') {
+      const expanded = Math.min(LLM_ANALYSIS_MAX_TOKENS_CAP, Math.max(req.maxTokens * 4, 8192))
+      if (expanded > req.maxTokens) {
+        return await runLlmAnalysis(ctx, { ...req, maxTokens: expanded })
+      }
+    }
+    throw error
+  }
+}
+
 /** 把 finish 原因映射为错误（fail-closed：不产出部分结果）。 */
 function finishError(finish: ReturnType<BlockAssembler['finish']>): Error | undefined {
   if (finish.kind === 'error') return new LlmError(finish.failure.message, finish.failure.code, finish.failure)
