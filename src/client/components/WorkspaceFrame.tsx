@@ -1955,23 +1955,14 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     setActionResult('✓ ' + t('notes.exportDone'))
   }
 
-  /** 一键清空未解决问题：服务端原子置 accepted（不修代码）；红色危险弹窗确认。 */
+  /** 一键清空未解决问题：服务端原子置 accepted（不修代码）。数量在 JSX 内联计算
+   *  （visible 是页签局部变量，本函数不可引用——曾因此 ReferenceError，2026-11-04）。 */
   const purgeOpenIssues = async (): Promise<void> => {
-    const openCount = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
-    if (openCount === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
-    setConfirmDialog({
-      title: t('review.purgeOpenConfirmTitle'),
-      message: t('review.purgeOpenConfirmMsg').replace('{n}', String(openCount)),
-      danger: true,
-      confirmLabel: t('review.purgeOpen'),
-      onConfirm: async () => {
-        const { ok, data } = await post('/project-control/api/issues/purge-open', { sessionId: props.sessionId ?? '' })
-        await loadIssues()
-        setActionResult(ok
-          ? '✓ ' + t('review.purgeOpenDone').replace('{n}', String(data['purged'] ?? 0))
-          : '✗ ' + String(data['error'] ?? 'error'))
-      },
-    })
+    const { ok, data } = await post('/project-control/api/issues/purge-open', { sessionId: props.sessionId ?? '' })
+    await loadIssues()
+    setActionResult(ok
+      ? '✓ ' + t('review.purgeOpenDone').replace('{n}', String(data['purged'] ?? 0))
+      : '✗ ' + String(data['error'] ?? 'error'))
   }
 
   /** 批量标记已处理（accepted）：人工确认无需逐条复检时直接结案。 */
@@ -3850,7 +3841,21 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     })
                   }}
                 >{t('review.triage')}</button>
-                <button style={{ ...styles.secondary, color: themeAwareText('#d1242f') }} title={t('review.purgeOpenHint')} onClick={() => { void purgeOpenIssues() }}>{t('review.purgeOpen')}</button>
+                <button
+                  style={{ ...styles.secondary, color: themeAwareText('#d1242f') }}
+                  title={t('review.purgeOpenHint')}
+                  onClick={() => {
+                    const openCount = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+                    if (openCount === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+                    setConfirmDialog({
+                      title: t('review.purgeOpenConfirmTitle'),
+                      message: t('review.purgeOpenConfirmMsg').replace('{n}', String(openCount)),
+                      danger: true,
+                      confirmLabel: t('review.purgeOpen'),
+                      onConfirm: () => { void purgeOpenIssues() },
+                    })
+                  }}
+                >{t('review.purgeOpen')}</button>
                 {(() => {
                   // 派发对象：勾选的待处理问题优先；未勾选 = 当前筛选下全部待处理（常驻入口，不再藏）。
                   const openVisible = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
