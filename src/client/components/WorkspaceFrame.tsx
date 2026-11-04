@@ -157,6 +157,9 @@ interface FixTaskEntry {
   impact?: { riskLevel: string; riskScore: number; direct: string[]; indirect: string[]; potential: string[] }
   /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
   mode?: 'fix' | 'plan'
+  /** 模型报错续跑次数 / 探活次数（活性状态机透出）。 */
+  resumes?: number
+  probes?: number
 }
 
 /** 修复差异的行级着色渲染：+ 绿、- 红、文件头加粗、其余弱化。 */
@@ -627,6 +630,9 @@ export const WORKSPACE_DICT = {
     'fix.taskFailed': '失败',
     'fix.taskCancelled': '已停止',
     'fix.attempt': '第 {n} 次',
+    'fix.runtime': '已运行 {n} 分',
+    'fix.resumes': '续跑 {n}',
+    'fix.probes': '探活 {n}',
     'fix.modelTitle': '修复并发（子 Agent 池）',
     'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰；修改后立即生效。',
 
@@ -954,6 +960,9 @@ export const WORKSPACE_DICT = {
     'fix.taskFailed': '失败',
     'fix.taskCancelled': '已停止',
     'fix.attempt': '第 {n} 次',
+    'fix.runtime': '已运行 {n} 分',
+    'fix.resumes': '续跑 {n}',
+    'fix.probes': '探活 {n}',
     'fix.modelTitle': '修复并发（子 Agent 池）',
     'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰。',
 
@@ -3864,6 +3873,17 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                         <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
                           {FIX_STATUS_LABELS[task.status] ?? task.status}{task.mode === 'plan' ? '·方案' : ''}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
                         </span>
+                        {(() => {
+                          const active = task.status === 'running' || task.status === 'merging' || task.status === 'redo'
+                          if (!active) return null
+                          const minutes = Math.max(0, Math.round((Date.now() - (task.startedAt ?? Date.now())) / 60_000))
+                          const extra = [
+                            minutes > 0 ? t('fix.runtime').replace('{n}', String(minutes)) : '',
+                            (task.resumes ?? 0) > 0 ? t('fix.resumes').replace('{n}', String(task.resumes)) : '',
+                            (task.probes ?? 0) > 0 ? t('fix.probes').replace('{n}', String(task.probes)) : '',
+                          ].filter((part) => part !== '')
+                          return extra.length > 0 ? <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)', flexShrink: 0 }}>{extra.join(' · ')}</span> : null
+                        })()}
                         <span style={{ minWidth: 0, flex: 1 }}>
                           <span style={{ display: 'block', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
                           {(task.status === 'running' || task.status === 'queued') && task.currentAction !== undefined && (

@@ -78,6 +78,10 @@ export interface FixTaskView {
   impact?: FixImpactView
   /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
   mode?: 'fix' | 'plan'
+  /** 模型报错后的续跑次数（followup 接续，上下文无损）。 */
+  resumes?: number
+  /** 总时限到点后的探活次数。 */
+  probes?: number
   startedAt?: number
   finishedAt?: number
 }
@@ -98,13 +102,25 @@ interface FixOutcome {
 }
 
 /** 子代理回合结果：outcome 未给时，endedClean 区分"正常结束没调工具"（可采纳
- *  worktree 真实改动——真机沙箱死循环但改动完整的场景）与"异常中断/超时"
- *  （额度耗尽、模型故障半路死——半成品不可信，一律丢弃，绝不合并）。 */
+ *  worktree 真实改动——真机沙箱死循环但改动完整的场景）与"异常中断"
+ *  （连续报错/探活零响应——半成品不可信，一律丢弃，绝不合并）。 */
 interface SubAgentResult {
   outcome?: FixOutcome
   endedClean: boolean
   /** apply_fix 实际写过的文件（采纳兜底时作 changedFiles）。 */
   changed: string[]
+  /** endedClean=false 时的死因（重派与进度文案用）。 */
+  diedAt?: 'model-errors' | 'stalled'
+}
+
+/** 子代理运行时共享状态（waitTurn / apply_fix / 完成工具三方共写）。 */
+interface SubAgentState {
+  outcome?: FixOutcome
+  changed: string[]
+  /** 最近一次 apply_fix 写文件的时刻（进程内零延迟活性——不依赖宿主批量落盘）。 */
+  lastToolAt: number
+  /** 最近一次观察到任何活动的时刻（事件增长 / 回合开着 / 工具写入）。 */
+  lastActivityAt: number
 }
 
 /** 合法判定结论（fix_complete 的 verdict 字段白名单）。 */
@@ -112,6 +128,15 @@ export const FIX_VERDICTS = ['false_positive', 'duplicate', 'obsolete', 'already
 export type FixVerdict = (typeof FIX_VERDICTS)[number]
 
 export const FIX_MAX_ATTEMPTS = 2
+/** 模型报错续跑上限（回合 error 收场 → followup 接续，上下文无损；业主 2026-11-04：偶发抖动应可接续）。 */
+export const FIX_MAX_RESUMES = 2
+/** 总时限到点后的探活上限（先敲门再进门；两次零响应才判停摆）。 */
+export const FIX_MAX_PROBES = 2
+
+/** 探活等待窗口：自适应（总时限的 1/4，夹在 3s~90s；真机默认 600s → 90s，测试 1.2s → 3s）。 */
+export function probeWindowOf(timeoutMs: number): number {
+  return Math.max(3_000, Math.min(90_000, Math.round(timeoutMs / 4)))
+}
 const FIX_WORKTREE_PREFIX = 'pc-fix-'
 
 export class FixDispatcher {
@@ -305,11 +330,23 @@ export class FixDispatcher {
 
       if (outcome === undefined) {
         if (!result.endedClean) {
-          // 异常中断（超时/模型故障/额度耗尽）：半成品改动不可信，直接丢弃——
-          // 宁可不修也不把可能写坏一半的代码合并进主仓。
+          // 真死（连续报错续跑不活 / 探活零响应）：半成品丢弃；attempt 未满自动重派一次
+          // （抖动续跑救不活的网关故障，重开新 worktree 从头跑；业主 2026-11-04 拍板）。
+          view.error = result.diedAt === 'model-errors'
+            ? `模型连续报错（续跑 ${FIX_MAX_RESUMES} 轮未恢复），worktree 半成品已丢弃`
+            : `长时间零响应（探活 ${FIX_MAX_PROBES} 次无回应），判停摆，半成品已丢弃`
+          if (view.attempt < FIX_MAX_ATTEMPTS) {
+            view.status = 'redo'
+            view.currentAction = `自动重派（第 ${view.attempt + 1} 次）`
+            await this.removeWorktree(project.rootPath, task.issueId)
+            const redo: FixTask = { ...task, view: { ...view, status: 'queued', attempt: view.attempt + 1, error: undefined, resumes: 0, probes: 0 } }
+            this.tasks.set(task.issueId, redo)
+            this.queue.push(task.issueId)
+            this.pump(project)
+            return
+          }
           view.status = 'failed'
-          view.error = '子代理异常中断（超时或模型故障），worktree 半成品改动已丢弃'
-          await this.writeBack(project, task, 'confirmed', `派发修复异常中断（第 ${view.attempt} 次）：${view.error}`)
+          await this.writeBack(project, task, 'confirmed', `派发修复异常中断（第 ${view.attempt} 次，已自动重派一次）：${view.error}`)
           return
         }
         // 兜底：回合正常结束但没走完成协议，且 worktree 有真实改动 → 采纳改动继续合并
@@ -495,7 +532,7 @@ export class FixDispatcher {
 
   /** 跑一个子代理修复任务；返回完成协议载荷 + 回合是否正常结束（超时=异常中断）。 */
   private async runSubAgent(project: { id: string; name: string; rootPath: string }, task: FixTask, worktree: string): Promise<SubAgentResult> {
-    const state: { outcome?: FixOutcome; changed: string[] } = { changed: [] }
+    const state: SubAgentState = { changed: [], lastToolAt: 0, lastActivityAt: Date.now() }
     const sessionId = `pc-fix-${task.issueId}-${task.view.attempt}-${Date.now().toString(36)}`
     const route = resolveDeploymentRoute(this.ctx, 'standard', this.service.liveConfig)
     // 生效禁改路径（已确定约束）：提示词告知 + apply_fix 硬拒双保险。
@@ -564,12 +601,14 @@ export class FixDispatcher {
                 if (total > 1) throw new Error(`search text appears ${total} times in ${safe} — include more surrounding lines so it is unique`)
                 writeFileSync(target, current.replace(search, replace), 'utf8')
                 markChanged()
+                state.lastToolAt = Date.now()
                 task.view.currentAction = `替换 ${safe}`
                 return `Replaced in ${safe}`
               }
               if ((args.content ?? '') === '') throw new Error('mode="full" requires content (the complete new file content); for large files use mode="replace" instead')
               writeFileSync(target, args.content!, 'utf8')
               markChanged()
+              state.lastToolAt = Date.now()
               task.view.currentAction = `写入 ${safe}`
               return `Written: ${safe}`
             },
@@ -636,66 +675,111 @@ export class FixDispatcher {
         content: [{ type: 'text', text: prompt }],
         source: { kind: 'project-control' },
       }))
-      const settled = await this.waitTurn(handle.agent.session.id, state, task.view)
-      if (settled === 'outcome') return { outcome: state.outcome, endedClean: true, changed: state.changed }
-      if (settled === 'ended') {
-        // 催促一轮完成协议（与 orchestrator 相同）。
-        handle.agent.followup(createUserMessage({
-          content: [{ type: 'text', text: task.mode === 'plan'
-            ? 'You finished your turn WITHOUT calling project_control_fix_complete. Call it now exactly once: with a verdict (false_positive/duplicate/obsolete/already_fixed) if the issue is not a real, still-present defect, or with the full plan fields (approach/files/impact/benefit/risk). Do NOT modify any file.'
-            : 'You finished your turn WITHOUT calling project_control_fix_complete. Call it now exactly once with a faithful summary (changedFiles if any); set blocked only if the fix truly cannot proceed, or a verdict if no code change is needed.' }],
-          source: { kind: 'project-control' },
-        }))
-        const retry = await this.waitTurn(handle.agent.session.id, state, task.view)
-        if (retry === 'outcome') return { outcome: state.outcome, endedClean: true, changed: state.changed }
-        if (retry === 'ended') return { outcome: undefined, endedClean: true, changed: state.changed }
-        return { outcome: undefined, endedClean: false, changed: state.changed }
+      // 活性状态机（业主 2026-11-04 拍板：抖动=续跑接上，停摆=探活确认，真死=重派兜底）：
+      // - 回合 error 收场（模型偶发 429/500）→ followup 续跑（≤FIX_MAX_RESUMES 轮，上下文无损）；
+      // - 总时限到点 → 探活（≤FIX_MAX_PROBES 次，窗口内有响应=活着并恢复时限，零响应才判停摆）；
+      // - 回合正常结束没调工具 → 催促一轮（原有语义）。
+      const timeoutMs = this.service.liveConfig.stepTimeoutMs
+      let nudged = false
+      let deadline = Date.now() + timeoutMs
+      for (;;) {
+        if (task.view.status === 'cancelled') return { outcome: state.outcome, endedClean: state.outcome !== undefined, changed: state.changed }
+        const settled = await this.waitTurn(handle.agent.session.id, state, task.view, deadline)
+        if (settled === 'outcome') return { outcome: state.outcome, endedClean: true, changed: state.changed }
+        if (settled === 'ended') {
+          if (!nudged) {
+            // 催促一轮完成协议（与 orchestrator 相同）。
+            nudged = true
+            handle.agent.followup(createUserMessage({
+              content: [{ type: 'text', text: task.mode === 'plan'
+                ? 'You finished your turn WITHOUT calling project_control_fix_complete. Call it now exactly once: with a verdict (false_positive/duplicate/obsolete/already_fixed) if the issue is not a real, still-present defect, or with the full plan fields (approach/files/impact/benefit/risk). Do NOT modify any file.'
+                : 'You finished your turn WITHOUT calling project_control_fix_complete. Call it now exactly once with a faithful summary (changedFiles if any); set blocked only if the fix truly cannot proceed, or a verdict if no code change is needed.' }],
+              source: { kind: 'project-control' },
+            }))
+            continue
+          }
+          return { outcome: undefined, endedClean: true, changed: state.changed }
+        }
+        if (settled === 'ended-error') {
+          const resumes = (task.view.resumes ?? 0) + 1
+          if (resumes <= FIX_MAX_RESUMES) {
+            task.view.resumes = resumes
+            task.view.currentAction = `模型报错，续跑第 ${resumes} 次`
+            handle.agent.followup(createUserMessage({
+              content: [{ type: 'text', text: '刚才的模型调用出错了（偶发抖动，属正常）。你的会话上下文完整保留——请从上次进度继续完成任务，已读过的文件不必重读。' + (task.mode === 'plan'
+                ? '完成后调用 project_control_fix_complete（verdict 判定类 / approach·files·impact·benefit·risk 方案字段），本轮仍不得修改任何文件。'
+                : '文件修改仍只用 project_control_apply_fix（大文件用 replace 模式）；完成后调用 project_control_fix_complete。') }],
+              source: { kind: 'project-control' },
+            }))
+            deadline = Date.now() + timeoutMs
+            continue
+          }
+          return { outcome: undefined, endedClean: false, changed: state.changed, diedAt: 'model-errors' }
+        }
+        // timeout：总时限到点 → 探活（先敲门再进门）。
+        const probes = (task.view.probes ?? 0) + 1
+        const probeStart = Date.now()
+        if (probes <= FIX_MAX_PROBES) {
+          task.view.probes = probes
+          task.view.currentAction = `长时间无进展，探活第 ${probes} 次`
+          handle.agent.followup(createUserMessage({
+            content: [{ type: 'text', text: '[系统探活] 长时间未观察到进展。若你仍在工作，请立即回复一句话进度；若已完成或无法继续，请立即调用 project_control_fix_complete 报告结果。持续无响应任务将被终止。' }],
+            source: { kind: 'project-control' },
+          }))
+          const probeSettled = await this.waitTurn(handle.agent.session.id, state, task.view, probeStart + probeWindowOf(timeoutMs))
+          if (probeSettled === 'outcome') return { outcome: state.outcome, endedClean: true, changed: state.changed }
+          if (probeSettled === 'ended' || probeSettled === 'ended-error') {
+            // 回合在探活期间收场：恢复完整时限回主循环（ended-error 由续跑分支接管）。
+            deadline = Date.now() + timeoutMs
+            continue
+          }
+          if (state.lastActivityAt > probeStart) {
+            // 有响应 = 活着：恢复完整时限继续等。
+            deadline = Date.now() + timeoutMs
+          } else {
+            // 零响应：deadline 置为已过期，主循环立即再超时 → 下一次探活（或终局）。
+            deadline = Date.now() + 1
+          }
+          continue
+        }
+        return { outcome: undefined, endedClean: false, changed: state.changed, diedAt: 'stalled' }
       }
-      // timeout：异常中断（额度耗尽/模型故障/长时间无进展）。
-      return { outcome: state.outcome, endedClean: false, changed: state.changed }
     } finally {
       await handle.dispose().catch(() => {})
     }
   }
 
-  /** 确定性等待回合结束。回合真关闭的判定：事件流里最后一个 turn 事件是 turn/end
-   *  （0.1.x 宿主事件按 attempt 整段批量落盘，模型生成期间事件流长时间静默——
-   *  纯静默阈值会把生成中误判为结束并过早 dispose 掐死回合，2026-11-04 真机事故）。 */
-  private async waitTurn(sessionId: string, state: { outcome?: FixOutcome }, view?: FixTaskView): Promise<'outcome' | 'ended' | 'timeout'> {
-    const timeoutMs = this.service.liveConfig.stepTimeoutMs
-    const deadline = Date.now() + timeoutMs
-    const silenceLimitMs = Math.min(180_000, timeoutMs)
+  /** 等待回合演化（活性版，业主 2026-11-04 拍板）。核心原则：**回合开着 = 活着**——
+   *  宿主管理回合生命周期，模型请求死了它必然发 turn/end 收场；回合开着时外部事件
+   *  静默不算停摆（生成大段代码期间事件批量落盘可长时间静默），只受调用方给的
+   *  deadline 约束（到点由 runSubAgent 探活，不在本方法内处决）。
+   *  - 最后一个 turn 事件是 turn/end 且 reason 非 completed（error/aborted）→ 'ended-error'
+   *    （模型偶发抖动，上层 followup 续跑接上）；
+   *  - turn/end(completed) 且静默 2.5s → 'ended'（真结束，上层催促）；
+   *  - 尚无任何 turn 事件（起步/宿主未落盘）→ 视作未开始，只受 deadline 约束。 */
+  private async waitTurn(sessionId: string, state: SubAgentState, view: FixTaskView, deadline: number): Promise<'outcome' | 'ended' | 'ended-error' | 'timeout'> {
     let lastCount = -1
-    let lastProgressAt = Date.now()
     while (Date.now() < deadline) {
       if (state.outcome !== undefined) return 'outcome'
-      // 任务被取消：立即结束等待（runTask 侧按 cancelled 收尾）。
-      if (view !== undefined && view.status === 'cancelled') return 'ended'
-      const events = (this.ctx as any).sessions?.get?.(sessionId)?.events as Array<{ type?: string }> | undefined
+      if (view.status === 'cancelled') return 'ended'
+      const events = (this.ctx as any).sessions?.get?.(sessionId)?.events as Array<{ type?: string; data?: unknown }> | undefined
       const count = events?.length ?? 0
-      // 回合是否仍开着：最后一个 turn/start|turn/end 事件决定。
-      let turnOpen = false
-      let assistant = 0
-      if (events !== undefined) {
-        for (let i = events.length - 1; i >= 0; i -= 1) {
-          const type = events[i]!.type
-          if (type === 'turn/start') { turnOpen = true; break }
-          if (type === 'turn/end') break
-        }
-        assistant = events.filter((event) => event.type === 'assistant/message').length
-        // 进度卡"当前动作"：扫最近一条 assistant/message 里的最后一个工具调用。
-        if (view !== undefined && events.length !== lastCount) {
-          const action = latestToolAction(events)
-          if (action !== undefined) view.currentAction = action
-        }
+      const turn = scanTurnState(events ?? [])
+      // 进度卡"当前动作"：扫最近一条 assistant/message 里的最后一个工具调用。
+      if (events !== undefined && count !== lastCount) {
+        const action = latestToolAction(events)
+        if (action !== undefined) view.currentAction = action
       }
-      if (count !== lastCount || turnOpen) {
-        // 回合开着 = 模型仍在生成/执行工具，事件未增长也算活跃。
+      // 活性 = 事件增长 / 回合开着 / 进程内工具写入（边沿触发，消费后清零）。
+      if (count !== lastCount || turn.open || state.lastToolAt > 0) {
         lastCount = count
-        lastProgressAt = Date.now()
+        state.lastActivityAt = Date.now()
+        state.lastToolAt = 0
       }
-      if (!turnOpen && assistant > 0 && Date.now() - lastProgressAt > 2500) return 'ended'
-      if (Date.now() - lastProgressAt > silenceLimitMs) return 'timeout'
+      if (!turn.open && turn.endReason !== undefined) {
+        if (turn.endReason !== 'completed') return 'ended-error'
+        if (Date.now() - state.lastActivityAt > 2500) return 'ended'
+      }
       await new Promise((resolve) => setTimeout(resolve, 400))
     }
     return 'timeout'
@@ -870,6 +954,22 @@ function verdictLabel(verdict: Exclude<FixOutcome['verdict'], '' | undefined>): 
   if (verdict === 'duplicate') return '重复'
   if (verdict === 'obsolete') return '功能已移除/需求已变更'
   return '此前已修复'
+}
+
+/** 回合状态扫描（纯函数，可单测）：从事件流反推回合开闭与结束原因。
+ * open=true → 最后一个 turn 事件是 turn/start（宿主仍在跑模型/工具，回合权威地"活着"）；
+ * endReason → 最后一个 turn 事件若是 turn/end，其 reason.kind（completed/error/aborted…）；
+ * 两者都空 → 尚无任何 turn 事件（起步/宿主尚未落盘，视作未开始只受 deadline 约束）。 */
+export function scanTurnState(events: Array<{ type?: string; data?: unknown }>): { open: boolean; endReason?: string } {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const type = events[i]!.type
+    if (type === 'turn/start') return { open: true }
+    if (type === 'turn/end') {
+      const reason = (events[i]!.data as { reason?: { kind?: string } } | undefined)?.reason?.kind
+      return { open: false, endReason: reason ?? 'unknown' }
+    }
+  }
+  return { open: false }
 }
 
 /** 从事件流提取最近一次工具调用的人类可读描述（进度卡"当前动作"数据源）。 */

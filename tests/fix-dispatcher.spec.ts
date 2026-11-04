@@ -6,13 +6,13 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { FixDispatcher } from '../src/runtime/fix-dispatcher.ts'
+import { FixDispatcher, scanTurnState, FIX_MAX_PROBES, FIX_MAX_RESUMES } from '../src/runtime/fix-dispatcher.ts'
 import { ProjectControlService } from '../src/plugin/service.ts'
 import { ProjectService } from '../src/domain/project.ts'
 import { ReviewIssueManager } from '../src/verification/issues.ts'
 import { GitAdapter } from '../src/git/adapter.ts'
 
-type Behavior = (worktree: string, attempt: number, tools: Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>) => void
+type Behavior = (worktree: string, attempt: number, tools: Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>, events: Array<Record<string, unknown>>) => void
 
 const finishTool = (tools: Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>, args: { summary: string; changedFiles?: string[]; blocked?: string; verdict?: string; approach?: string; files?: string[]; impact?: string; benefit?: string; risk?: string }): void => {
   void tools.get('project_control_fix_complete')!.execute(args, { concludeTurn: () => {} })
@@ -43,6 +43,8 @@ async function waitIdle(dispatcher: FixDispatcher, timeoutMs = 30_000): Promise<
 function makeHarness(opts: { concurrency?: number; stepTimeoutMs?: number; onRunning?: () => void; onRunningEnd?: () => void } = {}) {
   const behaviors = new Map<string, Behavior>()
   const git = new GitAdapter()
+  // 会话事件存储：behavior 可往里推事件（模拟宿主落盘 turn/assistant 事件），供 waitTurn 扫描。
+  const sessionsStore = new Map<string, { events: Array<Record<string, unknown>> }>()
   const ctx: any = {
     agents: {
       create: async (options: { sessionId: string; meta: { cwd: string }; setup: (agentCtx: unknown) => Promise<void> }) => {
@@ -53,13 +55,15 @@ function makeHarness(opts: { concurrency?: number; stepTimeoutMs?: number; onRun
         const parts = options.sessionId.split('-')
         const issueId = parts.slice(2, -2).join('-')
         const attempt = Number(parts.at(-2))
+        const entry = { events: [] as Array<Record<string, unknown>> }
+        sessionsStore.set(options.sessionId, entry)
         return {
           agent: {
             session: { id: options.sessionId },
             followup: () => {
               opts.onRunning?.()
               try {
-                behaviors.get(issueId)?.(options.meta.cwd, attempt, tools)
+                behaviors.get(issueId)?.(options.meta.cwd, attempt, tools, entry.events)
               } finally {
                 opts.onRunningEnd?.()
               }
@@ -69,7 +73,7 @@ function makeHarness(opts: { concurrency?: number; stepTimeoutMs?: number; onRun
         }
       },
     },
-    sessions: { get: () => undefined },
+    sessions: { get: (id: string) => sessionsStore.get(id) },
     workspaceRegistry: { list: () => [] },
     get: () => undefined,
     logger: { warn: () => {}, info: () => {} },
@@ -397,31 +401,80 @@ describe('FixDispatcher', () => {
     expect(existsSync(join(root, '.worktrees'))).toBe(false)
   }, 40_000)
 
-  it('异常中断（超时/额度耗尽模拟）：半成品改动丢弃，不合并不提交，问题保持待处理', async () => {
-    const { ctx, service, git, behaviors } = makeHarness({ stepTimeoutMs: 2_500 })
+  it('停摆（探活零响应）：自动重派一次后 failed，半成品丢弃、主仓零提交、问题保持待处理', async () => {
+    const { ctx, service, git, behaviors } = makeHarness({ stepTimeoutMs: 2_000 })
     const { project, mkIssue } = await setupProject(service, git)
-    const issue = await mkIssue('修到一半断了')
+    const issue = await mkIssue('彻底停摆')
     const headBefore = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD']).toString().trim()
     behaviors.set(issue.id, (_worktree, _attempt, tools) => {
-      // 写了部分文件后"死掉"：不调完成工具，回合此后再无任何产出（模拟额度耗尽/模型故障）。
+      // 写了部分文件后彻底死掉：不调完成工具、不落任何事件（探活零响应）。
       void tools.get('project_control_apply_fix')!.execute({ path: 'partial.js', content: 'half-done\n' }, {})
+    })
+    const dispatcher = new FixDispatcher(ctx, service, git)
+    dispatcher.dispatch({ id: project.id, name: project.name, rootPath: root }, [{ issueId: issue.id, title: issue.title, evidence: '' }])
+    await waitIdle(dispatcher, 60_000)
+    const view = dispatcher.status()[0]!
+    expect(view.status).toBe('failed')
+    expect(view.attempt).toBe(2)
+    expect(view.error).toContain('零响应')
+    expect(view.probes).toBe(FIX_MAX_PROBES)
+    expect(view.commit).toBeUndefined()
+    expect(existsSync(join(root, 'partial.js'))).toBe(false)
+    expect(existsSync(join(root, '.worktrees'))).toBe(false)
+    expect(execFileSync('git', ['-C', root, 'rev-parse', 'HEAD']).toString().trim()).toBe(headBefore)
+    const record = service.store.issues.get(issue.id as never)
+    expect(record?.status).toBe('open')
+    expect(record?.description).toContain('异常中断')
+  }, 90_000)
+
+  it('模型报错续跑接续：回合 error 收场 → followup 续跑 → 无损完成合并', async () => {
+    const { ctx, service, git, behaviors } = makeHarness()
+    const { project, mkIssue } = await setupProject(service, git)
+    const issue = await mkIssue('抖动后能修')
+    let calls = 0
+    behaviors.set(issue.id, (worktree, _attempt, tools, events) => {
+      calls += 1
+      if (calls === 1) {
+        // 模拟模型请求报错：回合以 error 收场，无任何产出（上下文保留在会话里）。
+        events.push({ type: 'turn/start', data: { turn: 1 } })
+        events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'error' } } })
+      } else if (calls === 2) {
+        // 续跑 followup 到达：模型恢复，直接完成（不再产生新回合事件，完成工具即产出）。
+        writeFileSync(join(worktree, 'fix.txt'), 'ok\n')
+        events.push({ type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+        finishTool(tools, { summary: '续跑后修复完成', changedFiles: ['fix.txt'] })
+      }
+      // calls>=3（不应发生）：置空挂起，靠断言暴露。
     })
     const dispatcher = new FixDispatcher(ctx, service, git)
     dispatcher.dispatch({ id: project.id, name: project.name, rootPath: root }, [{ issueId: issue.id, title: issue.title, evidence: '' }])
     await waitIdle(dispatcher)
     const view = dispatcher.status()[0]!
-    expect(view.status).toBe('failed')
-    expect(view.error).toContain('异常中断')
-    expect(view.commit).toBeUndefined()
-    // 半成品绝不进主仓；worktree 连同半成品一并清理。
-    expect(existsSync(join(root, 'partial.js'))).toBe(false)
+    expect(view.status).toBe('done')
+    expect(view.resumes).toBe(1)
+    expect(view.attempt).toBe(1)
+    expect(view.commit).toBeDefined()
+    expect(service.store.issues.get(issue.id as never)?.status).toBe('resolved')
     expect(existsSync(join(root, '.worktrees'))).toBe(false)
-    expect(execFileSync('git', ['-C', root, 'rev-parse', 'HEAD']).toString().trim()).toBe(headBefore)
-    // 问题不丢：回写保持待处理并注明中断。
-    const record = service.store.issues.get(issue.id as never)
-    expect(record?.status).toBe('open')
-    expect(record?.description).toContain('异常中断')
   }, 40_000)
+
+  it('scanTurnState 纯函数：起步无事件/回合开/completed/error/unknown 各归其位', () => {
+    expect(scanTurnState([])).toEqual({ open: false })
+    expect(scanTurnState([{ type: 'turn/start', data: {} }])).toEqual({ open: true })
+    expect(scanTurnState([
+      { type: 'turn/start', data: {} },
+      { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    ])).toEqual({ open: false, endReason: 'completed' })
+    expect(scanTurnState([
+      { type: 'turn/start', data: {} },
+      { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+      { type: 'turn/start', data: {} },
+    ])).toEqual({ open: true })
+    expect(scanTurnState([
+      { type: 'turn/end', data: { reason: { kind: 'error' } } },
+    ])).toEqual({ open: false, endReason: 'error' })
+    expect(scanTurnState([{ type: 'turn/end', data: {} }])).toEqual({ open: false, endReason: 'unknown' })
+  })
 
   it('启动恢复：dispatched 方案复位待评审 + 主仓 cherry-pick 冲突残留中止', async () => {
     const { ctx, service, git } = makeHarness()
