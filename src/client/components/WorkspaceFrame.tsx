@@ -596,6 +596,7 @@ export const WORKSPACE_DICT = {
     'review.triageStop': '停止',
     'review.triageDone': '分诊完成：关闭 重复 {a} · 过时 {b} · 不存在 {c}；保留 {d} 条待处理',
     'review.triageStopped': '分诊已停止（已判定的不会重复消耗，可再次点击继续）',
+    'review.triageNothing': '当前会话定位到的项目没有待分诊的待处理问题（若与列表不符，请确认左侧打开的会话属于该项目）',
     'review.triageParseFail': '；有一批输出解析失败已按保留处理，可重试',
     'review.handledDone': '已把 {n} 条问题标记为已处理',
     'fix.plan': '修复方案',
@@ -922,6 +923,7 @@ export const WORKSPACE_DICT = {
     'review.triageStop': 'Stop',
     'review.triageDone': 'Triage done: closed {a} duplicate · {b} obsolete · {c} non-issues; {d} pending kept',
     'review.triageStopped': 'Triage stopped (judged items are not re-billed; click again to continue)',
+    'review.triageNothing': 'No pending issues to triage for the project this session resolves to (if this looks wrong, check the open session belongs to that project)',
     'review.triageParseFail': '; one batch failed to parse and was kept as-is, retryable',
     'review.handledDone': '{n} issues marked as handled',
     'fix.plan': 'Fix plan',
@@ -1979,7 +1981,8 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
    * 判定即时关闭、可停止可续跑（服务端 seen 记忆防重复消耗）。 */
   const runTriage = async (): Promise<void> => {
     batchStopRef.current = false
-    setTriageState({ processed: 0, remaining: 0 })
+    // remaining=-1 = 尚未拿到首批响应（显示 … 而不是误导性的 0）。
+    setTriageState({ processed: 0, remaining: -1 })
     const closed = { duplicate: 0, obsolete: 0, false_positive: 0 }
     let kept = 0
     let processed = 0
@@ -1997,7 +2000,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       first = false
       if (!outcome.ok) { setActionResult('✗ ' + String(outcome.data['error'] ?? 'error')); break }
       const data = outcome.data
-      if (data['done'] === true) break
+      // 先累加再判 done：最后一批（done:true 且 processed>0）的计数不能丢。
       const batchClosed = (data['closed'] ?? {}) as Record<string, number>
       closed.duplicate += Number(batchClosed['duplicate'] ?? 0)
       closed.obsolete += Number(batchClosed['obsolete'] ?? 0)
@@ -2005,12 +2008,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       kept += Number(data['kept'] ?? 0)
       processed += Number(data['processed'] ?? 0)
       if (data['parseFailed'] === true) parseFailed = true
+      if (data['done'] === true) break
       setTriageState({ processed, remaining: Number(data['remaining'] ?? 0) })
     }
     setTriageState(null)
     await loadIssues()
     if (stopped) setActionResult('⏹ ' + t('review.triageStopped'))
-    else if (processed > 0) {
+    else if (processed === 0) {
+      // 首轮即 done 且零处理：当前会话定位到的项目没有待分诊问题——若与列表不符，多半是会话不属于该项目。
+      setActionResult('✗ ' + t('review.triageNothing'))
+    } else {
       setActionResult('✓ ' + t('review.triageDone')
         .replace('{a}', String(closed.duplicate)).replace('{b}', String(closed.obsolete)).replace('{c}', String(closed.false_positive)).replace('{d}', String(kept))
         + (parseFailed ? t('review.triageParseFail') : ''))
@@ -3899,7 +3906,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   ) : triageState !== null ? (
                     <>
                       <span style={{ color: themeAwareText('#d97706') }}>
-                        ⏳ {t('review.triageProgress').replace('{n}', String(triageState.processed)).replace('{m}', String(triageState.remaining))}
+                        ⏳ {t('review.triageProgress').replace('{n}', String(triageState.processed)).replace('{m}', triageState.remaining >= 0 ? String(triageState.remaining) : '…')}
                       </span>
                       <span style={{ flex: 1 }} />
                       <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { batchStopRef.current = true }}>{t('review.triageStop')}</button>
