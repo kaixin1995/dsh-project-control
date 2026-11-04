@@ -601,6 +601,11 @@ export const WORKSPACE_DICT = {
     'review.triageStopped': '分诊已停止（已判定的不会重复消耗，可再次点击继续）',
     'review.triageNothing': '当前会话定位到的项目没有待分诊的待处理问题（若与列表不符，请确认左侧打开的会话属于该项目）',
     'review.triageParseFail': '；有一批输出解析失败已按保留处理，可重试',
+    'review.purgeOpen': '🗑 清空未解决',
+    'review.purgeOpenHint': '把当前筛选下全部未解决问题一键置为已处理（不修任何代码）；保留期后自动物理清理',
+    'review.purgeOpenConfirmTitle': '清空全部未解决问题？',
+    'review.purgeOpenConfirmMsg': '将把 {n} 条未解决问题全部置为「已处理」——不会修改任何代码，仅关闭清单条目。已解决/已拒绝的问题不受影响。此操作不可一键撤销，但每条可单独在卡片里改回「待处理」。',
+    'review.purgeOpenDone': '已清空 {n} 条未解决问题（置为已处理）',
     'review.handledDone': '已把 {n} 条问题标记为已处理',
     'fix.plan': '修复方案',
     'fix.planApproach': '方案',
@@ -931,6 +936,11 @@ export const WORKSPACE_DICT = {
     'review.triageStopped': 'Triage stopped (judged items are not re-billed; click again to continue)',
     'review.triageNothing': 'No pending issues to triage for the project this session resolves to (if this looks wrong, check the open session belongs to that project)',
     'review.triageParseFail': '; one batch failed to parse and was kept as-is, retryable',
+    'review.purgeOpen': '🗑 Purge pending',
+    'review.purgeOpenHint': 'Mark every pending issue under the current filter as handled in one shot (no code changes); auto-purged after the retention window',
+    'review.purgeOpenConfirmTitle': 'Purge all pending issues?',
+    'review.purgeOpenConfirmMsg': 'Will mark {n} pending issues as "handled" — no code is modified, only the list entries are closed. Resolved/rejected issues are untouched. Not one-click undoable, but each issue can be set back to pending on its card.',
+    'review.purgeOpenDone': '已清空 {n} 条未解决问题（置为已处理）',
     'review.handledDone': '{n} issues marked as handled',
     'fix.plan': 'Fix plan',
     'fix.planApproach': 'Approach',
@@ -1943,6 +1953,25 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     anchor.click()
     URL.revokeObjectURL(url)
     setActionResult('✓ ' + t('notes.exportDone'))
+  }
+
+  /** 一键清空未解决问题：服务端原子置 accepted（不修代码）；红色危险弹窗确认。 */
+  const purgeOpenIssues = async (): Promise<void> => {
+    const openCount = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+    if (openCount === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+    setConfirmDialog({
+      title: t('review.purgeOpenConfirmTitle'),
+      message: t('review.purgeOpenConfirmMsg').replace('{n}', String(openCount)),
+      danger: true,
+      confirmLabel: t('review.purgeOpen'),
+      onConfirm: async () => {
+        const { ok, data } = await post('/project-control/api/issues/purge-open', { sessionId: props.sessionId ?? '' })
+        await loadIssues()
+        setActionResult(ok
+          ? '✓ ' + t('review.purgeOpenDone').replace('{n}', String(data['purged'] ?? 0))
+          : '✗ ' + String(data['error'] ?? 'error'))
+      },
+    })
   }
 
   /** 批量标记已处理（accepted）：人工确认无需逐条复检时直接结案。 */
@@ -3821,6 +3850,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     })
                   }}
                 >{t('review.triage')}</button>
+                <button style={{ ...styles.secondary, color: themeAwareText('#d1242f') }} title={t('review.purgeOpenHint')} onClick={() => { void purgeOpenIssues() }}>{t('review.purgeOpen')}</button>
                 {(() => {
                   // 派发对象：勾选的待处理问题优先；未勾选 = 当前筛选下全部待处理（常驻入口，不再藏）。
                   const openVisible = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')

@@ -2796,6 +2796,42 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           return
         }
+        // 一键清空未解决问题（业主 2026-11-04）：仅当前项目的 open/fixing → accepted
+        // （人工确认无需处理，保留期后自动物理清理）；已关闭项（resolved/rejected/accepted）不动。
+        if (req.method === 'POST' && routePath === '/issues/purge-open') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const project = await adoptProject(service, await readJsonBody(req))
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            const open = service.store.issues.list(
+              (issue) => issue.projectId === project.id && (issue.status === 'open' || issue.status === 'fixing'),
+            )
+            const now = Date.now()
+            let purged = 0
+            for (const issue of open) {
+              issue.status = 'accepted'
+              issue.updatedAt = now
+              await service.store.issues.save(issue)
+              purged += 1
+            }
+            // 清空后分诊的送审记忆一并作废（旧记录已 accepted，记忆失去意义）。
+            service.triageSeen.clear()
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, purged }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
         // 问题复检：对一组未解决问题重跑检测（修复确认 + 最优性/最小侵入 + 新问题扫描）。
         // 只有复检判定 FIXED 才置 resolved；人工不直接标记解决状态。
         if (req.method === 'POST' && routePath === '/issues/verify') {
