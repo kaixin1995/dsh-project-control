@@ -151,6 +151,12 @@ interface FixTaskEntry {
   files?: string[]
   commit?: string
   error?: string
+  /** 运行中子代理的最近动作（读/写哪个文件）。 */
+  currentAction?: string
+  /** 完成后的影响摘要（直派任务自动计算）。 */
+  impact?: { riskLevel: string; riskScore: number; direct: string[]; indirect: string[]; potential: string[] }
+  /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
+  mode?: 'fix' | 'plan'
 }
 
 /** 修复差异的行级着色渲染：+ 绿、- 红、文件头加粗、其余弱化。 */
@@ -582,24 +588,21 @@ export const WORKSPACE_DICT = {
     'review.batchProgress': '批量复检中 {i}/{n}',
     'review.batchDone': '批量复检完成：解决 {a} 条 · 仍待处理 {b} 条 · 新问题 {c} 条 · 失败 {d} 个目标',
     'review.batchStopped': '批量复检已停止',
-    'review.sendChat': '转聊天复验',
-    'review.sendChatHint': '把当前筛选下的待处理问题（最多 30 条）发送到聊天窗口，由模型从整体角度复验是否属实（误报/重复/已被修复）',
-    'review.sendChatConfirmTitle': '转聊天复验——选择模式',
-    'review.sendChatConfirmMsg': '将把 {n} 条待处理问题发送到当前聊天窗口（消耗模型用量）。直接修复：判定+修复+回写全自动。先出方案：误报/重复/已过时自动关闭；真实问题不修代码，逐条给出修复方案/影响范围/收益，等你在聊天里评审批准后才修。',
-    'review.sendChatAuto': '⚡ 直接修复',
-    'review.sendChatPlan': '📋 先出方案',
-    'review.sendChatEmpty': '没有待处理问题可发送',
-    'review.sendChatNoSession': '请先在左侧打开该项目下的会话，再转聊天复验',
-    'review.sendChatDone': '已发送 {n} 条问题到聊天窗口，模型将开始逐条复验。',
     'review.handledDone': '已把 {n} 条问题标记为已处理',
     'fix.plan': '修复方案',
     'fix.planApproach': '方案',
     'fix.planImpact': '影响范围',
     'fix.planBenefit': '收益',
     'fix.planRisk': '风险',
-    'fix.dispatch': '🚀 派发修复',
-    'fix.dispatchHint': '把待评审方案全部派发给子 Agent 并发修复（每任务独立 worktree，合并冲突自动基于最新代码重做）',
-    'fix.dispatchDirect': '派发选中（无方案自主修）',
+    'fix.dispatch': '派发修复',
+    'fix.dispatchHintMain': '把勾选的待处理问题（未勾选=当前筛选下全部）派发给子 Agent 并发处理：直接修复=三道闸判定+修复+回写+提交全自动；先出方案=只读分析产出结构化方案，批准后再派发执行',
+    'fix.dispatchModeTitle': '派发修复——选择模式',
+    'fix.dispatchModeMsg': '将派发 {n} 条待处理问题给子 Agent 并发处理（每任务独立 worktree，消耗模型用量，不占用聊天窗口）。⚡ 直接修复：三道闸判定 + 修复 + 回写 + 提交全自动，误报/重复/过时会自动关闭。📋 先出方案：只读分析产出结构化方案，不改任何代码；你在问题卡的方案块批准后点「派发待审方案」执行。',
+    'fix.dispatchAuto': '⚡ 直接修复',
+    'fix.dispatchPlan': '📋 先出方案',
+    'fix.dispatchNoOpen': '当前筛选下没有待处理问题可派发',
+    'fix.dispatchPlans': '派发待审方案',
+    'fix.dispatchPlansHint': '把已产出的待评审方案派发给子 Agent 并发执行修复（每任务独立 worktree，合并冲突自动基于最新代码重做）',
     'fix.dispatchDone': '已派发 {n} 个修复任务（并发 {c}）',
     'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案产出）',
     'fix.status': '修复执行',
@@ -902,26 +905,23 @@ export const WORKSPACE_DICT = {
     'review.batchProgress': 'Batch verifying {i}/{n}',
     'review.batchDone': 'Batch verify done: {a} resolved · {b} still open · {c} new · {d} failed targets',
     'review.batchStopped': 'Batch verify stopped',
-    'review.sendChat': 'Send to chat',
-    'review.sendChatHint': 'Send pending issues under the current filter (max 30) to the chat window for holistic re-verification (false positive / duplicate / already fixed)',
-    'review.sendChatConfirmTitle': 'Send to chat — pick a mode',
-    'review.sendChatConfirmMsg': 'Will send {n} pending issues to the current chat window (consumes model usage). Auto fix: verify + fix + write-back, fully automatic. Plan first: false positives/duplicates/obsolete are auto-closed; real issues are NOT fixed — you get per-issue plans (approach / impact / benefit) and the model fixes only after you approve in chat.',
-    'review.sendChatAuto': '⚡ Auto fix',
-    'review.sendChatPlan': '📋 Plan first',
-    'review.sendChatEmpty': 'No pending issues to send',
-    'review.sendChatNoSession': 'Open a session of this project on the left before sending to chat',
-    'review.sendChatDone': 'Sent {n} issues to chat; the model will verify them one by one.',
     'review.handledDone': '{n} issues marked as handled',
-    'fix.plan': '修复方案',
-    'fix.planApproach': '方案',
-    'fix.planImpact': '影响范围',
-    'fix.planBenefit': '收益',
-    'fix.planRisk': '风险',
-    'fix.dispatch': '🚀 派发修复',
-    'fix.dispatchHint': '把已批准的待评审方案派发给子 Agent 并发修复（每任务独立 worktree，合并冲突自动重做）',
-    'fix.dispatchDirect': '派发选中（无方案自主修）',
+    'fix.plan': 'Fix plan',
+    'fix.planApproach': 'Approach',
+    'fix.planImpact': 'Impact',
+    'fix.planBenefit': 'Benefit',
+    'fix.planRisk': 'Risk',
+    'fix.dispatch': 'Dispatch fixes',
+    'fix.dispatchHintMain': 'Dispatch the checked pending issues (unchecked = all under the current filter) to concurrent sub-agents: auto fix = three-gate verify + fix + write-back + commit; plan first = read-only structured plans awaiting your approval',
+    'fix.dispatchModeTitle': 'Dispatch fixes — pick a mode',
+    'fix.dispatchModeMsg': 'Will dispatch {n} pending issues to concurrent sub-agents (one worktree per task, consumes model usage, does not use the chat window). ⚡ Auto fix: three-gate verify + fix + write-back + commit; false positives/duplicates/obsolete are auto-closed. 📋 Plan first: read-only structured plans, no code changes; approve them on the issue card, then press "Dispatch approved plans".',
+    'fix.dispatchAuto': '⚡ Auto fix',
+    'fix.dispatchPlan': '📋 Plan first',
+    'fix.dispatchNoOpen': 'No pending issues under the current filter to dispatch',
+    'fix.dispatchPlans': 'Dispatch approved plans',
+    'fix.dispatchPlansHint': 'Dispatch the approved pending plans to concurrent sub-agent fixes (one worktree per task; conflicts auto-redo on latest HEAD)',
     'fix.dispatchDone': '已派发 {n} 个修复任务（并发 {c}）',
-    'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案）',
+    'fix.dispatchEmpty': '没有可派发的任务（勾选待处理问题或等待方案产出）',
     'fix.status': '修复执行',
     'fix.stop': '停止',
     'fix.stopDone': '已停止 {n} 个修复任务',
@@ -1830,7 +1830,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
-  // Review 页签实时同步：模型在聊天里回写状态（review_issue_update）后，看板 4 秒内跟上。
+  // Review 页签实时同步：修复子代理回写状态后，看板 4 秒内跟上。
   useEffect(() => {
     if (tab !== 'review') return
     const timer = setInterval(() => { void loadIssues(); void loadFixStatus() }, 4000)
@@ -1850,13 +1850,13 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     }
   }
 
-  /** 派发修复：planIds=批准全部待评审方案；issueIds=勾选的无方案问题（自主判定修复）。 */
-  const dispatchFix = async (planIds: string[], issueIds: string[]): Promise<void> => {
+  /** 派发修复：planIds=批准的待评审方案；issueIds=待处理问题（mode=fix 修复 / plan 只读出方案）。 */
+  const dispatchFix = async (planIds: string[], issueIds: string[], mode: 'fix' | 'plan' = 'fix'): Promise<void> => {
     if (planIds.length === 0 && issueIds.length === 0) {
       setActionResult('✗ ' + t('fix.dispatchEmpty'))
       return
     }
-    const { ok, data } = await post('/project-control/api/fix/dispatch', { planIds, issueIds })
+    const { ok, data } = await post('/project-control/api/fix/dispatch', { planIds, issueIds, mode })
     if (ok) {
       setActionResult('✓ ' + t('fix.dispatchDone').replace('{n}', String(data['accepted'] ?? 0)).replace('{c}', String(data['concurrency'] ?? 3)))
       await loadFixStatus()
@@ -1954,40 +1954,6 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     await loadIssues()
     if (batchStopRef.current) setActionResult('⏹ ' + t('review.batchStopped'))
     else setActionResult('✓ ' + t('review.batchDone').replace('{a}', String(resolvedTotal)).replace('{b}', String(openTotal)).replace('{c}', String(newTotal)).replace('{d}', String(failed)))
-  }
-
-  /** 转聊天复验：把筛选范围内的待处理问题发送到当前会话（followup 唤醒模型整体复验）。 */
-  const sendIssuesToChat = (issues: IssueEntry[]): void => {
-    const ids = issues
-      .filter((issue) => issue.status === 'open' || issue.status === 'fixing')
-      .map((issue) => issue.id)
-    if (ids.length === 0) {
-      setActionResult('✗ ' + t('review.sendChatEmpty'))
-      return
-    }
-    if (props.sessionId === undefined || props.sessionId === '') {
-      setActionResult('✗ ' + t('review.sendChatNoSession'))
-      return
-    }
-    setConfirmDialog({
-      title: t('review.sendChatConfirmTitle'),
-      message: t('review.sendChatConfirmMsg').replace('{n}', String(Math.min(ids.length, 30))),
-      danger: false,
-      confirmLabel: t('review.sendChatAuto'),
-      alt: {
-        label: t('review.sendChatPlan'),
-        onAlt: () => { void sendToChat(ids, 'plan') },
-      },
-      onConfirm: () => { void sendToChat(ids, 'auto') },
-    })
-  }
-
-  /** 实际发送：mode=auto 全自动修复；plan 半手动（误报/重复直接关，真问题只出方案等评审）。 */
-  const sendToChat = async (ids: string[], mode: 'auto' | 'plan'): Promise<void> => {
-    const { ok, data } = await post('/project-control/api/issues/to-chat', { ids, limit: 30, mode })
-    setActionResult(ok
-      ? '✓ ' + t('review.sendChatDone').replace('{n}', String(data['sent'] ?? ''))
-      : '✗ ' + String(data['error'] ?? 'error'))
   }
 
   /**
@@ -3763,24 +3729,39 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   }}
                 >{t('review.selectAll')}</button>
                 <button style={styles.secondary} title={t('review.exportMdHint')} onClick={() => { exportIssuesMd(visible) }}>{t('review.exportMd')}</button>
-                <button style={styles.secondary} title={t('review.sendChatHint')} onClick={() => { sendIssuesToChat(visible) }}>{'💬 ' + t('review.sendChat')}</button>
+                {(() => {
+                  // 派发对象：勾选的待处理问题优先；未勾选 = 当前筛选下全部待处理（常驻入口，不再藏）。
+                  const openVisible = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
+                  const checkedIds = openVisible.filter((issue) => issueChecked[issue.id] === true).map((issue) => issue.id)
+                  const ids = checkedIds.length > 0 ? checkedIds : openVisible.map((issue) => issue.id)
+                  return (
+                    <button
+                      style={{ ...styles.secondary, fontWeight: 600 }}
+                      title={t('fix.dispatchHintMain')}
+                      onClick={() => {
+                        if (ids.length === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+                        setConfirmDialog({
+                          title: t('fix.dispatchModeTitle'),
+                          message: t('fix.dispatchModeMsg').replace('{n}', String(ids.length)),
+                          danger: false,
+                          confirmLabel: t('fix.dispatchAuto'),
+                          alt: { label: t('fix.dispatchPlan'), onAlt: () => { void dispatchFix([], ids, 'plan') } },
+                          onConfirm: () => { void dispatchFix([], ids, 'fix') },
+                        })
+                      }}
+                    >🚀 {t('fix.dispatch')}({String(ids.length)})</button>
+                  )
+                })()}
                 {(() => {
                   const pendingPlans = visible.filter((issue) => issue.fixPlan?.status === 'pending')
                   return pendingPlans.length > 0 ? (
                     <button
-                      style={{ ...styles.secondary, fontWeight: 600 }}
-                      title={t('fix.dispatchHint')}
-                      onClick={() => { setConfirmDialog({ title: t('fix.dispatch'), message: `将派发 ${String(pendingPlans.length)} 个已产出的修复方案给子 Agent 并发执行（独立 worktree，消耗模型用量；完成后自动回写并提交）。`, danger: false, confirmLabel: t('fix.dispatch'), onConfirm: () => { void dispatchFix(pendingPlans.map((issue) => issue.fixPlan!.id), []) } }) }}
-                    >🚀 {t('fix.dispatch')}({String(pendingPlans.length)})</button>
+                      style={styles.secondary}
+                      title={t('fix.dispatchPlansHint')}
+                      onClick={() => { setConfirmDialog({ title: t('fix.dispatchPlans'), message: `将派发 ${String(pendingPlans.length)} 个已产出的修复方案给子 Agent 并发执行（独立 worktree，消耗模型用量；完成后自动回写并提交）。`, danger: false, confirmLabel: t('fix.dispatchPlans'), onConfirm: () => { void dispatchFix(pendingPlans.map((issue) => issue.fixPlan!.id), [], 'fix') } }) }}
+                    >📦 {t('fix.dispatchPlans')}({String(pendingPlans.length)})</button>
                   ) : null
                 })()}
-                {checkedOpen.length > 0 && (
-                  <button
-                    style={styles.secondary}
-                    title={t('fix.dispatchDirect')}
-                    onClick={() => { setConfirmDialog({ title: t('fix.dispatch'), message: `将派发 ${String(checkedOpen.length)} 条勾选的待处理问题（无预置方案，子 Agent 自主判定并修复，独立 worktree，消耗模型用量）。`, danger: false, confirmLabel: t('fix.dispatch'), onConfirm: () => { void dispatchFix([], checkedOpen.map((issue) => issue.id)) } }) }}
-                  >🚀 {t('fix.dispatchDirect')}({String(checkedOpen.length)})</button>
-                )}
                 <button style={styles.secondary} onClick={() => { void loadIssues() }}>{t('review.refresh')}</button>
               </div>
               {fixTasks.length > 0 && (() => {
@@ -3798,11 +3779,25 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     {fixTasks.slice().reverse().map((task) => (
                       <div key={task.issueId} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '6px 4px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
                         <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
-                          {FIX_STATUS_LABELS[task.status] ?? task.status}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
+                          {FIX_STATUS_LABELS[task.status] ?? task.status}{task.mode === 'plan' ? '·方案' : ''}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
                         </span>
                         <span style={{ minWidth: 0, flex: 1 }}>
                           <span style={{ display: 'block', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
+                          {(task.status === 'running' || task.status === 'queued') && task.currentAction !== undefined && (
+                            <span style={{ display: 'block', color: themeAwareText('#d97706'), fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)' }}>▸ {task.currentAction}</span>
+                          )}
                           {task.summary !== undefined && <span style={{ display: 'block', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>{task.summary}</span>}
+                          {task.impact !== undefined && (
+                            <span style={{ display: 'block' }}>
+                              <span style={styles.badge(task.impact.riskLevel === 'low' ? '#4ec9b0' : task.impact.riskLevel === 'medium' ? '#dcdcaa' : '#f14c4c')}>
+                                影响 {task.impact.riskLevel}({String(task.impact.riskScore)})
+                              </span>
+                              <span style={{ color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>
+                                {' '}直接 {String(task.impact.direct.length)} · 间接 {String(task.impact.indirect.length)} · 潜在 {String(task.impact.potential.length)}
+                                {task.impact.indirect.length > 0 ? `（如 ${task.impact.indirect.slice(0, 2).join(', ')}）` : ''}
+                              </span>
+                            </span>
+                          )}
                           {task.error !== undefined && <span style={{ display: 'block', color: themeAwareText('#d1242f') }}>{task.error}</span>}
                           {(task.files ?? []).length > 0 && (
                             <span style={{ display: 'block', fontFamily: 'var(--dsw-alias-font-mono, ui-monospace, monospace)', color: 'var(--dsw-alias-label-secondary, #6b7280)' }}>

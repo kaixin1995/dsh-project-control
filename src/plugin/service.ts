@@ -72,13 +72,6 @@ export class ProjectControlService {
     }
   })()
 
-  /**
-   * 转聊天复验的会话状态（内存态，进程重启即清零——重启后模型必然不在跑，冷却自然解除）：
-   * 会话 → 上次发送时间 / 上次 review_issue_update 回写时间。
-   * to-chat 路由读它做重复发送冷却；回写工具刷新 lastToolAt。
-   */
-  public readonly chatVerifySessions = new Map<string, { lastSentAt: number; lastToolAt: number }>()
-
   /** 修复派发器（子 Agent + worktree 隔离 + cherry-pick 合并）。 */
   public fixDispatcher?: import('../runtime/fix-dispatcher.ts').FixDispatcher
 
@@ -190,7 +183,8 @@ export class ProjectControlService {
       this.ctx?.logger?.warn?.(`project-control: scheduler start failed: ${String(error)}`)
     }
 
-    // 修复派发器的崩溃残留清扫：删除上次进程遗留的 pc-fix-* worktree（失败只记日志）。
+    // 修复派发器的崩溃恢复（业主 2026-11-04 容错要求）：删除上次进程遗留的
+    // pc-fix-* worktree + 中止主仓 cherry-pick 残留 + dispatched 方案复位待评审。
     if (this.fixDispatcher !== undefined) {
       for (const project of this.store.projects.list()) {
         try {
@@ -198,6 +192,12 @@ export class ProjectControlService {
           if (removed > 0) this.ctx?.logger?.info?.(`project-control: cleaned ${removed} orphan fix worktree(s) for ${project.identity.rootPath}`)
         } catch (error: unknown) {
           this.ctx?.logger?.warn?.(`project-control: fix worktree cleanup failed for ${project.identity.rootPath}: ${String(error)}`)
+        }
+        try {
+          const recovered = await this.fixDispatcher.recoverInterrupted({ id: project.id, rootPath: project.identity.rootPath })
+          if (recovered > 0) this.ctx?.logger?.info?.(`project-control: reset ${recovered} interrupted fix plan(s) for ${project.identity.rootPath}`)
+        } catch (error: unknown) {
+          this.ctx?.logger?.warn?.(`project-control: fix interruption recovery failed for ${project.identity.rootPath}: ${String(error)}`)
         }
       }
     }

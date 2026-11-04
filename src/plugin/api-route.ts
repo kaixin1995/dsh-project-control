@@ -14,7 +14,6 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 // v4 会话格式是开放式生产者词表：没有通用 plugin kind（session-format-v3-to-v4
 // 的 source 校验对 kind==='plugin' 直接抛 "requires a producer-owned source
@@ -369,31 +368,6 @@ export function chunkForNarrative(shas: string[], maxPerChunk = 30): string[][] 
     chunks.push(shas.slice(start, start + maxPerChunk))
   }
   return chunks.length > 0 ? chunks : [[]]
-}
-
-// ── 转聊天复验冷却（内存态；进程重启即清零 = 冷却解除）─────────────────────
-/** 发送保护窗口：发送后这时长内默认锁定（覆盖模型判定阶段尚未回写的起步期）。 */
-export const CHAT_VERIFY_SENT_WINDOW_MS = 5 * 60_000
-/** 空闲解锁：最后一次回写之后这时长无新回写，视为停止/完成，允许重发。 */
-export const CHAT_VERIFY_IDLE_MS = 2 * 60_000
-
-/**
- * 重复发送冷却判定：距上次发送 < 发送窗口，且（从未回写 或 距最后回写 < 空闲窗口）。
- * 从未回写时整个发送窗口都锁——防止起步阶段（模型在读代码还没回写）被误放行。
- * @returns 锁定时返回人类可读的拒绝理由，可发送时返回 undefined。
- */
-export function chatVerifyCooldownReason(entry: { lastSentAt: number; lastToolAt: number } | undefined, now = Date.now()): string | undefined {
-  if (entry === undefined) return undefined
-  const sinceSent = now - entry.lastSentAt
-  if (sinceSent >= CHAT_VERIFY_SENT_WINDOW_MS) return undefined
-  if (entry.lastToolAt === 0) {
-    return `上一批 ${Math.round(sinceSent / 60_000)} 分钟前已发出，模型可能仍在处理（尚无回写）。请到聊天窗口查看进度；约 ${Math.ceil((CHAT_VERIFY_SENT_WINDOW_MS - sinceSent) / 60_000)} 分钟后或停止后可重发。`
-  }
-  const sinceTool = now - entry.lastToolAt
-  if (sinceTool < CHAT_VERIFY_IDLE_MS) {
-    return `上一批 ${Math.round(sinceSent / 60_000)} 分钟前已发出，模型仍在处理中（${Math.round(sinceTool / 1000)} 秒前有回写活动）。请到聊天窗口查看进度；停止或完成后约 ${Math.ceil((CHAT_VERIFY_IDLE_MS - sinceTool) / 60_000)} 分钟可重发。`
-  }
-  return undefined
 }
 
 /** 从请求体取出会话 id（工作台按钮都会携带），并反查该会话的工作目录。 */
@@ -2927,135 +2901,6 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
           }
           return
         }
-
-        // 把待处理问题清单发送到聊天窗口：followup 唤醒当前会话模型，从整体角度复验
-        // 这些问题是否真实存在（误报/重复/已被后续提交修复）。只发消息不改任何状态。
-        if (req.method === 'POST' && routePath === '/issues/to-chat') {
-          try {
-            const body = await readJsonBody(req)
-            const sessionId = typeof body['sessionId'] === 'string' ? body['sessionId'] : ''
-            if (sessionId === '') {
-              res.writeHead(400, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ error: 'sessionId is required' }))
-              return
-            }
-            const project = await adoptProject(service, body)
-            if (project === undefined) {
-              res.writeHead(400, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ error: 'no project initialized' }))
-              return
-            }
-            const requestedIds = Array.isArray(body['ids']) ? (body['ids'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
-            const limitRaw = typeof body['limit'] === 'number' ? Math.trunc(body['limit']) : 30
-            const limit = Math.min(60, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 30))
-            const pool = (service.store?.issues.list() ?? [])
-              .filter((issue) => issue.projectId === project.id && (issue.status === 'open' || issue.status === 'fixing'))
-              .filter((issue) => requestedIds.length === 0 || requestedIds.includes(issue.id))
-              .sort((left, right) => left.createdAt - right.createdAt)
-            const severityWeight: Record<string, number> = { blocker: 0, critical: 1, major: 2, minor: 3, info: 4 }
-            const selected = [...pool]
-              .sort((left, right) => (severityWeight[left.severity] ?? 9) - (severityWeight[right.severity] ?? 9))
-              .slice(0, limit)
-            const agent = (ctx as any)?.agents?.get?.(sessionId)
-            if (agent === undefined || typeof agent.followup !== 'function') {
-              res.writeHead(409, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ error: '当前会话没有活跃的对话（请先打开该项目下的会话再试）' }))
-              return
-            }
-            // 重复发送冷却：上一批还在处理（或刚发出）时拒绝，防重复消耗与状态翻动。
-            const cooldown = chatVerifyCooldownReason(service.chatVerifySessions.get(sessionId))
-            if (cooldown !== undefined) {
-              res.writeHead(409, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ error: cooldown }))
-              return
-            }
-            if (selected.length === 0) {
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ ok: false, error: '没有待处理问题可发送', sent: 0 }))
-              return
-            }
-            const lines = selected.map((issue, index) => {
-              const description = issue.description ?? ''
-              const evidence = description.replace(/^证据：/, '').slice(0, 160)
-              const fix = description.match(/建议：([^]*)/)?.[1]?.slice(0, 120) ?? ''
-              const commitTag = issue.changeId.startsWith('review:')
-                ? `提交 ${issue.changeId.slice('review:'.length, 'review:'.length + 8)}`
-                : `变更 ${issue.changeId}`
-              return [
-                `${index + 1}. [id:${issue.id}] [${issue.severity}][${issue.category || 'general'}] ${issue.title}`,
-                `   对象：${commitTag}`,
-                `   证据：${evidence}`,
-                fix === '' ? '' : `   建议：${fix}`,
-              ].filter((line) => line !== '').join('\n')
-            })
-            const mode = body['mode'] === 'plan' ? 'plan' : 'auto'
-            const gateRules = mode === 'auto'
-              ? [
-                  '【判定流程：每条必须依次过三道闸，全部通过才能进入修复】',
-                  '第一闸（存在性）：问题指向的文件/函数/功能在当前代码里还存在吗？用代码搜索/读文件确认。已被删除或重构掉 → verdict=obsolete，note 注明被哪个提交/变更移除，fixFiles 填被移除功能所在的文件。',
-                  '第二闸（意图）：代码还在，但当前行为可能是有意的设计变更（需求转向、行为故意改变）。结合后续提交的提交信息与功能演进判断：若当前行为是有意的 → verdict=obsolete（需求已变更），note 说明依据（哪个提交把行为改成了现在这样、为什么它是故意的）。绝不许把有意的变更当 bug 修回去。',
-                  '第三闸（真实性）：确认在当前版本仍是真实缺陷后，默认动作是【立即修复】——按当前代码结构修（不是按发现时的老结构）。修完 verdict=fixed，note 写修复内容，fixFiles 列出你改的文件。只判定不修复是不可接受的。',
-                ]
-              : [
-                  '【本轮是"方案模式"：绝对禁止修改任何代码/文件。你的产出是判定 + 修复方案，不是修复本身。】',
-                  '判定类结论可以直接回写（这些不改代码，安全）：',
-                  '- 功能/代码已被删除或需求有意变更 → verdict=obsolete，note 注明依据提交；',
-                  '- 已被之前的提交修好 → verdict=already_fixed，note 引用修复提交/文件；',
-                  '- 从来就不是问题 → verdict=false_positive；与其他条重复 → verdict=duplicate。',
-                  '真实存在的问题（过完存在性/意图两闸后仍成立）：',
-                  '- 先调用 review_fix_plan 提交结构化方案（issueId 对应，approach/files/impact/benefit/risk 按方案#N 内容），方案会展示在 Review 面板等开发者批准；',
-                  '- 再调用 review_issue_update 回写 verdict=confirmed，note 写「方案#N 待评审」；',
-                  '- 然后为每一条输出完整修复方案，格式严格如下：',
-                  '  ### 方案#N：<问题标题>',
-                  '  - 问题：以当前代码为准的一句话缺陷描述（引用文件:行号）',
-                  '  - 方案：具体怎么修（改哪个文件、改什么逻辑，步骤化）',
-                  '  - 影响范围：改动会波及的文件/接口/调用方；是否影响公共行为',
-                  '  - 收益：修复后消除的风险/收益',
-                  '  - 风险：修复本身可能引入的问题、回归面',
-                  '- 方案必须基于当前 HEAD 的实际代码（先读过再写方案），不要按老提交的上下文臆测。',
-                  '全部处理完后输出「## 待评审汇总」：可直接关闭清单（已回写）、方案清单编号、建议优先级。然后停下等待开发者批准——开发者会在聊天里逐条批准（如"同意方案#1 #3"），届时再执行修复并回写 fixed。',
-                ]
-            const prompt = [
-              `请从整体角度处理以下 ${selected.length} 条 Review 问题（项目：${project.name}）。`,
-              '重要背景：这些问题是从历史提交的评审中提取的，清单里的"对象：提交 xxx"只是**发现时的基线**——代码库此后可能已经大幅演进。一切判定必须以**当前版本（HEAD）**为准，不要按老提交的视角行事。',
-              '',
-              ...gateRules,
-              '',
-              '其余判定：',
-              '- 已被之前的提交修好 → verdict=already_fixed，note 引用修复提交/文件，fixFiles 填那次修复涉及的文件；',
-              '- 从来就不是问题（证据不成立/逻辑本来正确）→ verdict=false_positive，note 写判定依据；',
-              '- 与清单中另一条重复 → verdict=duplicate，note 指明重复于哪一条；',
-              '- 属实、仍存在、但确实不该由你修 → verdict=confirmed，note 必须写明具体理由（需要产品决策 / 改公共 API 合同 / 需要同步改上游依赖），并给建议方案。修起来麻烦、工作量大都不是理由。',
-              '',
-              '每处理完一条（方案模式含 confirmed 回写），立即调用 review_issue_update（issueId 用清单里的 id），不要只在文字里说。',
-              mode === 'auto'
-                ? '全部处理完后输出「## 汇总」：已修复清单（含改动文件）、此前已修复清单、已过时清单（功能移除/需求变更，含依据）、误报/重复清单、保留待修清单（含原因），以及你发现的新问题（如有）。'
-                : '方案输出完即停，不要动手修复。开发者批准后执行修复时：修复 + review_issue_update(fixed) 完成后，同样按下述提交规则提交改动。',
-              '',
-              '【防丢码：提交规则】本轮只要改动过代码（含批准后的修复），在全部回写完成后必须执行 git 提交：',
-              '1. 只 git add 你本轮修复涉及的文件（与各条 fixFiles 一致），严禁 git add -A / git add .——工作区可能有开发者的其他未提交改动，绝不能卷进来；',
-              '2. 先 git diff --cached 复核暂存内容确实只有你的修复；',
-              '3. git commit，message 格式：`fix(review): batch-resolve N issues via chat re-verify`，正文逐条列出「问题标题 → 一句话修复」；',
-              '4. 不要 push，不要改分支；提交完成后在汇总末尾附上提交哈希。',
-              '若本轮没有任何代码改动（纯判定/方案），跳过提交。',
-              '',
-              '== 问题清单 ==',
-              ...lines,
-            ].join('\n')
-            agent.followup(createUserMessage({
-              content: [{ type: 'text', text: prompt }],
-              source: { kind: 'project-control' },
-            }))
-            // 记录本批发送时刻（lastToolAt 置 0：回写工具会刷新它；从未回写时整个发送窗口锁定）。
-            service.chatVerifySessions.set(sessionId, { lastSentAt: Date.now(), lastToolAt: 0 })
-            res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ ok: true, sent: selected.length }))
-          } catch (error: unknown) {
-            res.writeHead(500, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
-          }
-          return
-        }
         if (req.method === 'GET' && routePath === '/notes') {
           const query: Record<string, unknown> = {}
           for (const [key, value] of url.searchParams.entries()) query[key] = value
@@ -3543,13 +3388,15 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             }
             const planIds = Array.isArray(body['planIds']) ? (body['planIds'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
             const issueIds = Array.isArray(body['issueIds']) ? (body['issueIds'] as unknown[]).filter((id): id is string => typeof id === 'string') : []
+            // issueIds 路径的模式：fix=判定+修复+合并提交（默认）；plan=只读出方案入库待评审。
+            const mode: 'fix' | 'plan' = body['mode'] === 'plan' ? 'plan' : 'fix'
             if (planIds.length === 0 && issueIds.length === 0) {
               res.writeHead(400, { 'content-type': 'application/json' })
               res.end(JSON.stringify({ error: 'planIds or issueIds required' }))
               return
             }
-            const inputs: Array<{ issueId: string; title: string; evidence: string; approach?: string; files?: string[]; planId?: string }> = []
-            // 路径一：批准的方案（plan 模式产出）。
+            const inputs: Array<{ issueId: string; title: string; evidence: string; approach?: string; files?: string[]; planId?: string; mode?: 'fix' | 'plan' }> = []
+            // 路径一：批准的方案（plan 模式产出）→ 固定按 fix 执行（方案就是让它修）。
             for (const planId of planIds) {
               const plan = service.store.fixPlans.get(planId)
               if (plan === undefined || plan.projectId !== project.id || plan.status !== 'pending') continue
@@ -3562,19 +3409,26 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
                 approach: `方案：${plan.approach}\n影响：${plan.impact}\n收益：${plan.benefit}\n风险：${plan.risk}`,
                 files: plan.files,
                 planId: plan.id,
+                mode: 'fix',
               })
               plan.status = 'dispatched'
               plan.updatedAt = Date.now()
               await service.store.fixPlans.save(plan)
             }
-            // 路径二：直接派发的问题（无方案，子代理自主判定+修复）。
+            // 路径二：直接派发的问题（fix=自主判定+修复；plan=只读出方案）。
             for (const issueId of issueIds) {
               const issue = service.store.issues.get(issueId as never)
               if (issue === undefined || issue.projectId !== project.id || (issue.status !== 'open' && issue.status !== 'fixing')) continue
+              // plan 模式跳过已有待评审方案的问题（避免重复产出/覆盖）。
+              if (mode === 'plan') {
+                const hasPending = (service.store.fixPlans.list() ?? []).some((candidate) => candidate.issueId === issue.id && candidate.status === 'pending')
+                if (hasPending) continue
+              }
               inputs.push({
                 issueId: issue.id,
                 title: issue.title,
                 evidence: (issue.description ?? '').replace(/\n\[复[检验][^\]]*\][^\n]*/g, '').slice(0, 400),
+                mode,
               })
             }
             const accepted = service.fixDispatcher.dispatch(

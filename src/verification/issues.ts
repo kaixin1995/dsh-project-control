@@ -95,7 +95,7 @@ export class ReviewIssueManager {
   }
 
   /**
-   * 应用聊天复验结论（转聊天复验闭环的回写端）：
+   * 应用复验结论（修复派发子代理的回写端；聊天复验链路已下线，语义不变）：
    * - false_positive / duplicate / obsolete → rejected（关闭），resolution 记录结论与依据；
    * - fixed → resolved（解决），记录修复说明与涉及文件；
    * - already_fixed → resolved（解决），此前提交已修复，记录历史修复依据；
@@ -115,14 +115,14 @@ export class ReviewIssueManager {
     if (verdict === 'false_positive' || verdict === 'duplicate' || verdict === 'obsolete') {
       const label = verdict === 'false_positive' ? '误报' : verdict === 'duplicate' ? '重复' : '功能已移除/需求已变更'
       issue.status = 'rejected'
-      issue.resolution = `${label}（聊天复验 ${stamp}）：${safeNote}`
+      issue.resolution = `${label}（复验 ${stamp}）：${safeNote}`
     } else if (verdict === 'fixed') {
       issue.status = 'resolved'
-      issue.resolution = `聊天复验修复（${stamp}）：${safeNote}`
+      issue.resolution = `复验修复（${stamp}）：${safeNote}`
       if (fixFiles !== undefined && fixFiles.length > 0) issue.fixFiles = fixFiles
     } else if (verdict === 'already_fixed') {
       issue.status = 'resolved'
-      issue.resolution = `此前已修复（聊天复验 ${stamp}）：${safeNote}`
+      issue.resolution = `此前已修复（复验 ${stamp}）：${safeNote}`
       if (fixFiles !== undefined && fixFiles.length > 0) issue.fixFiles = fixFiles
     } else {
       issue.status = 'open'

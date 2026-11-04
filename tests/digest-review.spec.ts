@@ -1,14 +1,14 @@
 // 批量消化与 Review 批量处理回归：
 // - 已解读标记（commit-detail 成功/缓存命中 → analyzed；LLM 失败不标记）
 // - 叙事分段的纯函数切块
-// - /issues/to-chat 只发当前项目的问题、经 followup 注入聊天、无活跃会话报 409
+// - /fix/dispatch 子 Agent 派发（fix 模式全链 + plan 模式只读出方案）
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { chunkForNarrative, chatVerifyCooldownReason, CHAT_VERIFY_IDLE_MS, CHAT_VERIFY_SENT_WINDOW_MS, registerApiRoute } from '../src/plugin/api-route.ts'
+import { chunkForNarrative, registerApiRoute } from '../src/plugin/api-route.ts'
 import { ProjectControlService } from '../src/plugin/service.ts'
 import { ProjectService } from '../src/domain/project.ts'
 import { safeStorageId } from '../src/store/repository.ts'
@@ -131,7 +131,7 @@ describe('已解读标记', () => {
   })
 })
 
-describe('applyChatVerdict 聊天复验回写', () => {
+describe('applyChatVerdict 复验回写', () => {
   it('四种判定各自落到正确状态：误报/重复→rejected，修复/历史修复→resolved，属实→保持 open 加备注', async () => {
     const { ReviewIssueManager } = await import('../src/verification/issues.ts')
     const manager = new ReviewIssueManager(service.store.issues)
@@ -154,7 +154,7 @@ describe('applyChatVerdict 聊天复验回写', () => {
     const fixedRecord = service.store.issues.get(fixed.id as never)
     expect(fixedRecord?.status).toBe('resolved')
     expect(fixedRecord?.fixFiles).toEqual(['src/a.ts'])
-    expect(fixedRecord?.resolution).toContain('聊天复验修复')
+    expect(fixedRecord?.resolution).toContain('复验修复')
 
     const already = await mk('历史修复项')
     await manager.applyChatVerdict(already.id, 'already_fixed', '提交 abc123 已处理', ['src/b.ts'])
@@ -177,119 +177,34 @@ describe('applyChatVerdict 聊天复验回写', () => {
   })
 })
 
-describe('转聊天复验重复发送冷却', () => {
-  const now = 10_000_000_000
-
-  it('起步锁：发送后未回写，整个发送窗口内拒绝；过期放行', () => {
-    const entry = { lastSentAt: now - 60_000, lastToolAt: 0 }
-    expect(chatVerifyCooldownReason(entry, now)).toContain('尚无回写')
-    expect(chatVerifyCooldownReason({ lastSentAt: now - CHAT_VERIFY_SENT_WINDOW_MS - 1, lastToolAt: 0 }, now)).toBeUndefined()
-  })
-
-  it('活跃锁：最后回写在空闲窗口内拒绝（模型仍在处理）', () => {
-    const entry = { lastSentAt: now - 3 * 60_000, lastToolAt: now - 30_000 }
-    expect(chatVerifyCooldownReason(entry, now)).toContain('回写活动')
-  })
-
-  it('停止/完成解锁：最后回写超过空闲窗口即放行', () => {
-    const entry = { lastSentAt: now - 3 * 60_000, lastToolAt: now - CHAT_VERIFY_IDLE_MS - 1 }
-    expect(chatVerifyCooldownReason(entry, now)).toBeUndefined()
-  })
-
-  it('无记录（重启/新会话）直接放行', () => {
-    expect(chatVerifyCooldownReason(undefined, now)).toBeUndefined()
-  })
-
-  it('端到端：发送后同会话二次发送 409，另一会话不受影响；回写后按空闲窗口解锁', async () => {
-    const { ReviewIssueManager } = await import('../src/verification/issues.ts')
-    const manager = new ReviewIssueManager(service.store.issues)
-    await manager.createIssue({ projectId: projectA as never, changeId: 'review:ffffff' as never, severity: 'minor' as never, category: '测试' as never, title: '冷却问题', description: '证据：x' })
-    await manager.createIssue({ projectId: projectB as never, changeId: 'review:f0f0f0f0' as never, severity: 'minor' as never, category: '测试' as never, title: 'B项目问题', description: '证据：y' })
-    const first = await post('/issues/to-chat', { sessionId: 'session-a' })
-    expect(first.status).toBe(200)
-    const second = await post('/issues/to-chat', { sessionId: 'session-a' })
-    expect(second.status).toBe(409)
-    expect(String(second.data['error'])).toContain('尚无回写')
-    // 另一会话（不同项目）不受冷却影响。
-    const other = await post('/issues/to-chat', { sessionId: 'session-b' })
-    expect(other.status).toBe(200)
-    // 回写刷新活跃时间：空闲窗口外解锁。
-    const entry = service.chatVerifySessions.get('session-a')!
-    entry.lastToolAt = Date.now() - CHAT_VERIFY_IDLE_MS - 1_000
-    const third = await post('/issues/to-chat', { sessionId: 'session-a' })
-    expect(third.status).toBe(200)
-  })
-})
-
-describe('/issues/to-chat 转聊天复验', () => {
-  it('只发送当前项目的待处理问题，并经 followup 注入（source=plugin）', async () => {
-    const { ReviewIssueManager } = await import('../src/verification/issues.ts')
-    const manager = new ReviewIssueManager(service.store.issues)
-    const issueA = await manager.createIssue({ projectId: projectA as never, changeId: 'review:aaaaaaaa' as never, severity: 'minor' as never, category: '正确性' as never, title: '问题A', description: '证据：A' })
-    await manager.createIssue({ projectId: projectB as never, changeId: 'review:bbbbbbbb' as never, severity: 'major' as never, category: '构建' as never, title: '问题B', description: '证据：B' })
-    const outcome = await post('/issues/to-chat', { sessionId: 'session-a' })
-    expect(outcome.status).toBe(200)
-    expect(outcome.data['sent']).toBe(1)
-    expect(followup).toHaveBeenCalledTimes(1)
-    const message = followup.mock.calls[0]![0] as { content: Array<{ text: string }>; source: { kind: string } }
-    // v4 禁用通用 plugin kind（宿主 session-format 校验直接拒绝）；必须用自有生产者 kind。
-    expect(message.source).toEqual({ kind: 'project-control' })
-    expect(message.content[0]!.text).toContain('问题A')
-    expect(message.content[0]!.text).not.toContain('问题B')
-    // 闭环要素：id 回写 + 三道闸（存在性/意图/真实性）+ obsolete 判定 + 修复默认动作。
-    expect(message.content[0]!.text).toContain(`[id:${issueA.id}]`)
-    expect(message.content[0]!.text).toContain('review_issue_update')
-    expect(message.content[0]!.text).toContain('already_fixed')
-    expect(message.content[0]!.text).toContain('obsolete')
-    expect(message.content[0]!.text).toContain('以**当前版本（HEAD）**为准')
-    expect(message.content[0]!.text).toContain('第一闸（存在性）')
-    expect(message.content[0]!.text).toContain('第二闸（意图）')
-    expect(message.content[0]!.text).toContain('立即修复')
-    // 防丢码：auto 模式同样要求修复完成后 git 提交且只 add 修复文件。
-    expect(message.content[0]!.text).toContain('git 提交')
-    expect(message.content[0]!.text).toContain('严禁 git add -A')
-  })
-
-  it('方案模式（plan）：判定类回写照常，真实问题只出方案且禁止改代码', async () => {
-    const { ReviewIssueManager } = await import('../src/verification/issues.ts')
-    const manager = new ReviewIssueManager(service.store.issues)
-    const issue = await manager.createIssue({ projectId: projectA as never, changeId: 'review:eeeeeeee' as never, severity: 'minor' as never, category: '测试' as never, title: '问题E', description: '证据：E' })
-    await post('/issues/to-chat', { sessionId: 'session-a', ids: [issue.id], mode: 'plan' })
-    expect(followup).toHaveBeenCalledTimes(1)
-    const text = (followup.mock.calls[0]![0] as { content: Array<{ text: string }> }).content[0]!.text
-    expect(text).toContain('方案模式')
-    expect(text).toContain('禁止修改任何代码')
-    expect(text).toContain('### 方案#N')
-    expect(text).toContain('影响范围')
-    expect(text).toContain('方案#N 待评审')
-    expect(text).not.toContain('立即修复')
-    // 防丢码：两种模式都必须带"修复后 git 提交（只 add 修复文件）"规则。
-    expect(text).toContain('git 提交')
-    expect(text).toContain('严禁 git add -A')
-  })
-
-  it('/fix 端点：dispatch（issueIds 自主路径）→ status 轮询 → 回写 resolved；model-config 可调并发', async () => {
-    // mock 子代理：在 worktree 写修复文件并调完成工具。
-    const agentCtxs: Array<{ sessionId: string; cwd: string; tools: Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>; issueId: string; attempt: number }> = []
+describe('/fix 子 Agent 派发', () => {
+  /** mock 子代理：fix 模式（注册了 apply_fix）写修复文件；plan 模式只交结构化方案。 */
+  function installAgentMock(): void {
     const baseCtx = service.ctx as any
     baseCtx.agents = baseCtx.agents ?? {}
     baseCtx.agents.create = async (options: { sessionId: string; meta: { cwd: string }; setup: (agentCtx: unknown) => Promise<void> }) => {
       const tools = new Map<string, { execute: (args: unknown, exec: unknown) => Promise<unknown> }>()
       await options.setup({ tools: { register: (tool: { name: string; execute: (args: unknown, exec: unknown) => Promise<unknown> }) => { tools.set(tool.name, tool) } } })
-      const parts = options.sessionId.split('-')
-      const entry = { sessionId: options.sessionId, cwd: options.meta.cwd, tools, issueId: parts.slice(2, -2).join('-'), attempt: Number(parts.at(-2)) }
-      agentCtxs.push(entry)
       return {
         agent: {
           session: { id: options.sessionId },
           followup: () => {
-            writeFileSync(join(entry.cwd, 'fixed.txt'), 'ok\n')
-            void tools.get('project_control_fix_complete')!.execute({ summary: '修了', changedFiles: ['fixed.txt'] }, { concludeTurn: () => {} })
+            if (tools.has('project_control_apply_fix')) {
+              writeFileSync(join(options.meta.cwd, 'fixed.txt'), 'ok\n')
+              void tools.get('project_control_fix_complete')!.execute({ summary: '修了', changedFiles: ['fixed.txt'] }, { concludeTurn: () => {} })
+            } else {
+              // plan 模式：不写任何文件，只交方案。
+              void tools.get('project_control_fix_complete')!.execute({ summary: '确认属实', approach: '把 calc.js 里的减号改成加号', files: ['calc.js'], impact: '仅该函数', benefit: '计算正确', risk: '低' }, { concludeTurn: () => {} })
+            }
           },
         },
         dispose: async () => {},
       }
     }
+  }
+
+  it('/fix 端点：dispatch（issueIds 修复路径）→ status 轮询 → 回写 resolved；model-config 可调并发', async () => {
+    installAgentMock()
     const { ReviewIssueManager } = await import('../src/verification/issues.ts')
     const manager = new ReviewIssueManager(service.store.issues)
     const issue = await manager.createIssue({ projectId: projectA as never, changeId: 'review:fixfix01' as never, severity: 'minor' as never, category: '测试' as never, title: '待派发问题', description: '证据：x' })
@@ -315,19 +230,35 @@ describe('/issues/to-chat 转聊天复验', () => {
     expect((await get('/model-config')).data['fixConcurrency']).toBe(5)
   }, 40_000)
 
-  it('显式 ids 跨项目过滤 + 无活跃会话 409 + 空清单不发送', async () => {
+  it('plan 模式派发：只读出方案入库待评审，问题不关、主仓无新提交；已有待审方案再派会跳过', async () => {
+    installAgentMock()
     const { ReviewIssueManager } = await import('../src/verification/issues.ts')
     const manager = new ReviewIssueManager(service.store.issues)
-    const created = await manager.createIssue({ projectId: projectA as never, changeId: 'review:cccccccc' as never, severity: 'critical' as never, category: '构建' as never, title: '问题C', description: '证据：C' })
-    const cross = await post('/issues/to-chat', { sessionId: 'session-a', ids: [created.id, 'not-in-project'] })
-    expect(cross.data['sent']).toBe(1)
-    // session-c：有项目有问题但无活跃 agent → 409。
-    const noAgent = await post('/issues/to-chat', { sessionId: 'session-c' })
-    expect(noAgent.status).toBe(409)
-    // 空清单走另一会话（session-a 已发送进入冷却，属预期拦截）。
-    const empty = await post('/issues/to-chat', { sessionId: 'session-b', ids: ['missing-id'] })
-    expect(empty.status).toBe(200)
-    expect(empty.data['ok']).toBe(false)
-    expect(followup).toHaveBeenCalledTimes(1)
-  })
+    const issue = await manager.createIssue({ projectId: projectA as never, changeId: 'review:planplan1' as never, severity: 'minor' as never, category: '测试' as never, title: '待出方案问题', description: '证据：x' })
+    const headBefore = execFileSync('git', ['-C', rootA, 'rev-parse', 'HEAD']).toString().trim()
+    const dispatch = await post('/fix/dispatch', { sessionId: 'session-a', issueIds: [issue.id], mode: 'plan' })
+    expect(dispatch.status).toBe(200)
+    expect(dispatch.data['accepted']).toBe(1)
+    let final: any
+    for (let i = 0; i < 100; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      const status = await get('/fix/status?sessionId=session-a')
+      final = status.data['tasks']?.[0]
+      if (final !== undefined && ['done', 'conflict', 'failed', 'cancelled'].includes(final.status)) break
+    }
+    expect(final.status).toBe('done')
+    expect(final.mode).toBe('plan')
+    expect(final.commit).toBeUndefined()
+    // 方案入库待评审；问题保持待处理；主仓零提交。
+    const plans = (service.store.fixPlans.list() ?? []).filter((plan) => (plan as { issueId: string }).issueId === issue.id)
+    expect(plans).toHaveLength(1)
+    expect(plans[0]!.status).toBe('pending')
+    expect(plans[0]!.approach).toContain('加号')
+    expect(service.store.issues.get(issue.id as never)?.status).toBe('open')
+    expect(execFileSync('git', ['-C', rootA, 'rev-parse', 'HEAD']).toString().trim()).toBe(headBefore)
+    // 已有 pending 方案的问题再派 plan 模式 → 服务端跳过（防重复产出）。
+    const again = await post('/fix/dispatch', { sessionId: 'session-a', issueIds: [issue.id], mode: 'plan' })
+    expect(again.status).toBe(200)
+    expect(again.data['accepted']).toBe(0)
+  }, 40_000)
 })

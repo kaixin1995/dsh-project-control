@@ -724,112 +724,6 @@ ${result.references}` }]
     },
   })
 
-  // ── 聊天复验闭环：模型判定/修复后回写 Review 问题状态 ────────────────────
-
-  const reviewIssueUpdateTool = defineTool({
-    name: 'review_issue_update',
-    description: 'Update a Review issue after in-chat verification (the "send issues to chat" loop). Call this for EVERY issue you received, immediately after handling it. Verdicts: fixed after YOU fix the code (default for real, still-present defects); already_fixed when a later commit already fixed it; obsolete when the feature/code was REMOVED or the behavior was deliberately changed by later commits (cite them) — never "fix" an obsolete issue; false_positive or duplicate closes it as rejected; confirmed only when fixing is genuinely not appropriate (state why). The Review board reflects changes in real time.',
-    parameters: {
-      issueId: { type: 'string', required: true, description: 'The issue id from the list you were given (format iss_xxx).' },
-      verdict: { type: 'string', required: true, description: 'One of: fixed | already_fixed | obsolete | false_positive | duplicate | confirmed.' },
-      note: { type: 'string', required: true, description: 'One-sentence evidence for the verdict (what you fixed / which later commit fixed, removed, or repurposed it / why it is a false positive).' },
-      fixFiles: { type: 'array', items: { type: 'string' }, description: 'Files involved: the files YOU changed (verdict=fixed, required), or the files the later fix/Removal touched (already_fixed/obsolete).' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        properties: { issueId: { type: 'string' }, status: { type: 'string' }, title: { type: 'string' } },
-        additionalProperties: false,
-      },
-      render: (_args: unknown, value: unknown) => {
-        const result = value as { issueId: string; status: string; title: string }
-        return [{ type: 'text', text: `Review issue ${result.issueId} → ${result.status}: ${result.title}` }]
-      },
-    },
-    async execute(args: { issueId: string; verdict: string; note: string; fixFiles?: string[] }, exec: ToolRunContext) {
-      const service = control(ctx)
-      const store = requireStore(ctx)
-      const verdicts = ['fixed', 'already_fixed', 'obsolete', 'false_positive', 'duplicate', 'confirmed'] as const
-      if (!verdicts.includes(args.verdict as never)) {
-        throw new Error(`verdict must be one of: ${verdicts.join(' | ')}`)
-      }
-      if (args.verdict === 'fixed' && (args.fixFiles ?? []).length === 0) {
-        throw new Error('verdict=fixed requires fixFiles (the files you changed)')
-      }
-      // 归属校验：只允许操作当前会话项目的问题，杜绝跨项目改状态。
-      const ensured = await service.ensureCurrentProject(workdir(exec))
-      const issue = store.issues.get(args.issueId as never)
-      if (issue === undefined || issue.projectId !== ensured.project.id) {
-        throw new Error(`review issue "${args.issueId}" not found in the current project`)
-      }
-      const manager = new ReviewIssueManager(store.issues)
-      const updated = await manager.applyChatVerdict(
-        args.issueId as never,
-        args.verdict as 'confirmed' | 'fixed' | 'already_fixed' | 'obsolete' | 'false_positive' | 'duplicate',
-        args.note,
-        args.fixFiles,
-      )
-      // 转聊天复验冷却的活跃信号：回写成功即证明模型仍在处理这一批。
-      const verifySessionId = exec.agent?.session?.id
-      if (typeof verifySessionId === 'string' && verifySessionId !== '') {
-        const entry = service.chatVerifySessions.get(verifySessionId)
-        if (entry !== undefined) entry.lastToolAt = Date.now()
-      }
-      return { issueId: updated.id, status: updated.status, title: updated.title }
-    },
-  })
-
-  // ── 修复方案提交（方案模式闭环）：confirmed 问题先落结构化方案，供批准后派发子 Agent ──
-
-  const reviewFixPlanTool = defineTool({
-    name: 'review_fix_plan',
-    description: 'Submit a structured fix plan for a CONFIRMED Review issue (plan mode). Call this BEFORE review_issue_update(confirmed) for every real, still-present issue. The plan is shown on the Review board for the developer to approve; approved plans are dispatched to isolated sub-agents that apply the fix.',
-    parameters: {
-      issueId: { type: 'string', required: true, description: 'The issue id from the list you were given (format iss_xxx).' },
-      approach: { type: 'string', required: true, description: 'How to fix it, step by step, against the CURRENT code (file + what to change).' },
-      files: { type: 'array', items: { type: 'string' }, description: 'Relative paths the fix will touch (best-effort, informational).' },
-      impact: { type: 'string', required: true, description: 'Blast radius: affected files/APIs/callers; any public behavior change.' },
-      benefit: { type: 'string', required: true, description: 'What risk/pain the fix removes.' },
-      risk: { type: 'string', required: true, description: 'What the fix itself could break / regression surface.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        properties: { planId: { type: 'string' } },
-        additionalProperties: false,
-      },
-      render: (_args: unknown, value: unknown) => {
-        const result = value as { planId: string }
-        return [{ type: 'text', text: `Fix plan recorded: ${result.planId} (awaiting developer approval)` }]
-      },
-    },
-    async execute(args: { issueId: string; approach: string; files?: string[]; impact: string; benefit: string; risk: string }, exec: ToolRunContext) {
-      const service = control(ctx)
-      const store = requireStore(ctx)
-      const ensured = await service.ensureCurrentProject(workdir(exec))
-      const issue = store.issues.get(args.issueId as never)
-      if (issue === undefined || issue.projectId !== ensured.project.id) {
-        throw new Error(`review issue "${args.issueId}" not found in the current project`)
-      }
-      const now = Date.now()
-      const plan = {
-        id: `fix_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-        projectId: ensured.project.id,
-        issueId: args.issueId as never,
-        approach: args.approach,
-        files: args.files ?? [],
-        impact: args.impact,
-        benefit: args.benefit,
-        risk: args.risk,
-        status: 'pending' as const,
-        createdAt: now,
-        updatedAt: now,
-      }
-      await store.fixPlans.save(plan)
-      return { planId: plan.id }
-    },
-  })
-
   const tools = [
     createChangeTool,
     listChangesTool,
@@ -839,8 +733,6 @@ ${result.references}` }]
     queryImpactTool,
     runReviewTool,
     runVerificationTool,
-    reviewIssueUpdateTool,
-    reviewFixPlanTool,
     writeAgentNoteTool,
     explainConceptTool,
     summarizeLearningTool,
