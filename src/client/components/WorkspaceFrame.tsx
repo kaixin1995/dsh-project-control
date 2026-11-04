@@ -640,8 +640,8 @@ export const WORKSPACE_DICT = {
     'fix.runtime': '已运行 {n} 分',
     'fix.resumes': '续跑 {n}',
     'fix.probes': '探活 {n}',
-    'fix.modelTitle': '修复并发（子 Agent 池）',
-    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰；修改后立即生效。',
+    'fix.modelTitle': '模型总并发',
+    'fix.modelHint': '全插件共享的模型并发上限（1-10）：修复子 Agent 与解读/分诊/评审等所有 AI 调用共用，占满自动排队。修改后立即生效（重启后保持）。',
 
     'plan.title': '编排计划确认',
     'plan.hint': '每步的角色决定上下文注入与默认模型（分析/操作=fast，开发=standard，规划=reasoning，验收=verifier）；可调整后再启动。',
@@ -975,8 +975,8 @@ export const WORKSPACE_DICT = {
     'fix.runtime': '已运行 {n} 分',
     'fix.resumes': '续跑 {n}',
     'fix.probes': '探活 {n}',
-    'fix.modelTitle': '修复并发（子 Agent 池）',
-    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰。',
+    'fix.modelTitle': '模型总并发',
+    'fix.modelHint': 'Shared plugin-wide model concurrency cap (1-10): fix sub-agents and all one-shot analyses share it; queued when full.',
 
     'plan.title': 'Orchestration plan',
     'plan.hint': 'Each step role drives context injection and the default model (analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier); adjust before launching.',

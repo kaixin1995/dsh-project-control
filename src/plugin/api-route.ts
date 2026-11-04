@@ -2588,6 +2588,8 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             if (typeof body['fixConcurrency'] === 'number' && Number.isFinite(body['fixConcurrency'])) {
               const fixConcurrency = Math.max(1, Math.min(10, Math.trunc(body['fixConcurrency'])))
               service.liveConfig = { ...service.liveConfig, fixConcurrency } as typeof service.liveConfig
+              // 总并发闸门实时生效：调大立即放行等待者，调小后新任务排队到低水位。
+              service.llmGate.updateLimit(fixConcurrency)
               await service.store.pluginSettings.save({ id: 'fix-concurrency', fixConcurrency })
             }
             res.writeHead(200, { 'content-type': 'application/json' })
@@ -3548,6 +3550,7 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             tasks: dispatcher?.status() ?? [],
             concurrency: service.liveConfig.fixConcurrency,
             busy: dispatcher?.isBusy() ?? false,
+            gate: service.llmGate.stats(),
           }))
           return
         }

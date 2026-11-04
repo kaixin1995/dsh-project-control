@@ -323,6 +323,20 @@ export class FixDispatcher {
 
   private async runTask(project: { id: string; name: string; rootPath: string }, task: FixTask): Promise<void> {
     const view = task.view
+    // 全局总并发闸门：占满则排队（状态保持「排队中」直到真正拿到槽）；
+    // 整个任务时长（worktree+子代理+合并）持 1 槽，与解读等一次性分析共享预算。
+    await this.service.llmGate.acquire()
+    try {
+      // 排队等待闸门期间被取消：直接收尾，不再启动。
+      if (task.view.status === 'cancelled') return
+      await this.runTaskGated(project, task)
+    } finally {
+      this.service.llmGate.release()
+    }
+  }
+
+  private async runTaskGated(project: { id: string; name: string; rootPath: string }, task: FixTask): Promise<void> {
+    const view = task.view
     view.status = 'running'
     view.startedAt = Date.now()
     const worktree = await this.createWorktree(project.rootPath, task.issueId)

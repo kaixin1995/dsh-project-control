@@ -10,6 +10,15 @@ import type { Context } from '@deepseek-ai/cordis'
 import { BlockAssembler, createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '../domain/ids.ts'
+import type { LlmGate } from '../runtime/llm-gate.ts'
+
+/** 全局模型并发闸门（模块级，service 启动时注入；未注入则不限流——测试默认路径）。 */
+let globalGate: LlmGate | undefined
+
+/** 注入/替换全局闸门（service 构造与实时调整时调用；传 undefined 清除，测试用）。 */
+export function setLlmGate(gate: LlmGate | undefined): void {
+  globalGate = gate
+}
 
 /** 一次性分析请求。 */
 export interface LlmAnalysisRequest {
@@ -81,6 +90,13 @@ export async function runLlmAnalysis(ctx: Context, req: LlmAnalysisRequest): Pro
   if (!req.provider || !req.model) {
     throw new Error('llm-analyzer: no provider/model route resolved')
   }
+  // 全局总并发：无槽则 FIFO 排队（业主 2026-11-04——并发是全插件共享预算，不是各功能各自的）。
+  if (globalGate !== undefined) return globalGate.run(() => runLlmAnalysisUngated(ctx, req))
+  return runLlmAnalysisUngated(ctx, req)
+}
+
+/** 真正执行一次 LLM 调用（闸门持槽内运行）。 */
+async function runLlmAnalysisUngated(ctx: Context, req: LlmAnalysisRequest): Promise<LlmAnalysisResult> {
   const using = withTimeout(req.timeoutMs)
   try {
     const messages: Message[] = [
