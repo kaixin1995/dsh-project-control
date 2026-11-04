@@ -11,6 +11,8 @@ import { readFileSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { coreDomainSpec, analysisDomainSpec, historyDomainSpec } from '../store/domains.ts'
 import { FixDispatcher } from '../runtime/fix-dispatcher.ts'
+import { LlmGate } from '../runtime/llm-gate.ts'
+import { setLlmGate } from '../analysis/llm-analyzer.ts'
 import { DomainRepository, createInMemoryStore, type ProjectControlStore, type ProjectNoteRecord } from '../store/repository.ts'
 import type {
   ProjectRecord,
@@ -81,8 +83,14 @@ export class ProjectControlService {
    */
   public readonly triageSeen = new Set<string>()
 
+  /** 全局模型并发闸门（总并发；设置页实时调整，子代理与一次性分析共用）。 */
+  public llmGate!: import('../runtime/llm-gate.ts').LlmGate
+
   constructor(public readonly ctx: any, config: ProjectControlConfig = {}) {
     this.liveConfig = resolveFullConfig(config as never)
+    // 全局模型并发闸门（业主 2026-11-04：总并发，子代理与全部一次性分析共用，占满排队）。
+    this.llmGate = new LlmGate(this.liveConfig.fixConcurrency ?? 3)
+    setLlmGate(this.llmGate)
     // 默认初始化内存 Store，保证在无 storageDomain 的环境（如 headless 面或测试环境）下基础操作仍可用
     this.initStore(createInMemoryStore())
   }
@@ -159,6 +167,14 @@ export class ProjectControlService {
         }
       }
       this.liveConfig = { ...this.liveConfig, modelTiers: { ...this.liveConfig.modelTiers, ...clean } } as typeof this.liveConfig
+    }
+
+    // 持久化的总并发恢复（设置页保存过「模型总并发」时优先于配置默认）。
+    const savedConcurrency = this.store.pluginSettings?.get('fix-concurrency') as { fixConcurrency?: number } | undefined
+    if (savedConcurrency !== undefined && Number.isFinite(savedConcurrency.fixConcurrency)) {
+      const restored = Math.max(1, Math.min(10, Math.trunc(savedConcurrency.fixConcurrency ?? 3)))
+      this.liveConfig = { ...this.liveConfig, fixConcurrency: restored } as typeof this.liveConfig
+      this.llmGate.updateLimit(restored)
     }
 
     // 执行系统启动时的未完成任务恢复扫描

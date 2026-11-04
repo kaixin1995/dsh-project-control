@@ -78,6 +78,8 @@ export interface FixTaskView {
   impact?: FixImpactView
   /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
   mode?: 'fix' | 'plan'
+  /** fix 任务且按批准方案执行（进度卡轮次文案「执行·方案#N」用）。 */
+  planExec?: boolean
   /** 模型报错后的续跑次数（followup 接续，上下文无损）。 */
   resumes?: number
   /** 总时限到点后的探活次数。 */
@@ -176,7 +178,14 @@ export class FixDispatcher {
       if (existing !== undefined && !this.isTerminal(existing.view.status)) continue
       const task: FixTask = {
         ...input,
-        view: { issueId: input.issueId, title: input.title, status: 'queued', attempt: existing !== undefined ? existing.view.attempt + 1 : 1, mode: input.mode ?? 'fix' },
+        view: {
+          issueId: input.issueId,
+          title: input.title,
+          status: 'queued',
+          attempt: existing !== undefined ? existing.view.attempt + 1 : 1,
+          mode: input.mode ?? 'fix',
+          planExec: (input.mode ?? 'fix') !== 'plan' && ((input.approach !== undefined && input.approach !== '') || input.planId !== undefined),
+        },
       }
       this.tasks.set(input.issueId, task)
       this.queue.push(task.issueId)
@@ -313,6 +322,20 @@ export class FixDispatcher {
   }
 
   private async runTask(project: { id: string; name: string; rootPath: string }, task: FixTask): Promise<void> {
+    const view = task.view
+    // 全局总并发闸门：占满则排队（状态保持「排队中」直到真正拿到槽）；
+    // 整个任务时长（worktree+子代理+合并）持 1 槽，与解读等一次性分析共享预算。
+    await this.service.llmGate.acquire()
+    try {
+      // 排队等待闸门期间被取消：直接收尾，不再启动。
+      if (task.view.status === 'cancelled') return
+      await this.runTaskGated(project, task)
+    } finally {
+      this.service.llmGate.release()
+    }
+  }
+
+  private async runTaskGated(project: { id: string; name: string; rootPath: string }, task: FixTask): Promise<void> {
     const view = task.view
     view.status = 'running'
     view.startedAt = Date.now()

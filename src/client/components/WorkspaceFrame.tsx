@@ -157,6 +157,8 @@ interface FixTaskEntry {
   impact?: { riskLevel: string; riskScore: number; direct: string[]; indirect: string[]; potential: string[] }
   /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
   mode?: 'fix' | 'plan'
+  /** fix 任务且按批准方案执行（轮次文案「执行·方案#N」）。 */
+  planExec?: boolean
   /** 模型报错续跑次数 / 探活次数（活性状态机透出）。 */
   resumes?: number
   probes?: number
@@ -601,6 +603,11 @@ export const WORKSPACE_DICT = {
     'review.triageStopped': '分诊已停止（已判定的不会重复消耗，可再次点击继续）',
     'review.triageNothing': '当前会话定位到的项目没有待分诊的待处理问题（若与列表不符，请确认左侧打开的会话属于该项目）',
     'review.triageParseFail': '；有一批输出解析失败已按保留处理，可重试',
+    'review.purgeOpen': '🗑 清空未解决',
+    'review.purgeOpenHint': '把当前筛选下全部未解决问题一键置为已处理（不修任何代码）；保留期后自动物理清理',
+    'review.purgeOpenConfirmTitle': '清空全部未解决问题？',
+    'review.purgeOpenConfirmMsg': '将把 {n} 条未解决问题全部置为「已处理」——不会修改任何代码，仅关闭清单条目。已解决/已拒绝的问题不受影响。此操作不可一键撤销，但每条可单独在卡片里改回「待处理」。',
+    'review.purgeOpenDone': '已清空 {n} 条未解决问题（置为已处理）',
     'review.handledDone': '已把 {n} 条问题标记为已处理',
     'fix.plan': '修复方案',
     'fix.planApproach': '方案',
@@ -633,8 +640,8 @@ export const WORKSPACE_DICT = {
     'fix.runtime': '已运行 {n} 分',
     'fix.resumes': '续跑 {n}',
     'fix.probes': '探活 {n}',
-    'fix.modelTitle': '修复并发（子 Agent 池）',
-    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰；修改后立即生效。',
+    'fix.modelTitle': '模型总并发',
+    'fix.modelHint': '全插件共享的模型并发上限（1-10）：修复子 Agent 与解读/分诊/评审等所有 AI 调用共用，占满自动排队。修改后立即生效（重启后保持）。',
 
     'plan.title': '编排计划确认',
     'plan.hint': '每步的角色决定上下文注入与默认模型（分析/操作=fast，开发=standard，规划=reasoning，验收=verifier）；可调整后再启动。',
@@ -931,6 +938,11 @@ export const WORKSPACE_DICT = {
     'review.triageStopped': 'Triage stopped (judged items are not re-billed; click again to continue)',
     'review.triageNothing': 'No pending issues to triage for the project this session resolves to (if this looks wrong, check the open session belongs to that project)',
     'review.triageParseFail': '; one batch failed to parse and was kept as-is, retryable',
+    'review.purgeOpen': '🗑 Purge pending',
+    'review.purgeOpenHint': 'Mark every pending issue under the current filter as handled in one shot (no code changes); auto-purged after the retention window',
+    'review.purgeOpenConfirmTitle': 'Purge all pending issues?',
+    'review.purgeOpenConfirmMsg': 'Will mark {n} pending issues as "handled" — no code is modified, only the list entries are closed. Resolved/rejected issues are untouched. Not one-click undoable, but each issue can be set back to pending on its card.',
+    'review.purgeOpenDone': '已清空 {n} 条未解决问题（置为已处理）',
     'review.handledDone': '{n} issues marked as handled',
     'fix.plan': 'Fix plan',
     'fix.planApproach': 'Approach',
@@ -963,8 +975,8 @@ export const WORKSPACE_DICT = {
     'fix.runtime': '已运行 {n} 分',
     'fix.resumes': '续跑 {n}',
     'fix.probes': '探活 {n}',
-    'fix.modelTitle': '修复并发（子 Agent 池）',
-    'fix.modelHint': '同时执行的修复子 Agent 上限（1-10）。每任务独立 worktree 互不干扰。',
+    'fix.modelTitle': '模型总并发',
+    'fix.modelHint': 'Shared plugin-wide model concurrency cap (1-10): fix sub-agents and all one-shot analyses share it; queued when full.',
 
     'plan.title': 'Orchestration plan',
     'plan.hint': 'Each step role drives context injection and the default model (analysis/ops=fast, coding=standard, planning=reasoning, verification=verifier); adjust before launching.',
@@ -1759,6 +1771,22 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     pumpDetailPool()
   }
 
+  /** 解读失败判定：失败占位的 what 以固定前缀开头（loadDetailOnce 写入）。 */
+  const isFailedAnalysis = (d?: CommitDetailPayload): boolean => d !== undefined && d.analysis.what.startsWith('AI 解读失败')
+
+  /** 批量重试解读失败（业主 2026-11-04：逐条手点效率低）：失败卡片串行强制重新生成，
+   *  走现有并发池；完成数量在操作结果栏汇总。 */
+  const retryFailedDetails = (): void => {
+    const failed = selectedTargets.filter((target) => isFailedAnalysis(details[target]))
+    if (failed.length === 0) { setActionResult('✗ 当前没有解读失败的提交'); return }
+    let done = 0
+    for (const target of failed) {
+      loadDetail(target, true)
+      done += 1
+    }
+    setActionResult('🔁 已对 ' + String(done) + ' 条解读失败的提交发起重新生成（并发池自动调度，完成后卡片自动刷新）')
+  }
+
   /** 队列任务体：真正发起解读请求；任何失败（网络中断/超时/服务未运行）都写入卡片错误占位，绝不无限转圈。 */
   const loadDetailOnce = async (target: string, force: boolean): Promise<void> => {
     setDetailStatus((previous) => ({ ...previous, [target]: 'running' }))
@@ -1943,6 +1971,16 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     anchor.click()
     URL.revokeObjectURL(url)
     setActionResult('✓ ' + t('notes.exportDone'))
+  }
+
+  /** 一键清空未解决问题：服务端原子置 accepted（不修代码）。数量在 JSX 内联计算
+   *  （visible 是页签局部变量，本函数不可引用——曾因此 ReferenceError，2026-11-04）。 */
+  const purgeOpenIssues = async (): Promise<void> => {
+    const { ok, data } = await post('/project-control/api/issues/purge-open', { sessionId: props.sessionId ?? '' })
+    await loadIssues()
+    setActionResult(ok
+      ? '✓ ' + t('review.purgeOpenDone').replace('{n}', String(data['purged'] ?? 0))
+      : '✗ ' + String(data['error'] ?? 'error'))
   }
 
   /** 批量标记已处理（accepted）：人工确认无需逐条复检时直接结案。 */
@@ -2762,6 +2800,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       )}
 
       {/* 每条选中提交的 AI 解读 */}
+      {(() => {
+        // 失败显眼条：有解读失败时顶部红条 + 一键批量重试（业主 2026-11-04）。
+        const failedCount = selectedTargets.filter((target) => isFailedAnalysis(details[target])).length
+        if (failedCount === 0) return null
+        return (
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '8px 12px', marginBottom: '10px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid ' + themeAwareText('#f14c4c'), borderRadius: '6px', fontSize: '12px' }}>
+            <span style={{ color: themeAwareText('#d1242f'), fontWeight: 600 }}>⚠ {String(failedCount)} 条提交解读失败</span>
+            <span style={{ flex: 1 }} />
+            <button style={{ ...styles.secondary, fontWeight: 600 }} onClick={() => { retryFailedDetails() }}>🔁 {t('cache.regenerate')}全部失败</button>
+          </div>
+        )
+      })()}
       {selectedTargets.map((target) => {
         const d = details[target]
         const label = target === 'working' ? t('repo.working') : (d?.commit?.message ?? target.slice(0, 8))
@@ -2769,6 +2819,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           <Card key={`d-${target}`} title={`🔍 ${label}${target !== 'working' ? `（${target.slice(0, 8)}）` : ''}`}>
             {d !== undefined && (
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                {isFailedAnalysis(d) && <span style={styles.badge(themeAwareText('#f14c4c'))}>⚠ 解读失败</span>}
                 {d.analysisCached === true && (
                   <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{d.analysisGeneratedAt ? ' · ' + new Date(d.analysisGeneratedAt).toLocaleString() : ''}</span>
                 )}
@@ -2809,7 +2860,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 {d.analysis.what !== '' && (
                   <>
                     <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('detail.what')}</div>
-                    <div style={styles.what}>{d.analysis.what}</div>
+                    <div style={{ ...styles.what, ...(isFailedAnalysis(d) ? { color: themeAwareText('#d1242f'), fontWeight: 600 } : {}) }}>{d.analysis.what}</div>
                   </>
                 )}
                 {d.analysis.logic.length > 0 && (
@@ -3315,7 +3366,23 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <td style={styles.td}>{formatTime(run.startedAt)}</td>
                   <td style={styles.td}>{run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'}</td>
                   <td style={styles.td}>
-                    <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(run.id) }}>{runDetail?.run.id === run.id ? t('plan.refreshDetail') : t('plan.viewDetail')}</button>
+                    <span style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}>
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(run.id) }}>{runDetail?.run.id === run.id ? t('plan.refreshDetail') : t('plan.viewDetail')}</button>
+                      {/* 同一变更可能挂多条 Run：删除 = 连变更与全部 Run 记录一起删（弹窗注明）。 */}
+                      <button
+                        style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px', color: themeAwareText('#d1242f') }}
+                        onClick={() => {
+                          const changeTitle = changes.find((change) => change.id === run.changeId)?.title ?? run.changeId
+                          const siblingCount = runs.filter((entry) => entry.changeId === run.changeId).length
+                          setConfirmDialog({
+                            title: '删除这条变更任务？',
+                            message: `「${changeTitle}」及其全部执行记录（含本条在内共 ${String(siblingCount)} 条 Run）、计划、问题清单将被永久删除。`,
+                            danger: true,
+                            onConfirm: () => { void runAction('deleteChange', '/project-control/api/changes/delete', { id: run.changeId }) },
+                          })
+                        }}
+                      >✕</button>
+                    </span>
                   </td>
                 </tr>
               ))}
@@ -3821,6 +3888,21 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     })
                   }}
                 >{t('review.triage')}</button>
+                <button
+                  style={{ ...styles.secondary, color: themeAwareText('#d1242f') }}
+                  title={t('review.purgeOpenHint')}
+                  onClick={() => {
+                    const openCount = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+                    if (openCount === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+                    setConfirmDialog({
+                      title: t('review.purgeOpenConfirmTitle'),
+                      message: t('review.purgeOpenConfirmMsg').replace('{n}', String(openCount)),
+                      danger: true,
+                      confirmLabel: t('review.purgeOpen'),
+                      onConfirm: () => { void purgeOpenIssues() },
+                    })
+                  }}
+                >{t('review.purgeOpen')}</button>
                 {(() => {
                   // 派发对象：勾选的待处理问题优先；未勾选 = 当前筛选下全部待处理（常驻入口，不再藏）。
                   const openVisible = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
@@ -3871,7 +3953,17 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     {fixTasks.map((task) => (
                       <div key={task.issueId} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '6px 4px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
                         <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
-                          {FIX_STATUS_LABELS[task.status] ?? task.status}{task.mode === 'plan' ? '·方案' : ''}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
+                          {(() => {
+                            // 轮次语义按任务类型区分（业主 2026-11-04：裸"第 N 次"易误读为重试）：
+                            // plan=出方案；fix+方案（服务端 planExec 标志）=按方案执行；fix 直派/重派=执行·第N次。
+                            const planExec = task.planExec === true
+                            const roundLabel = task.mode === 'plan'
+                              ? (task.attempt > 1 ? `·出方案·第 ${String(task.attempt)} 次` : '·出方案')
+                              : planExec
+                                ? `·执行·方案#${String(task.attempt)}`
+                                : (task.attempt > 1 ? `·执行·第 ${String(task.attempt)} 次` : '')
+                            return `${FIX_STATUS_LABELS[task.status] ?? task.status}${roundLabel}`
+                          })()}
                         </span>
                         {(() => {
                           const active = task.status === 'running' || task.status === 'merging' || task.status === 'redo'

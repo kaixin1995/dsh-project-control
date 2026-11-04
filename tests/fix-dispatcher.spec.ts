@@ -458,6 +458,32 @@ describe('FixDispatcher', () => {
     expect(existsSync(join(root, '.worktrees'))).toBe(false)
   }, 40_000)
 
+  it('总并发闸门：内部并发 3 但闸门压到 1 → 任务仍严格串行（与其他消费方共享预算）', async () => {
+    let running = 0
+    let peak = 0
+    const { ctx, service, git, behaviors } = makeHarness({ concurrency: 3, onRunning: () => { running += 1; peak = Math.max(peak, running) }, onRunningEnd: () => { running -= 1 } })
+    service.llmGate.updateLimit(1)
+    const { project, mkIssue } = await setupProject(service, git)
+    const issueA = await mkIssue('闸门A')
+    const issueB = await mkIssue('闸门B')
+    behaviors.set(issueA.id, (worktree, _attempt, tools) => {
+      writeFileSync(join(worktree, 'a.txt'), 'x\n')
+      finishTool(tools, { summary: 'a', changedFiles: ['a.txt'] })
+    })
+    behaviors.set(issueB.id, (worktree, _attempt, tools) => {
+      writeFileSync(join(worktree, 'b.txt'), 'x\n')
+      finishTool(tools, { summary: 'b', changedFiles: ['b.txt'] })
+    })
+    const dispatcher = new FixDispatcher(ctx, service, git)
+    dispatcher.dispatch({ id: project.id, name: project.name, rootPath: root }, [
+      { issueId: issueA.id, title: issueA.title, evidence: '' },
+      { issueId: issueB.id, title: issueB.title, evidence: '' },
+    ])
+    await waitIdle(dispatcher)
+    expect(dispatcher.status().every((task) => task.status === 'done')).toBe(true)
+    expect(peak).toBe(1)
+  }, 40_000)
+
   it('scanTurnState 纯函数：起步无事件/回合开/completed/error/unknown 各归其位', () => {
     expect(scanTurnState([])).toEqual({ open: false })
     expect(scanTurnState([{ type: 'turn/start', data: {} }])).toEqual({ open: true })
