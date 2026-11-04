@@ -157,6 +157,8 @@ interface FixTaskEntry {
   impact?: { riskLevel: string; riskScore: number; direct: string[]; indirect: string[]; potential: string[] }
   /** 任务模式：fix=修复（默认）；plan=只读出方案。 */
   mode?: 'fix' | 'plan'
+  /** fix 任务且按批准方案执行（轮次文案「执行·方案#N」）。 */
+  planExec?: boolean
   /** 模型报错续跑次数 / 探活次数（活性状态机透出）。 */
   resumes?: number
   probes?: number
@@ -3922,7 +3924,17 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                     {fixTasks.map((task) => (
                       <div key={task.issueId} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '6px 4px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
                         <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
-                          {FIX_STATUS_LABELS[task.status] ?? task.status}{task.mode === 'plan' ? '·方案' : ''}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
+                          {(() => {
+                            // 轮次语义按任务类型区分（业主 2026-11-04：裸"第 N 次"易误读为重试）：
+                            // plan=出方案；fix+方案（服务端 planExec 标志）=按方案执行；fix 直派/重派=执行·第N次。
+                            const planExec = task.planExec === true
+                            const roundLabel = task.mode === 'plan'
+                              ? (task.attempt > 1 ? `·出方案·第 ${String(task.attempt)} 次` : '·出方案')
+                              : planExec
+                                ? `·执行·方案#${String(task.attempt)}`
+                                : (task.attempt > 1 ? `·执行·第 ${String(task.attempt)} 次` : '')
+                            return `${FIX_STATUS_LABELS[task.status] ?? task.status}${roundLabel}`
+                          })()}
                         </span>
                         {(() => {
                           const active = task.status === 'running' || task.status === 'merging' || task.status === 'redo'
