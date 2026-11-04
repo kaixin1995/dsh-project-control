@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-control",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "AI project cognition and development control plugin for DeepSeek Harness",
   "type": "module",
   "engines": {
