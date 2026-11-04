@@ -3335,7 +3335,23 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   <td style={styles.td}>{formatTime(run.startedAt)}</td>
                   <td style={styles.td}>{run.costUsd !== undefined ? '$' + run.costUsd.toFixed(4) : '—'}</td>
                   <td style={styles.td}>
-                    <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(run.id) }}>{runDetail?.run.id === run.id ? t('plan.refreshDetail') : t('plan.viewDetail')}</button>
+                    <span style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}>
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void loadRunDetail(run.id) }}>{runDetail?.run.id === run.id ? t('plan.refreshDetail') : t('plan.viewDetail')}</button>
+                      {/* 同一变更可能挂多条 Run：删除 = 连变更与全部 Run 记录一起删（弹窗注明）。 */}
+                      <button
+                        style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px', color: themeAwareText('#d1242f') }}
+                        onClick={() => {
+                          const changeTitle = changes.find((change) => change.id === run.changeId)?.title ?? run.changeId
+                          const siblingCount = runs.filter((entry) => entry.changeId === run.changeId).length
+                          setConfirmDialog({
+                            title: '删除这条变更任务？',
+                            message: `「${changeTitle}」及其全部执行记录（含本条在内共 ${String(siblingCount)} 条 Run）、计划、问题清单将被永久删除。`,
+                            danger: true,
+                            onConfirm: () => { void runAction('deleteChange', '/project-control/api/changes/delete', { id: run.changeId }) },
+                          })
+                        }}
+                      >✕</button>
+                    </span>
                   </td>
                 </tr>
               ))}
