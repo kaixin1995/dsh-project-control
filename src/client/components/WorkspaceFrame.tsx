@@ -1771,6 +1771,22 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     pumpDetailPool()
   }
 
+  /** 解读失败判定：失败占位的 what 以固定前缀开头（loadDetailOnce 写入）。 */
+  const isFailedAnalysis = (d?: CommitDetailPayload): boolean => d !== undefined && d.analysis.what.startsWith('AI 解读失败')
+
+  /** 批量重试解读失败（业主 2026-11-04：逐条手点效率低）：失败卡片串行强制重新生成，
+   *  走现有并发池；完成数量在操作结果栏汇总。 */
+  const retryFailedDetails = (): void => {
+    const failed = selectedTargets.filter((target) => isFailedAnalysis(details[target]))
+    if (failed.length === 0) { setActionResult('✗ 当前没有解读失败的提交'); return }
+    let done = 0
+    for (const target of failed) {
+      loadDetail(target, true)
+      done += 1
+    }
+    setActionResult('🔁 已对 ' + String(done) + ' 条解读失败的提交发起重新生成（并发池自动调度，完成后卡片自动刷新）')
+  }
+
   /** 队列任务体：真正发起解读请求；任何失败（网络中断/超时/服务未运行）都写入卡片错误占位，绝不无限转圈。 */
   const loadDetailOnce = async (target: string, force: boolean): Promise<void> => {
     setDetailStatus((previous) => ({ ...previous, [target]: 'running' }))
@@ -2784,6 +2800,18 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
       )}
 
       {/* 每条选中提交的 AI 解读 */}
+      {(() => {
+        // 失败显眼条：有解读失败时顶部红条 + 一键批量重试（业主 2026-11-04）。
+        const failedCount = selectedTargets.filter((target) => isFailedAnalysis(details[target])).length
+        if (failedCount === 0) return null
+        return (
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '8px 12px', marginBottom: '10px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid ' + themeAwareText('#f14c4c'), borderRadius: '6px', fontSize: '12px' }}>
+            <span style={{ color: themeAwareText('#d1242f'), fontWeight: 600 }}>⚠ {String(failedCount)} 条提交解读失败</span>
+            <span style={{ flex: 1 }} />
+            <button style={{ ...styles.secondary, fontWeight: 600 }} onClick={() => { retryFailedDetails() }}>🔁 {t('cache.regenerate')}全部失败</button>
+          </div>
+        )
+      })()}
       {selectedTargets.map((target) => {
         const d = details[target]
         const label = target === 'working' ? t('repo.working') : (d?.commit?.message ?? target.slice(0, 8))
@@ -2791,6 +2819,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
           <Card key={`d-${target}`} title={`🔍 ${label}${target !== 'working' ? `（${target.slice(0, 8)}）` : ''}`}>
             {d !== undefined && (
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                {isFailedAnalysis(d) && <span style={styles.badge(themeAwareText('#f14c4c'))}>⚠ 解读失败</span>}
                 {d.analysisCached === true && (
                   <span style={styles.badge('#8b8b8b')}>{t('cache.hit')}{d.analysisGeneratedAt ? ' · ' + new Date(d.analysisGeneratedAt).toLocaleString() : ''}</span>
                 )}
@@ -2831,7 +2860,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                 {d.analysis.what !== '' && (
                   <>
                     <div style={{ ...styles.sectionTitle, marginTop: '8px' }}>{t('detail.what')}</div>
-                    <div style={styles.what}>{d.analysis.what}</div>
+                    <div style={{ ...styles.what, ...(isFailedAnalysis(d) ? { color: themeAwareText('#d1242f'), fontWeight: 600 } : {}) }}>{d.analysis.what}</div>
                   </>
                 )}
                 {d.analysis.logic.length > 0 && (
