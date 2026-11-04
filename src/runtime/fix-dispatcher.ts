@@ -517,19 +517,22 @@ export class FixDispatcher {
         // sandbox_permissions/justification 并被逐次拒绝，陷入无谓重试。plan 模式不注册：
         // 只读任务物理上不给写入口。
         if (!planMode) {
-          const { writeFileSync } = await import('node:fs')
+          const { writeFileSync, readFileSync, existsSync } = await import('node:fs')
           agentCtx.tools.register(defineTool({
             name: 'project_control_apply_fix',
-            description: 'Write one file with its full new content, relative to your worktree root. Use this for EVERY file modification in the fix — do not use edit/bash/pwsh for writing files.',
+            description: 'Modify one file in your worktree root, relative path. Two modes: mode="full" (default) writes the COMPLETE new file content; mode="replace" applies an exact unique search/replace inside the existing file — ALWAYS use mode="replace" for files larger than ~200 lines or when you do not have the whole file content (never rewrite a big file blindly). Use this for EVERY file modification — do not use edit/bash/pwsh for writing files.',
             parameters: {
               path: { type: 'string', required: true, description: 'Relative file path inside the worktree, e.g. "src/bug.js".' },
-              content: { type: 'string', required: true, description: 'The COMPLETE new file content (not a diff).' },
+              content: { type: 'string', description: 'mode="full": the COMPLETE new file content (not a diff).' },
+              mode: { type: 'string', description: '"full" (default) or "replace".' },
+              search: { type: 'string', description: 'mode="replace": the EXACT existing text to find. It must appear in the file EXACTLY ONCE — include enough surrounding lines to make it unique. Copy it verbatim from the file.' },
+              replace: { type: 'string', description: 'mode="replace": the new text that replaces the search text (empty string = delete the search text).' },
             },
             output: {
               schema: { type: 'string' },
               render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
             },
-            async execute(args: { path: string; content: string }) {
+            async execute(args: { path: string; content?: string; mode?: string; search?: string; replace?: string }) {
               const safe = args.path.replace(/\\/g, '/').replace(/^\.?\//, '')
               if (safe.includes('..') || safe === '') throw new Error('path must be a relative path inside the worktree')
               const hit = forbiddenPaths.find((forbidden) => safe === forbidden || safe.startsWith(forbidden + '/'))
@@ -537,8 +540,36 @@ export class FixDispatcher {
                 throw new Error(`「${hit}」是开发者已确定约束的禁改路径（forbidden path），修复不得触碰。若修复确实必须改它，请调 fix_complete 设 blocked 说明，由开发者决策。`)
               }
               const target = join(worktree, safe)
-              writeFileSync(target, args.content, 'utf8')
-              state.changed.push(safe)
+              const markChanged = (): void => {
+                if (!state.changed.includes(safe)) state.changed.push(safe)
+              }
+              if (args.mode === 'replace') {
+                // 2026-11-04 真机：47KB/1024 行文件"整文件重写"模型无法安全完成而 blocked。
+                // 替换模式只需精确局部文本，避免读截断/写超限双重失败。
+                if ((args.search ?? '') === '') throw new Error('mode="replace" requires search (exact unique text copied verbatim from the file)')
+                if (!existsSync(target)) throw new Error(`file not found: ${safe}`)
+                const current = readFileSync(target, 'utf8')
+                const occurrences = (text: string): number => text.split(args.search!).length - 1
+                let total = occurrences(current)
+                let search = args.search!
+                let replace = args.replace ?? ''
+                if (total === 0 && search.includes('\n')) {
+                  // 行尾容错：文件是 CRLF 而模型按 LF 复制了 search（或反之）——换行风格互换后再试。
+                  const swap = (text: string): string => text.includes('\r\n') ? text.replace(/\r\n/g, '\n') : text.replace(/(^|[^r])\n/g, `$1\r\n`)
+                  search = swap(search)
+                  replace = swap(replace)
+                  total = occurrences(current)
+                }
+                if (total === 0) throw new Error(`search text not found in ${safe} — read the file first and copy the exact text verbatim (watch for whitespace and line endings)`)
+                if (total > 1) throw new Error(`search text appears ${total} times in ${safe} — include more surrounding lines so it is unique`)
+                writeFileSync(target, current.replace(search, replace), 'utf8')
+                markChanged()
+                task.view.currentAction = `替换 ${safe}`
+                return `Replaced in ${safe}`
+              }
+              if ((args.content ?? '') === '') throw new Error('mode="full" requires content (the complete new file content); for large files use mode="replace" instead')
+              writeFileSync(target, args.content!, 'utf8')
+              markChanged()
               task.view.currentAction = `写入 ${safe}`
               return `Written: ${safe}`
             },
@@ -810,7 +841,7 @@ export class FixDispatcher {
           '- 只修改 worktree 内的文件（你的工作目录就是 worktree 根）；改动保持最小侵入。',
           '- 禁止执行 git commit / git add——提交由合并器统一处理。',
           '- 禁止 push、禁止改分支。',
-          '- 文件修改【只】用 project_control_apply_fix 工具（参数 path + 完整新内容 content）写入。不要用 edit/bash/pwsh 写文件——它们的沙箱参数校验在此环境会拒绝；也不要在任何工具调用里设置 sandbox_permissions 字段。',
+          '- 文件修改【只】用 project_control_apply_fix 工具：小文件（≤200 行且你已读过全文）用 mode="full" 传完整新内容；大文件或你只读过片段的文件【必须】用 mode="replace"（search=从文件里逐字复制的唯一精确文本 + replace=新文本）。不要用 edit/bash/pwsh 写文件——它们的沙箱参数校验在此环境会拒绝；也不要在任何工具调用里设置 sandbox_permissions 字段。',
           '- 修复完成（文件已改好）后立即调用 project_control_fix_complete，summary 写清修了什么，changedFiles 列出你改的相对路径。',
           '- 判定类结论（verdict）【不要改任何文件】；无法修复（需要产品决策/依赖缺失/涉及禁改路径）→ 调工具设 blocked 字段说明原因，不要硬修。',
         ]

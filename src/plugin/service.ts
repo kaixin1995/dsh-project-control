@@ -75,6 +75,12 @@ export class ProjectControlService {
   /** 修复派发器（子 Agent + worktree 隔离 + cherry-pick 合并）。 */
   public fixDispatcher?: import('../runtime/fix-dispatcher.ts').FixDispatcher
 
+  /**
+   * 整体分诊的已送审记忆（内存态）：一轮分诊中已判过的 issueId（含 keep——
+   * keep 不关闭，不记会每批重复选中死循环）。前端「整体分诊」以 reset 开始新一轮。
+   */
+  public readonly triageSeen = new Set<string>()
+
   constructor(public readonly ctx: any, config: ProjectControlConfig = {}) {
     this.liveConfig = resolveFullConfig(config as never)
     // 默认初始化内存 Store，保证在无 storageDomain 的环境（如 headless 面或测试环境）下基础操作仍可用

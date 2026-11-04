@@ -261,4 +261,24 @@ describe('/fix 子 Agent 派发', () => {
     expect(again.status).toBe(200)
     expect(again.data['accepted']).toBe(0)
   }, 40_000)
+
+  it('/issues/triage：无 LLM 环境整批降级保留，seen 记忆推进到 done；只碰当前项目', async () => {
+    const { ReviewIssueManager } = await import('../src/verification/issues.ts')
+    const manager = new ReviewIssueManager(service.store.issues)
+    const created = await manager.createIssue({ projectId: projectA as never, changeId: 'review:triage001' as never, severity: 'minor' as never, category: '测试' as never, title: '分诊目标', description: '证据：x' })
+    await manager.createIssue({ projectId: projectB as never, changeId: 'review:triage002' as never, severity: 'minor' as never, category: '测试' as never, title: 'B项目不该被动', description: '证据：y' })
+    // 第一轮（reset）：ctx.llm 不存在 → complete 抛错 → 引擎按解析失败整批保留。
+    const first = await post('/issues/triage', { sessionId: 'session-a', reset: true })
+    expect(first.status).toBe(200)
+    expect(first.data['ok']).toBe(true)
+    expect(first.data['processed']).toBe(1)
+    expect(first.data['parseFailed']).toBe(true)
+    expect(first.data['done']).toBe(true)
+    // 问题全部保留，B 项目问题不受影响。
+    expect(service.store.issues.get(created.id as never)?.status).toBe('open')
+    // 第二轮（无 reset）：seen 记忆内无剩余 → done 且零处理。
+    const second = await post('/issues/triage', { sessionId: 'session-a' })
+    expect(second.data['done']).toBe(true)
+    expect(second.data['processed']).toBe(0)
+  }, 40_000)
 })

@@ -588,6 +588,15 @@ export const WORKSPACE_DICT = {
     'review.batchProgress': '批量复检中 {i}/{n}',
     'review.batchDone': '批量复检完成：解决 {a} 条 · 仍待处理 {b} 条 · 新问题 {c} 条 · 失败 {d} 个目标',
     'review.batchStopped': '批量复检已停止',
+    'review.triage': '🧹 整体分诊',
+    'review.triageHint': 'LLM 整体扫描全部待处理问题：判重复/过时/不成立即时关闭（带依据，可人工重开复核），真问题留下再派发修复',
+    'review.triageConfirmTitle': '整体分诊？',
+    'review.triageConfirmMsg': '将用 LLM 分批扫描全部待处理问题（每批最多 {n} 条，消耗模型用量）。判为重复/过时/不成立的问题会【立即关闭】并注明依据——全部可在问题卡复核重开。留下的真问题再走派发修复。',
+    'review.triageProgress': '分诊中：已处理 {n} 条，剩余约 {m} 条',
+    'review.triageStop': '停止',
+    'review.triageDone': '分诊完成：关闭 重复 {a} · 过时 {b} · 不存在 {c}；保留 {d} 条待处理',
+    'review.triageStopped': '分诊已停止（已判定的不会重复消耗，可再次点击继续）',
+    'review.triageParseFail': '；有一批输出解析失败已按保留处理，可重试',
     'review.handledDone': '已把 {n} 条问题标记为已处理',
     'fix.plan': '修复方案',
     'fix.planApproach': '方案',
@@ -905,6 +914,15 @@ export const WORKSPACE_DICT = {
     'review.batchProgress': 'Batch verifying {i}/{n}',
     'review.batchDone': 'Batch verify done: {a} resolved · {b} still open · {c} new · {d} failed targets',
     'review.batchStopped': 'Batch verify stopped',
+    'review.triage': '🧹 Triage all',
+    'review.triageHint': 'LLM holistic scan over all pending issues: duplicates/obsolete/non-issues are closed immediately with evidence (reopenable); real issues stay for fix dispatch',
+    'review.triageConfirmTitle': 'Triage all pending issues?',
+    'review.triageConfirmMsg': 'Will scan all pending issues with the LLM in batches (up to {n} per batch, consumes model usage). Issues judged duplicate/obsolete/non-issues are closed IMMEDIATELY with evidence — every closure is reviewable and reopenable on the issue card. Real issues stay for fix dispatch.',
+    'review.triageProgress': 'Triaging: {n} processed, ~{m} remaining',
+    'review.triageStop': 'Stop',
+    'review.triageDone': 'Triage done: closed {a} duplicate · {b} obsolete · {c} non-issues; {d} pending kept',
+    'review.triageStopped': 'Triage stopped (judged items are not re-billed; click again to continue)',
+    'review.triageParseFail': '; one batch failed to parse and was kept as-is, retryable',
     'review.handledDone': '{n} issues marked as handled',
     'fix.plan': 'Fix plan',
     'fix.planApproach': 'Approach',
@@ -1512,6 +1530,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
   const [verifyingTarget, setVerifyingTarget] = useState<string | null>(null)
   const [issueChecked, setIssueChecked] = useState<Record<string, boolean>>({})
   const [batchVerifyState, setBatchVerifyState] = useState<{ done: number; total: number } | null>(null)
+  const [triageState, setTriageState] = useState<{ processed: number; remaining: number } | null>(null)
   const batchStopRef = useRef(false)
   const [fixTasks, setFixTasks] = useState<FixTaskEntry[]>([])
   const [fixConcurrency, setFixConcurrency] = useState('3')
@@ -1954,6 +1973,48 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
     await loadIssues()
     if (batchStopRef.current) setActionResult('⏹ ' + t('review.batchStopped'))
     else setActionResult('✓ ' + t('review.batchDone').replace('{a}', String(resolvedTotal)).replace('{b}', String(openTotal)).replace('{c}', String(newTotal)).replace('{d}', String(failed)))
+  }
+
+  /** 整体分诊：循环调用 /issues/triage 直至 done（每批 = 服务端"open 且本轮未送审"的前 N 条），
+   * 判定即时关闭、可停止可续跑（服务端 seen 记忆防重复消耗）。 */
+  const runTriage = async (): Promise<void> => {
+    batchStopRef.current = false
+    setTriageState({ processed: 0, remaining: 0 })
+    const closed = { duplicate: 0, obsolete: 0, false_positive: 0 }
+    let kept = 0
+    let processed = 0
+    let parseFailed = false
+    let stopped = false
+    let first = true
+    for (;;) {
+      if (batchStopRef.current) { stopped = true; break }
+      let outcome: { ok: boolean; data: Record<string, unknown> }
+      try {
+        outcome = await post('/project-control/api/issues/triage', { sessionId: props.sessionId ?? '', ...(first ? { reset: true } : {}) })
+      } catch {
+        outcome = { ok: false, data: { error: 'network error' } }
+      }
+      first = false
+      if (!outcome.ok) { setActionResult('✗ ' + String(outcome.data['error'] ?? 'error')); break }
+      const data = outcome.data
+      if (data['done'] === true) break
+      const batchClosed = (data['closed'] ?? {}) as Record<string, number>
+      closed.duplicate += Number(batchClosed['duplicate'] ?? 0)
+      closed.obsolete += Number(batchClosed['obsolete'] ?? 0)
+      closed.false_positive += Number(batchClosed['false_positive'] ?? 0)
+      kept += Number(data['kept'] ?? 0)
+      processed += Number(data['processed'] ?? 0)
+      if (data['parseFailed'] === true) parseFailed = true
+      setTriageState({ processed, remaining: Number(data['remaining'] ?? 0) })
+    }
+    setTriageState(null)
+    await loadIssues()
+    if (stopped) setActionResult('⏹ ' + t('review.triageStopped'))
+    else if (processed > 0) {
+      setActionResult('✓ ' + t('review.triageDone')
+        .replace('{a}', String(closed.duplicate)).replace('{b}', String(closed.obsolete)).replace('{c}', String(closed.false_positive)).replace('{d}', String(kept))
+        + (parseFailed ? t('review.triageParseFail') : ''))
+    }
   }
 
   /**
@@ -3729,6 +3790,21 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   }}
                 >{t('review.selectAll')}</button>
                 <button style={styles.secondary} title={t('review.exportMdHint')} onClick={() => { exportIssuesMd(visible) }}>{t('review.exportMd')}</button>
+                <button
+                  style={styles.secondary}
+                  title={t('review.triageHint')}
+                  onClick={() => {
+                    const openCount = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing').length
+                    if (openCount === 0) { setActionResult('✗ ' + t('fix.dispatchNoOpen')); return }
+                    setConfirmDialog({
+                      title: t('review.triageConfirmTitle'),
+                      message: t('review.triageConfirmMsg').replace('{n}', '40'),
+                      danger: false,
+                      confirmLabel: t('review.triage'),
+                      onConfirm: () => { void runTriage() },
+                    })
+                  }}
+                >{t('review.triage')}</button>
                 {(() => {
                   // 派发对象：勾选的待处理问题优先；未勾选 = 当前筛选下全部待处理（常驻入口，不再藏）。
                   const openVisible = visible.filter((issue) => issue.status === 'open' || issue.status === 'fixing')
@@ -3776,7 +3852,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                       <span style={{ flex: 1 }} />
                       {fixActive && <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { void cancelFix() }}>⏹ {t('fix.stop')}</button>}
                     </div>
-                    {fixTasks.slice().reverse().map((task) => (
+                    {fixTasks.map((task) => (
                       <div key={task.issueId} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', padding: '6px 4px', borderBottom: '1px solid var(--dsw-alias-border-l3, rgba(5,5,5,0.06))', fontSize: '11px' }}>
                         <span style={styles.badge(task.status === 'done' ? '#4ec9b0' : task.status === 'queued' ? '#8b949e' : task.status === 'running' || task.status === 'merging' || task.status === 'redo' ? '#dcdcaa' : '#f14c4c')}>
                           {FIX_STATUS_LABELS[task.status] ?? task.status}{task.mode === 'plan' ? '·方案' : ''}{task.attempt > 1 ? `·${t('fix.attempt').replace('{n}', String(task.attempt))}` : ''}
@@ -3810,7 +3886,7 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                   </Card>
                 )
               })()}
-              {(checkedVisible.length > 0 || batchVerifyState !== null) && (
+              {(checkedVisible.length > 0 || batchVerifyState !== null || triageState !== null) && (
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', padding: '6px 10px', marginBottom: '10px', background: 'var(--dsw-alias-bg-layer-1, #fafafa)', border: '1px solid var(--dsw-alias-border-l2, rgba(5,5,5,0.1))', borderRadius: '6px', fontSize: '11px' }}>
                   {batchVerifyState !== null ? (
                     <>
@@ -3819,6 +3895,14 @@ export function WorkspaceFrame(props: WorkspaceFrameProps) {
                       </span>
                       <span style={{ flex: 1 }} />
                       <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { batchStopRef.current = true }}>{t('review.batchStop')}</button>
+                    </>
+                  ) : triageState !== null ? (
+                    <>
+                      <span style={{ color: themeAwareText('#d97706') }}>
+                        ⏳ {t('review.triageProgress').replace('{n}', String(triageState.processed)).replace('{m}', String(triageState.remaining))}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      <button style={{ ...styles.secondary, padding: '2px 8px', fontSize: '11px' }} onClick={() => { batchStopRef.current = true }}>{t('review.triageStop')}</button>
                     </>
                   ) : (
                     <>

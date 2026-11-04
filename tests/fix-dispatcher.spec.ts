@@ -21,6 +21,8 @@ const finishTool = (tools: Map<string, { execute: (args: unknown, exec: unknown)
 function initRepo(path: string): void {
   const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@x', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@x' }
   execFileSync('git', ['init', '-q', '-b', 'main', path], { env })
+  // Windows 全局 autocrlf 会让 worktree checkout 把 LF 转 CRLF——本套件按字节断言，关掉。
+  execFileSync('git', ['-C', path, 'config', 'core.autocrlf', 'false'], { env })
   writeFileSync(join(path, 'shared.txt'), 'base\n')
   execFileSync('git', ['-C', path, 'add', '.'], { env })
   execFileSync('git', ['-C', path, 'commit', '-qm', 'base'], { env })
@@ -488,5 +490,61 @@ describe('FixDispatcher', () => {
     expect(dispatcher.status()[0]!.status).toBe('done')
     expect(service.store.issues.get(issue.id as never)?.status).toBe('resolved')
     expect(service.store.fixPlans.get('fix_stale_p' as never)?.status).toBe('rejected')
+  }, 40_000)
+
+  it('apply_fix replace 模式：大文件精确局部替换成功并正常合并', async () => {
+    const { ctx, service, git, behaviors } = makeHarness()
+    const { project, mkIssue } = await setupProject(service, git)
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@x', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@x' }
+    writeFileSync(join(root, 'big.txt'), Array.from({ length: 300 }, (_, i) => `line ${i}\n`).join(''))
+    execFileSync('git', ['-C', root, 'add', 'big.txt'], { env })
+    execFileSync('git', ['-C', root, 'commit', '-qm', 'add big file'], { env })
+    const issue = await mkIssue('大文件局部修改')
+    behaviors.set(issue.id, (_worktree, _attempt, tools) => {
+      const apply = tools.get('project_control_apply_fix')!
+      void apply.execute({ path: 'big.txt', mode: 'replace', search: 'line 5\n', replace: 'line 5 patched\n' }, {})
+        .then(() => finishTool(tools, { summary: '局部替换完成', changedFiles: ['big.txt'] }))
+        .catch((error: unknown) => finishTool(tools, { summary: '替换失败', blocked: String((error as Error).message).slice(0, 100) }))
+    })
+    const dispatcher = new FixDispatcher(ctx, service, git)
+    dispatcher.dispatch({ id: project.id, name: project.name, rootPath: root }, [{ issueId: issue.id, title: issue.title, evidence: '' }])
+    await waitIdle(dispatcher)
+    const view = dispatcher.status()[0]!
+    expect(view.status).toBe('done')
+    expect(view.files).toContain('big.txt')
+    const content = execFileSync('git', ['-C', root, 'show', 'HEAD:big.txt']).toString()
+    expect(content).toContain('line 5 patched')
+    expect(content).toContain('line 299\n')
+    expect(service.store.issues.get(issue.id as never)?.status).toBe('resolved')
+  }, 40_000)
+
+  it('apply_fix replace 模式：search 不唯一/不存在都报错且不产生改动', async () => {
+    const { ctx, service, git, behaviors } = makeHarness()
+    const { project, mkIssue } = await setupProject(service, git)
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@x', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@x' }
+    writeFileSync(join(root, 'big.txt'), Array.from({ length: 300 }, (_, i) => `line ${i}\n`).join(''))
+    execFileSync('git', ['-C', root, 'add', 'big.txt'], { env })
+    execFileSync('git', ['-C', root, 'commit', '-qm', 'add big file'], { env })
+    const headBefore = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD']).toString().trim()
+    const issue = await mkIssue('替换参数错误')
+    behaviors.set(issue.id, (_worktree, _attempt, tools) => {
+      const apply = tools.get('project_control_apply_fix')!
+      const errors: string[] = []
+      void apply.execute({ path: 'big.txt', mode: 'replace', search: 'line', replace: 'x' }, {})
+        .catch((error: unknown) => errors.push(String((error as Error).message)))
+        .then(() => apply.execute({ path: 'big.txt', mode: 'replace', search: 'no such line here', replace: 'x' }, {}))
+        .catch((error: unknown) => errors.push(String((error as Error).message)))
+        .then(() => finishTool(tools, { summary: '两次替换都被拒', blocked: errors.join(' | ').slice(0, 160) }))
+    })
+    const dispatcher = new FixDispatcher(ctx, service, git)
+    dispatcher.dispatch({ id: project.id, name: project.name, rootPath: root }, [{ issueId: issue.id, title: issue.title, evidence: '' }])
+    await waitIdle(dispatcher)
+    const view = dispatcher.status()[0]!
+    expect(view.status).toBe('failed')
+    expect(view.error).toContain('times in')
+    expect(view.error).toContain('not found')
+    // 主仓零改动，问题保持待处理。
+    expect(execFileSync('git', ['-C', root, 'rev-parse', 'HEAD']).toString().trim()).toBe(headBefore)
+    expect(service.store.issues.get(issue.id as never)?.status).toBe('open')
   }, 40_000)
 })

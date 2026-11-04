@@ -38,6 +38,7 @@ import { ChangeService } from '../domain/change.ts'
 import { scanHistory } from '../runtime/history.ts'
 import { generatePlanSteps } from '../runtime/plan-gen.ts'
 import { runLlmAnalysis } from '../analysis/llm-analyzer.ts'
+import { runTriageBatch, toTriageIssue, TRIAGE_BATCH_SIZE } from '../verification/triage.ts'
 import { addConfirmedItem, removeConfirmedItem } from './confirmed.ts'
 import type { ConfirmedItemRecord } from './confirmed.ts'
 import { ReviewIssueManager, appendCappedNote } from '../verification/issues.ts'
@@ -2729,6 +2730,66 @@ export function registerApiRoute(ctx: Context, service: ProjectControlService): 
             await manager.updateStatus(id as never, status as never)
             res.writeHead(200, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok: true }))
+          } catch (error: unknown) {
+            res.writeHead(500, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+          }
+          return
+        }
+        // 整体分诊（业主 2026-11-04 拍板 LLM 批量判定）：对未解决问题全集做清单级
+        // 扫描——判 duplicate/obsolete/false_positive 即时关闭（带依据可复核重开），
+        // keep 留给修复阶段。每轮处理"open 且本轮未送审"的前 N 条，前端循环到 done。
+        if (req.method === 'POST' && routePath === '/issues/triage') {
+          if (service.store === undefined) {
+            res.writeHead(503, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'service not started' }))
+            return
+          }
+          try {
+            const body = await readJsonBody(req)
+            const project = await adoptProject(service, body)
+            if (project === undefined) {
+              res.writeHead(400, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ error: 'no project initialized' }))
+              return
+            }
+            if (body['reset'] === true) service.triageSeen.clear()
+            const open = service.store.issues.list(
+              (issue) => issue.projectId === project.id && (issue.status === 'open' || issue.status === 'fixing'),
+            ).sort((left, right) => left.createdAt - right.createdAt)
+            const pending = open.filter((issue) => !service.triageSeen.has(issue.id))
+            if (pending.length === 0) {
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(JSON.stringify({ ok: true, done: true, processed: 0, remaining: 0, closed: { duplicate: 0, obsolete: 0, false_positive: 0 }, kept: 0, parseFailed: false }))
+              return
+            }
+            const batch = pending.slice(0, TRIAGE_BATCH_SIZE).map(toTriageIssue)
+            const all = open.map(toTriageIssue)
+            const route = resolveDeploymentRoute(ctx, 'reasoning', service.liveConfig)
+            const result = await runTriageBatch(service.store.issues as never, batch, all, async (prompt) => {
+              const llm = await runLlmAnalysis(ctx, {
+                prompt,
+                provider: route.provider,
+                model: route.model,
+                maxTokens: service.liveConfig.analysisMaxTokens,
+                timeoutMs: service.liveConfig.analysisTimeoutMs,
+                purpose: 'project-control-issue-triage',
+              })
+              return llm.text
+            })
+            // 本批全部记为已送审（含 keep——keep 不关闭，不记会每批重复选中）。
+            for (const issue of batch) service.triageSeen.add(issue.id)
+            const remaining = open.filter((issue) => !service.triageSeen.has(issue.id)).length
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({
+              ok: true,
+              done: remaining === 0,
+              processed: batch.length,
+              remaining,
+              closed: result.closed,
+              kept: result.kept,
+              parseFailed: result.parseFailed,
+            }))
           } catch (error: unknown) {
             res.writeHead(500, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
