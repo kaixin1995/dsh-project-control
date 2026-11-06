@@ -55,24 +55,10 @@ function withTimeout(ms: number): { signal: AbortSignal; dispose: () => void } {
 export const LLM_ANALYSIS_MAX_TOKENS_CAP = 32_768
 
 /**
- * 带自动放大重试的一次性分析（业主 2026-11-04：hit max tokens 二次手点效率低）：
- * 首次调用若因输出截断失败（MAX_TOKENS），自动把 maxTokens 放大 ×4（夹在
- * 8192~32768）立即重试一次；其余错误原样抛出。大 diff 解读常需要比默认 4096
- * 更大的输出空间，用户不应为此手动二次点击。
+ * 兼容别名：自动放大重试已下沉到 runLlmAnalysis 本体（2026-11-06——此前只给解读
+ * 单独接了放大，评审/分诊/复检等 12 处调用点仍裸调漏网）。保留导出避免调用点改动。
  */
-export async function runLlmAnalysisAutoExpand(ctx: Context, req: LlmAnalysisRequest): Promise<LlmAnalysisResult> {
-  try {
-    return await runLlmAnalysis(ctx, req)
-  } catch (error: unknown) {
-    if (error instanceof LlmError && error.code === 'MAX_TOKENS') {
-      const expanded = Math.min(LLM_ANALYSIS_MAX_TOKENS_CAP, Math.max(req.maxTokens * 4, 8192))
-      if (expanded > req.maxTokens) {
-        return await runLlmAnalysis(ctx, { ...req, maxTokens: expanded })
-      }
-    }
-    throw error
-  }
-}
+export const runLlmAnalysisAutoExpand = runLlmAnalysis
 
 /** 把 finish 原因映射为错误（fail-closed：不产出部分结果）。 */
 function finishError(finish: ReturnType<BlockAssembler['finish']>): Error | undefined {
@@ -83,16 +69,31 @@ function finishError(finish: ReturnType<BlockAssembler['finish']>): Error | unde
 }
 
 /**
- * 执行一次 LLM 分析调用。
- * @throws 路由缺失 / 超时 / 上游错误 / 截断——调用方决定降级策略。
+ * 执行一次 LLM 分析调用（全部一次性分析的统一入口：总并发闸门 + MAX_TOKENS 自动放大重试）。
+ * 输出截断（MAX_TOKENS）时自动把 maxTokens ×4（夹 8192~32768）立即重试一次——
+ * 评审/解读/分诊/复检等长输出调用方一律受益，不再需要各自手动二次点击（业主 2026-11-06：
+ * 评审路径仍报 hit max tokens，因当时只给解读单独接了放大）。
+ * @throws 路由缺失 / 超时 / 上游错误 / 放大后仍截断——调用方决定降级策略。
  */
 export async function runLlmAnalysis(ctx: Context, req: LlmAnalysisRequest): Promise<LlmAnalysisResult> {
   if (!req.provider || !req.model) {
     throw new Error('llm-analyzer: no provider/model route resolved')
   }
-  // 全局总并发：无槽则 FIFO 排队（业主 2026-11-04——并发是全插件共享预算，不是各功能各自的）。
-  if (globalGate !== undefined) return globalGate.run(() => runLlmAnalysisUngated(ctx, req))
-  return runLlmAnalysisUngated(ctx, req)
+  const execute = (request: LlmAnalysisRequest): Promise<LlmAnalysisResult> =>
+    globalGate !== undefined
+      ? globalGate.run(() => runLlmAnalysisUngated(ctx, request))
+      : runLlmAnalysisUngated(ctx, request)
+  try {
+    return await execute(req)
+  } catch (error: unknown) {
+    if (error instanceof LlmError && error.code === 'MAX_TOKENS') {
+      const expanded = Math.min(LLM_ANALYSIS_MAX_TOKENS_CAP, Math.max(req.maxTokens * 4, 8192))
+      if (expanded > req.maxTokens) {
+        return await execute({ ...req, maxTokens: expanded })
+      }
+    }
+    throw error
+  }
 }
 
 /** 真正执行一次 LLM 调用（闸门持槽内运行）。 */
